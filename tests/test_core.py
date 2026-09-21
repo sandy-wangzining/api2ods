@@ -42,9 +42,13 @@ from api2ods.cli import record_to_json  # noqa: E402
 
 
 class OfflineTestCase(unittest.TestCase):
-    """所有用例的基类：禁止真实 sleep（把 time.sleep 变成空操作），避免测试卡住。"""
+    """所有用例的基类：禁止真实 sleep（把 time.sleep 变成空操作），并统一控制台编码。"""
 
     def setUp(self):
+        utils.setup_console()
+        self._console = mock.patch.object(utils, "_console_patched", True)
+        self._console.start()
+        self.addCleanup(self._console.stop)
         patcher = mock.patch.object(time, "sleep", lambda *_args, **_kwargs: None)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1174,6 +1178,38 @@ class TestRunLock(OfflineTestCase):
                 with self.assertRaises(SystemExit):
                     with utils.RunLock(path):
                         pass
+
+
+class TestLogging(OfflineTestCase):
+    def test_log_falls_back_on_non_utf8_console(self):
+        class AsciiOnlyStream:
+            """模拟 Windows cp1252 控制台：写非 ASCII 字符就抛 UnicodeEncodeError。"""
+            encoding = "cp1252"
+
+            def __init__(self):
+                self.chunks = []
+
+            def write(self, text):
+                text.encode("cp1252")  # 中文/emoji 会在这里抛错
+                self.chunks.append(text)
+
+            def flush(self):
+                pass
+
+        stream = AsciiOnlyStream()
+        with mock.patch("sys.stdout", stream):
+            utils.log("中文日志 ❌ 测试")      # 不应抛异常
+        self.assertTrue(any("[20" in chunk for chunk in stream.chunks))
+        self.assertTrue(any("? " in chunk for chunk in stream.chunks))
+
+    def test_log_writes_to_file_sink(self):
+        handle = io.StringIO()
+        utils.add_log_sink(handle)
+        try:
+            utils.log("写一份到文件")
+        finally:
+            utils._sinks.remove(handle)
+        self.assertIn("写一份到文件", handle.getvalue())
 
 
 class TestRecordToJson(OfflineTestCase):

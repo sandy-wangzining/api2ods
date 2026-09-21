@@ -22,14 +22,15 @@ class FatalApiError(RuntimeError):
 
 _lock = threading.Lock()
 _sinks: list = []
+_console_patched = False
 
 
 def setup_console() -> None:
-    """stdout/stderr 切 UTF-8，避免 Windows 控制台中文乱码。"""
+    """stdout/stderr 切 UTF-8，避免 Windows 控制台中文乱码/报错。"""
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
+        except Exception:  # noqa: BLE001 - 某些重定向流不支持 reconfigure（如 CI 捕获）
             pass
 
 
@@ -40,18 +41,32 @@ def add_log_sink(handle) -> None:
 
 
 def log(message: str) -> None:
-    """线程安全的控制台输出；时间戳=运行机器本地时间，只标记执行时刻。"""
+    """线程安全的控制台输出；时间戳=运行机器本地时间，只标记执行时刻。
+
+    防御：Windows CI/老控制台默认是 cp1252 之类编码，中文/符号会抛 UnicodeEncodeError；
+    这里第一次调用时自动把控制台切到 UTF-8，切不了就用"可替换字符"降级输出，保证不中断业务。
+    """
+    global _console_patched
+    if not _console_patched:
+        setup_console()
+        _console_patched = True
+
     import datetime as _dt
 
     stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{stamp}] {message}"
     with _lock:
-        print(line, flush=True)
+        try:
+            print(line, flush=True)
+        except UnicodeEncodeError:
+            encoding = (getattr(sys.stdout, "encoding", None) or "utf-8")
+            safe = line.encode(encoding, "replace").decode(encoding, "replace")
+            print(safe, flush=True)
         for handle in _sinks:
             try:
                 handle.write(line + "\n")
                 handle.flush()
-            except Exception:
+            except Exception:  # noqa: BLE001 - 日志文件问题不影响主流程
                 pass
 
 
