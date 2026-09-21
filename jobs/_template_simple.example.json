@@ -1,0 +1,44 @@
+{
+  "//": "===== 最小可用模板：Header Token + 页码分页 的普通 JSON 接口 =====",
+  "//1": "用法：复制为 jobs/xxx.json（去掉 .example），把 <尖括号> 内容换掉即可",
+  "//2": "密钥直接写文件里；jobs/*.json 已 gitignore。也可以先用 `api2ods --init` 自动生成",
+  "//3": "常见字段默认值：method=GET、pt=${bizdate}、json 列名=json、时区=Asia/Shanghai/+08:00",
+
+  "job": "demo_api",
+
+  "maxcompute": {
+    "project": "<项目名>",
+    "access_key_id": "<阿里云 AccessKeyId>",
+    "access_key_secret": "<阿里云 AccessKeySecret>",
+    "//endpoint": "不写默认 us-west-1：http://service.us-west-1.maxcompute.aliyun.com/api"
+  },
+
+  "request": {
+    "base_url": "https://<api 域名，如 api.example.com>",
+    "path": "/v1/<接口路径>",
+    "headers": { "Authorization": "Bearer <token 直接写这里>" },
+    "records_path": "data.list",
+    "//records_path": "记录数组在返回 JSON 里的路径（如 data.list）；整个返回就是数组则删掉这行"
+  },
+
+  "window": {
+    "days": 15,
+    "start_param": "startTime",
+    "end_param": "endTime",
+    "//": "按天窗口：脚本每天生成一组 startTime/endTime 请求一次；format 默认 %Y-%m-%d %H:%M:%S，unix 表示秒"
+  },
+
+  "pagination": {
+    "type": "page",
+    "page_param": "page",
+    "size_param": "size",
+    "page_size": 100,
+    "total_pages_path": "data.totalPages",
+    "//": "没有总页数字段就换成 \"total_items_path\": \"data.totalCount\"（总条数）"
+  },
+
+  "target": {
+    "table": "ods_<业务域>_<过程>_json_di",
+    "//": "project 不写就用 maxcompute.project；分区默认 pt=${bizdate}（也可写 --pt 覆盖）"
+  }
+}

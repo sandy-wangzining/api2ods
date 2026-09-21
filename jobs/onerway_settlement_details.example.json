@@ -1,0 +1,60 @@
+{
+  "job": "onerway_settlement_details",
+  "description": "Onerway 结算明细：结算文件接口（参数走 Header、返回 CSV）示例",
+
+  "secrets": {
+    "onerway_secret_key": "<Onerway 商户密钥 Secret key>"
+  },
+  "maxcompute": {
+    "project": "<项目名>",
+    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "access_key_id": "<阿里云 AccessKeyId>",
+    "access_key_secret": "<阿里云 AccessKeySecret>"
+  },
+
+  "request": {
+    "base_url": "https://acq.onerway.com",
+    "path": "/v1/settlementFile/download",
+    "method": "GET",
+    "timeout_seconds": 180,
+    "//params_in": "所有参数（含签名）放进请求头而不是 URL：这个接口要求 Header 传参",
+    "params": { "merchantNo": "<商户号>", "currency": "USD" },
+    "params_in": "headers",
+    "headers": { "Accept": "application/octet-stream, application/json" },
+    "auth": {
+      "type": "sha256_concat",
+      "secret_key": "${secrets.onerway_secret_key}",
+      "sign_field": "sign",
+      "sign_in": "body"
+    },
+    "response_type": "bytes"
+  },
+
+  "window": {
+    "mode": "per_day",
+    "days": 21,
+    "date_tz": "America/New_York",
+    "api_tz": "+08:00",
+    "pad_hours": 0,
+    "start_param": "date",
+    "format": "%Y%m%d",
+    "//": "结算日=美东日期；date 参数格式 yyyyMMdd；默认回扫 21 天（每周出账 + 改账回刷）"
+  },
+
+  "parse": {
+    "format": "csv",
+    "encoding": "utf-8-sig",
+    "skip_until": "Settlement Date,Settlement Batch ID",
+    "//skip_until": "文件前半段是汇总表：从包含这段文字的行（明细表头）开始解析；未出账的文件返回空"
+  },
+
+  "pagination": { "type": "none" },
+
+  "target": {
+    "project": "<项目名>",
+    "table": "ods_onerway_settlement_details_json_di",
+    "pt": "${bizdate}",
+    "column": "json",
+    "comment": "Onerway 结算明细（结算文件明细段，每行一条 JSON；含最近 N 天结算日窗口）"
+  }
+}

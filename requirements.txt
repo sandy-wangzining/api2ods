@@ -1,0 +1,4 @@
+# 运行时依赖（等价于 pyproject.toml 里的 dependencies）
+requests>=2.25
+pyodps>=0.11
+tzdata>=2023.3; platform_system == "Windows"

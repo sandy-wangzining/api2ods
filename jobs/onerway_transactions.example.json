@@ -1,0 +1,66 @@
+{
+  "job": "onerway_transactions",
+  "description": "Onerway 交易流水：每跑一次把最近 window.days 天原样打进 pt=${bizdate} 分区（先删再填）",
+
+  "//secrets": "密钥直接写这里；作业文件已 gitignore，别提交/外发",
+  "secrets": {
+    "onerway_secret_key": "<Onerway 商户密钥 Secret key>"
+  },
+  "maxcompute": {
+    "project": "<项目名>",
+    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "access_key_id": "<阿里云 AccessKeyId>",
+    "access_key_secret": "<阿里云 AccessKeySecret>"
+  },
+
+  "request": {
+    "base_url": "https://acq.onerway.com",
+    "path": "/v1/txn/list",
+    "method": "POST",
+    "body_type": "json",
+    "timeout_seconds": 30,
+    "headers": { "Content-Type": "application/json" },
+    "params": { "merchantNo": "<Onerway 商户号>" },
+    "auth": {
+      "type": "sha256_concat",
+      "secret_key": "${secrets.onerway_secret_key}",
+      "sign_field": "sign",
+      "sign_in": "body"
+    },
+    "records_path": "data.content",
+    "fail_if": [
+      { "path": "respCode", "not_equals": "20000", "message_path": "respMsg" }
+    ]
+  },
+
+  "window": {
+    "mode": "per_day",
+    "days": 30,
+    "date_tz": "America/New_York",
+    "api_tz": "+08:00",
+    "pad_hours": 1,
+    "start_param": "startTime",
+    "end_param": "endTime",
+    "format": "%Y-%m-%d %H:%M:%S"
+  },
+
+  "pagination": {
+    "type": "page",
+    "page_param": "current",
+    "size_param": "size",
+    "page_size": 100,
+    "param_as_string": true,
+    "total_pages_path": "data.totalPages",
+    "delay_seconds": 2,
+    "max_pages": 2000
+  },
+
+  "target": {
+    "project": "<项目名>",
+    "table": "ods_onerway_payhub_transactions_json_di",
+    "pt": "${bizdate}",
+    "column": "json",
+    "comment": "Onerway 交易流水（JSON 原样落库，分区=业务日，含最近 N 天窗口）",
+    "allow_empty": false
+  }
+}

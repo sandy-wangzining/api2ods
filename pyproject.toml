@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "api2ods"
+dynamic = ["version"]
+description = "通用 REST API → MaxCompute ODS 同步工具（裸 json 列 + pt 分区，先删再填）"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "api2ods contributors" }]
+keywords = ["maxcompute", "odps", "rest-api", "etl", "data-ingestion", "data-warehouse"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database",
+  "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+  "requests>=2.25",
+  "pyodps>=0.11",
+  "tzdata>=2023.3; platform_system == 'Windows'",
+]
+
+[project.scripts]
+api2ods = "api2ods.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/sandy-wangzining/api2ods"
+
+[project.optional-dependencies]
+dev = ["ruff>=0.5"]
+
+[tool.setuptools]
+packages = ["api2ods"]
+
+[tool.setuptools.dynamic]
+version = { attr = "api2ods.VERSION" }
+
+# ---------------------------------------------------------------------------
+# 代码检查配置（开发用：pip install ruff && ruff check .）
+# 选"能发现真问题"的规则；风格类/有意的写法按下面说明忽略
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+exclude = ["venv", ".venv", "build", "dist", "__pycache__", ".run-locks"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "I", "UP"]
+ignore = [
+  "E501",    # 长行：中文说明/日志字符串多，120 列仍可能超
+  "UP009",   # 保留文件头的 # -*- coding: utf-8 -*-（团队习惯，便于跨工具查看）
+  "UP015",   # open(mode="r") 显式写法保留（可读性）
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]   # 测试先插 sys.path 再 import

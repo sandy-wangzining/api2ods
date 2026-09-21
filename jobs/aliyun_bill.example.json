@@ -1,0 +1,75 @@
+{
+  "job": "aliyun_bill_daily",
+  "description": "阿里云按天账单明细（QueryInstanceBill，RPC 签名）→ ODS（JSON 原样，窗口=最近 N 天）",
+
+  "//secrets": "密钥直接写这里；多账号=多份作业配置+多张表（DWD 再合），不要往一张表里挤",
+  "secrets": {
+    "aliyun_bill_access_key_id": "<账单账号 AccessKeyId>",
+    "aliyun_bill_access_key_secret": "<账单账号 AccessKeySecret>"
+  },
+  "maxcompute": {
+    "project": "<项目名>",
+    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "access_key_id": "<阿里云 AccessKeyId>",
+    "access_key_secret": "<阿里云 AccessKeySecret>"
+  },
+
+  "request": {
+    "base_url": "https://business.ap-southeast-1.aliyuncs.com",
+    "//base_url": "国际站=ap-southeast-1；中国站改成 https://business.aliyuncs.com",
+    "path": "/",
+    "method": "GET",
+    "timeout_seconds": 60,
+    "params": {
+      "Action": "QueryInstanceBill",
+      "Version": "2017-12-14",
+      "Granularity": "DAILY",
+      "IsBillingItem": "true"
+    },
+    "auth": {
+      "type": "aliyun_rpc",
+      "access_key_id": "${secrets.aliyun_bill_access_key_id}",
+      "access_key_secret": "${secrets.aliyun_bill_access_key_secret}"
+    },
+    "records_path": "Data.Items.Item",
+    "records_missing": "empty",
+    "//records_missing": "零消费日接口返回 Items: {}（没有 Item 键），按空结果处理；默认 error 会报错",
+    "add_fields": { "source_account": "<账号别名，如 alibabacloud1>" },
+    "fail_if": [
+      { "path": "Code", "not_equals": "Success", "message_path": "Message", "retry": true }
+    ]
+  },
+
+  "window": {
+    "mode": "per_day",
+    "days": 15,
+    "date_tz": "UTC",
+    "api_tz": "+08:00",
+    "pad_hours": 0,
+    "start_param": "BillingDate",
+    "//end_param": "该接口按 BillingDate + BillingCycle 查询，没有结束时间参数，故不配 end_param",
+    "format": "%Y-%m-%d",
+    "extra_params": { "BillingCycle": "%Y-%m" }
+  },
+
+  "pagination": {
+    "type": "page",
+    "page_param": "PageNum",
+    "size_param": "PageSize",
+    "page_size": 300,
+    "total_items_path": "Data.TotalCount",
+    "delay_seconds": 0.5,
+    "max_pages": 2000,
+    "window_retries": 2
+  },
+
+  "target": {
+    "project": "<项目名>",
+    "table": "ods_trade_aliyun_bill_json_di",
+    "pt": "${bizdate}",
+    "column": "json",
+    "comment": "阿里云账单明细（QueryInstanceBill；JSON 原样，分区=业务日，含最近 N 天窗口）",
+    "stored_as": "aliorc",
+    "lifecycle_days": 36500
+  }
+}

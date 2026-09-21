@@ -1,0 +1,10 @@
+include README.md
+include LICENSE
+include requirements.txt
+include CHANGELOG.md
+include signers.example.py
+
+# 只带 .example.json 模板；真实作业（jobs/*.json，含密钥）绝不进包
+recursive-include jobs *.example.json
+
+recursive-include tests *.py

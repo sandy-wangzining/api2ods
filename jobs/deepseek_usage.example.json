@@ -1,0 +1,66 @@
+{
+  "job": "deepseek_usage_daily",
+  "description": "DeepSeek 用量明细（导出接口返回 ZIP，内含 amount CSV）→ ODS（每行 CSV 一条 JSON）",
+
+  "secrets": {
+    "deepseek_token": "<platform.deepseek.com 的 userToken（找持号人要；过期后用旧下载脚本 --set-token 刷新并更新这里）>"
+  },
+  "maxcompute": {
+    "project": "<项目名>",
+    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "access_key_id": "<阿里云 AccessKeyId>",
+    "access_key_secret": "<阿里云 AccessKeySecret>"
+  },
+
+  "request": {
+    "base_url": "https://platform.deepseek.com",
+    "path": "/api/v0/usage/export",
+    "method": "GET",
+    "timeout_seconds": 180,
+    "params": { "tz": 28800 },
+    "headers": {
+      "Accept": "*/*",
+      "x-client-platform": "web",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+    },
+    "auth": {
+      "type": "token",
+      "header": "Authorization",
+      "prefix": "Bearer ",
+      "value": "${secrets.deepseek_token}"
+    },
+    "response_type": "bytes",
+    "//response_type": "返回是 zip 文件（不是 JSON），走文件解析通道；不支持分页"
+  },
+
+  "window": {
+    "mode": "per_day",
+    "days": 15,
+    "date_tz": "Asia/Shanghai",
+    "api_tz": "+08:00",
+    "pad_hours": 0,
+    "start_param": "start",
+    "end_param": "end",
+    "format": "unix",
+    "//format": "接口要 unix 秒（左闭右开区间）；也可写 unix_ms"
+  },
+
+  "parse": {
+    "format": "csv",
+    "encoding": "utf-8-sig",
+    "unzip": true,
+    "entry_contains": "amount",
+    "entry_field": "__file",
+    "//": "只取 zip 里文件名含 amount 的 CSV；每行加 __file 列记录来源文件（DWD 可用来区分）"
+  },
+
+  "pagination": { "type": "none" },
+
+  "target": {
+    "project": "<项目名>",
+    "table": "ods_trade_deepseek_usage_json_di",
+    "pt": "${bizdate}",
+    "column": "json",
+    "comment": "DeepSeek 用量明细（导出 ZIP 的 amount CSV，每行一条 JSON；分区=业务日，含最近 N 天窗口）"
+  }
+}
