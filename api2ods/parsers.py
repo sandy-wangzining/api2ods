@@ -15,6 +15,24 @@ from .utils import ConfigError, as_bool, log
 _PATH_TOKEN_RE = re.compile(r"^([^\[\]]*)((?:\[\d+\])*)$")
 _INDEX_RE = re.compile(r"\[(\d+)\]")
 
+# 行边界只认 \r\n / \r / \n（与 csv / JSONL 的行定义一致）。不用 str.splitlines()：
+# 它还会在 \x0b \x0c \x1c \x1d \x1e \x85     处分行——报表导出里的分页符
+# \x0c 会让 skip_rows 与 csv.reader 的"第几行"错位（表头错位、列名全错还照样成功），
+# JSON 字符串里的 U+2028（合法字符，工具自己 dump 的记录就可能有）会被劈成两半
+_LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
+
+
+def _split_lines(text: str, keepends: bool = False) -> list[str]:
+    """按 \\r\\n / \\r / \\n 切行；keepends=True 时保留行尾换行符（见上方 _LINE_RE 说明）。"""
+    lines = []
+    for match in _LINE_RE.finditer(text):
+        segment = match.group(0)
+        if not segment:
+            continue
+        lines.append(segment if keepends else segment.rstrip("\r\n"))
+    return lines
+
+
 # CSV 单字段默认只允许 128KB，报表类文件很容易超；调到接近 MaxCompute 单列上限
 _CSV_FIELD_LIMIT = 7_000_000
 try:
@@ -96,6 +114,11 @@ def extract_json_records(payload, request_cfg: dict, label: str, missing_ok: boo
         hint = (f"找不到 records_path={records_path!r}（顶层键：{top_keys}）" if records_path
                 else "records_path 为空且返回不是记录数组")
         raise RuntimeError(f"{label} 解析失败：{hint}；返回片段：{snippet}")
+    if isinstance(records, dict) and not records:
+        # 路径落在空对象上（Items: {}、data: {}）——接口用它表示"这次没有数据"。
+        # 原样包成一条 {} 会往 ODS 写一条全 NULL 的假记录；分页时它还会让"零数据日"
+        # 的豁免失效，一路翻到 max_pages 才报错
+        return []
     return ensure_object_records(records, label)
 
 
@@ -119,12 +142,12 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
 
     if skip_rows:
         before = text
-        text = "".join(text.splitlines(keepends=True)[skip_rows:])
+        text = "".join(_split_lines(text, keepends=True)[skip_rows:])
         if before.strip() and not text.strip():
             # 文件本来有内容，被 skip_rows 一行不剩地跳空了：要么 skip_rows 配大了，
             # 要么源文件结构缩水（比如错误页只有两行）。空结果是静默的，得留个痕
             log(f"  警告：{label or '文件'} 按 skip_rows={skip_rows} 跳过之后没有任何内容"
-                f"（原文件 {len(before.splitlines())} 行）；请核对 parse.skip_rows 与文件结构")
+                f"（原文件 {len(_split_lines(before))} 行）；请核对 parse.skip_rows 与文件结构")
     if skip_until and not text.strip():
         # 配置了两个跳过项、且 skip_rows 正好把内容全跳空了：按空结果处理。
         # 这条要放在冲突检测前面——"文件里有内容"这个前提不成立时，
@@ -143,7 +166,7 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
         # 文件有内容却没有明细段 = 结构变了/拿到错误页，报错触发整窗重试（否则静默少拉一天）
         # keepends=True + 直接叠加：用 splitlines() 再 join 会把「引号里跨行的 CSV 字段」
         # 的换行重建掉，字段内容被悄悄改掉
-        lines = text.splitlines(keepends=True)
+        lines = _split_lines(text, keepends=True)
         for index, line in enumerate(lines):
             if skip_until in line:
                 text = "".join(lines[index:])
@@ -168,10 +191,22 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
         except csv.Error as exc:
             raise RuntimeError(f"{label or '文件'} 表头解析失败：{exc}（引号未闭合？）")
         if not fieldnames:
+            # 首行是空行（表头为空）时，后面所有数据行都会被静默丢掉（0 行）。
+            # 文件本身为空才是 0 行；"有内容却解析不出表头"说明文件结构变了
+            if text.strip():
+                raise RuntimeError(
+                    f"{label or '文件'} 的第一行是空行（表头为空），无法解析；"
+                    f"文件开头：{text.lstrip()[:120]!r}"
+                )
             return []
         try:
             for line_no, row in enumerate(reader, start=2):
-                if row is None or all(v is None or str(v).strip() == "" for v in row.values()):
+                if row is None:
+                    continue
+                if (all(v is None or str(v).strip() == "" for v in row.values())
+                        and len(fieldnames) > 1):
+                    # 全空白行：多列文件里是排版垃圾，跳过；单列文件里它就是"值为空"的
+                    # 一条合法记录，丢掉等于静默少数
                     continue
                 # 列数比表头多：多出来的字段会落进 restkey=None，静默丢字段等于写错数据
                 extra = row.pop(None, None)
@@ -189,11 +224,15 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
                 f"{label or '文件'} 第 {reader.line_num} 行 CSV 解析失败：{exc}；"
                 f"多半是引号未闭合/字段内含未转义的引号，整份文件的行数会因此对不上"
             )
-        # 同名列会让前面的列被后面的覆盖，等于静默丢列（表头都是字符串时才可能出现）
+        # 同名列会让前面的列被后面的覆盖、空列名的键是 ""（下游 get_json_object 取不到），
+        # 都等于静默丢列（表头都是字符串时才可能出现）
+        if fieldnames and any(str(name).strip() == "" for name in fieldnames):
+            raise RuntimeError(
+                f"{label or '文件'} 的 CSV 表头有空列名（行尾多了一个分隔符？）：{fieldnames}")
         if fieldnames and len(fieldnames) != len(set(fieldnames)):
             raise RuntimeError(f"{label or '文件'} 的 CSV 表头有重复列名，解析会丢列：{fieldnames}")
     elif fmt == "jsonl":
-        for line_no, line in enumerate(text.splitlines(), start=1):
+        for line_no, line in enumerate(_split_lines(text), start=1):
             line = line.strip()
             if not line:
                 continue
@@ -230,14 +269,25 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
     allow_multi_entry = as_bool(parse_cfg.get("allow_multi_entry"), default=False)
     entry_contains = str(parse_cfg.get("entry_contains") or "")
 
-    # 防呆：接口出错时经常返回 JSON（HTTP 200），而不是文件流；这里直接给出可读报错
-    # lstrip b"\xef\xbb\xbf"：带 BOM 的 JSON 错误体前缀不是 "{"，漏掉会给出"期望 ZIP"的误导报错
-    if data.lstrip(b" \t\r\n\xef\xbb\xbf")[:1] == b"{":
+    # 防呆：接口出错时经常返回 JSON（HTTP 200），而不是文件流；这里直接给出可读报错。
+    # lstrip b"\xef\xbb\xbf"：带 BOM 的 JSON 错误体前缀不是 "{"，漏掉会给出"期望 ZIP"的误导报错。
+    # parse.format=jsonl 时跳过：JSONL 文件本身就是一行一个 JSON 对象，"只有 1 条记录的文件"
+    # 与 JSON 错误体在内容上无法区分，拦下来会让低流量源（每天 1 条）永远跑不通
+    probe = data.lstrip(b" \t\r\n\xef\xbb\xbf")
+    if (probe[:1] in (b"{", b"[")
+            and str(parse_cfg.get("format") or "").lower() != "jsonl"):
+        payload = None
         try:
             payload = loads_json(data.decode("utf-8-sig", "replace"))
         except ValueError:
-            payload = None
-        if isinstance(payload, dict):
+            # 解不出来又以 }/] 收尾：大概率是含 NaN/被截断的 JSON 错误体。
+            # （CSV 表头以 { [ 开头虽罕见但合法，所以只在这个更窄的形态上报错）
+            if probe[-1:] in (b"}", b"]"):
+                raise RuntimeError(
+                    f"{label} 期望文件流，但响应像一个无法解析的 JSON（含 NaN/Infinity 或被截断）："
+                    f"{data[:200].decode('utf-8', 'replace')!r}"
+                )
+        if isinstance(payload, (dict, list)):
             raise RuntimeError(
                 f"{label} 期望文件流，但接口返回了 JSON（多半是错误信息）："
                 f"{json.dumps(payload, ensure_ascii=False)[:300]}"

@@ -169,9 +169,12 @@ def _lock_path(job_path: Path) -> Path:
     for base in candidates:
         try:
             base.mkdir(parents=True, exist_ok=True)
-            probe = base / ".probe"
-            probe.write_text("", encoding="utf-8")
-            probe.unlink()
+            # 探测文件名必须唯一（mkstemp）：原来用所有作业共享的 ".probe"，并发启动时
+            # 别的进程先 unlink 会让本进程抛 FileNotFoundError，于是"静默"落到下一个候选
+            # 目录——同一作业的两个实例锁在不同路径上，互斥失效
+            handle, probe = tempfile.mkstemp(prefix=".probe-", dir=str(base))
+            os.close(handle)
+            os.unlink(probe)
             return base / f"{name}.lock"
         except OSError:
             continue
@@ -257,7 +260,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     job_dir = job_path.parent
     project, table_name, column, pt = resolve_target(job, config, args, bizdate)
     target_cfg = job.get("target") or {}
-    days = resolve_days(args, job)
+    days = resolve_days(args, job, bizdate)
     pagination = job.get("pagination") or {}
 
     # 构造 Fetcher 会读 signers.py（自定义签名）：文件缺失/写错时抛 SystemExit，
@@ -406,6 +409,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if not args.job:
         log("请用 --job 指定作业配置文件（第一次接新源可以先用 `api2ods --init` 生成）")
+        # 提前返回同样要摘掉日志 sink：不然同进程再次调用 main 时，日志会继续写进上一轮的文件
+        _detach_log_sink(log_handle)
         return 2
 
     try:
@@ -481,6 +486,12 @@ def main(argv: list[str] | None = None) -> int:
                 # 主线程一句 return 1 之后，解释器退出会 join 它们，调度看到的就是"报了错还赖着"
                 return _exit_now(1)
             return rc
+        except SystemExit as exc:
+            # 配置类错误（ConfigError 是 SystemExit 子类）从 run_sync 里冒泡时同样带着
+            # 在飞请求：不走 _exit_now 的话，解释器退出阶段仍要 join 它们（实测进程耗时
+            # 随在飞请求线性增长）。消息可能是配置片段，log 前统一过脱敏
+            log(f"❌ {redact(str(exc))}")
+            return _exit_now(1)
         except KeyboardInterrupt:
             # 准备阶段（还没进 run_sync）被 Ctrl+C：没有线程要等，但走同一条出口更省心
             log("已中断（尚未开始运行），退出")

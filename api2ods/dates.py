@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -15,15 +16,19 @@ DEFAULT_DATE_TZ = "Asia/Shanghai"
 DEFAULT_API_TZ = "+08:00"
 DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 _OFFSET_RE = re.compile(r"^([+-])(\d{1,2})(?::?(\d{2}))?$")
-# 带时刻的格式指令：出现任意一个就说明接口要的是"时间点"，需要按时区换算
-_TIME_TOKENS = ("%H", "%I", "%M", "%S", "%f", "%p", "%X", "%T", "%c", "%z", "%Z")
+# 带时刻的格式指令：出现任意一个就说明接口要的是"时间点"，需要按时区换算。
+# %R（= %H:%M）/%r（12 小时制）/ %s（epoch 秒）也是常见的"带时刻"写法，
+# 漏掉它们会把这类 format 误判成"只到日期"：跳过时区换算、end 取闭区间，
+# 窗口直接塌成零长度（start == end）而没有任何告警
+_TIME_TOKENS = ("%H", "%I", "%M", "%S", "%f", "%p", "%P", "%X", "%T", "%R", "%r", "%s",
+                "%c", "%z", "%Z")
 _UNIX_FORMATS = ("unix", "unix_s", "unix_ms", "unix_millis")
 
 
 def is_date_only_format(fmt: str) -> bool:
     """格式是否只到"日"（没有时分秒），如 %Y-%m-%d / %Y%m%d / %Y-%m。"""
     fmt = str(fmt or "")
-    if fmt in _UNIX_FORMATS:
+    if fmt.lower() in _UNIX_FORMATS:
         return False
     return not any(token in fmt for token in _TIME_TOKENS)
 
@@ -114,14 +119,25 @@ def env_bizdate(strict: bool = True) -> date | None:
         ) from exc
 
 
-def resolve_days(args, job: dict) -> list[date]:
+def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
     """命令行参数 → 待拉取的日期列表（升序）。
 
     优先级：--dates > --start-date/--end-date > --bizdate（或环境变量）> 默认（时区昨天）。
     回拉天数：--days 覆盖配置 window.days（默认 1），语义 = 含基准日的最近 N 天。
+
+    bizdate：调用方（main）已经定好的业务日；给了它就别再自己读时钟——原来这里和
+    main 各读一次 datetime.now()，跨零点时 pt 与"拉哪几天"会错开一天（数据写进错的
+    pt 且先删后填）。不传时保持旧行为（独立可用、测试友好）。
     """
     window = job.get("window") or {}
     tz = date_tz_of(job)
+
+    if getattr(args, "days", None) is not None and (
+            getattr(args, "dates", "") or getattr(args, "start_date", "")
+            or getattr(args, "end_date", "")):
+        # 补数模式下拉取范围由 --dates / --start-date+--end-date 决定，--days 不参与；
+        # 静默忽略会让"--start-date X --end-date Y --days 1"看起来像只拉一天
+        log_once("  提示：补数模式（--dates / --start-date+--end-date）下 --days 不生效")
 
     if getattr(args, "dates", ""):
         days = [parse_day_arg(x) for x in args.dates.split(",") if x.strip()]
@@ -140,17 +156,26 @@ def resolve_days(args, job: dict) -> list[date]:
         # （--check 用 strict=False 时这里就真的会二次抛），显式参数优先这条规则必须一致
         if getattr(args, "bizdate", ""):
             base = parse_day_arg(args.bizdate)
+        elif bizdate is not None:
+            # 调用方已经算过业务日（--bizdate / 环境变量 / 默认昨天），直接用——
+            # 在这里二次读时钟会与 pt 的取值错开（见 docstring）
+            base = bizdate
         else:
             from_env = env_bizdate(strict=not getattr(args, "check", False))
             base = (from_env if from_env is not None
                     else datetime.now(tz).date() - timedelta(days=1))
+        from_cli = getattr(args, "days", None) is not None
         try:
-            count = (args.days if getattr(args, "days", None) is not None
-                     else int(window.get("days") or 1))
+            if from_cli:
+                count = int(args.days)
+            else:
+                configured = window.get("days")
+                # 不用 `or 1`：0 会被静默当成默认值 1（window.days=0 是笔误，该报错）
+                count = 1 if configured is None or configured == "" else int(configured)
         except (TypeError, ValueError):
             raise SystemExit(f"window.days 必须是整数，实际 {window.get('days')!r}")
         if count < 1:
-            raise SystemExit("--days 必须 >= 1")
+            raise SystemExit(f"{'--days' if from_cli else 'window.days'} 必须 >= 1，实际 {count}")
         days = [base - timedelta(days=count - 1 - i) for i in range(count)]
     return sorted(set(days))
 
@@ -158,9 +183,10 @@ def resolve_days(args, job: dict) -> list[date]:
 def format_time(value: datetime, fmt: str):
     """按配置格式化时间：支持 unix（秒）/ unix_ms（毫秒）两种特殊格式。"""
     fmt = str(fmt or DEFAULT_TIME_FORMAT)
-    if fmt in ("unix", "unix_s"):
+    lowered = fmt.lower()
+    if lowered in ("unix", "unix_s"):
         return int(value.timestamp())
-    if fmt in ("unix_ms", "unix_millis"):
+    if lowered in ("unix_ms", "unix_millis"):
         return int(value.timestamp() * 1000)
     return value.strftime(fmt)
 
@@ -223,6 +249,9 @@ def window_param_sets(job: dict, days: list[date]) -> list[dict | None]:
         pad_hours = float(win.get("pad_hours") or 0)
     except (TypeError, ValueError):
         raise ConfigError(f"window.pad_hours 必须是数字（小时），实际 {win.get('pad_hours')!r}")
+    if not math.isfinite(pad_hours):
+        # NaN 跟谁比都是 False，会绕过下面的 0~24 校验，最后在 timedelta 里抛裸 ValueError
+        raise ConfigError(f"window.pad_hours 必须是有限数字，实际 {win.get('pad_hours')!r}")
     if pad_hours < 0 or pad_hours > 24:
         raise ConfigError(
             f"window.pad_hours 应在 0~24 之间，实际 {pad_hours:g}："
