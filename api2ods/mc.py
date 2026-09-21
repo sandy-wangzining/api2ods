@@ -8,7 +8,7 @@ import os
 import time
 from pathlib import Path
 
-from .utils import log, retry_call
+from .utils import log, progress_log, retry_call
 
 try:
     from odps import ODPS
@@ -17,7 +17,8 @@ except ImportError:  # pragma: no cover
 
 PARTITION_COLUMN = "pt"
 SQL_TIMEOUT_SECONDS = 600
-WRITE_BATCH_SIZE = 1000
+WRITE_BATCH_SIZE = 1000        # 写入分批的行数上限（实际分批在 SpoolWriter.iter_batches 里做）
+MAX_BATCH_BYTES = 8_000_000    # 写入分批的字节上限：单条记录很大时防止攒批吃内存
 MAX_ROW_BYTES = 7_000_000      # MaxCompute string 上限 8MB，留余量提前报错
 SQL_HEARTBEAT_SECONDS = 30
 DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
@@ -52,8 +53,25 @@ def load_mc_credentials(profile: dict, source_label: str = "作业文件", cli_p
 
     cli_config_file = Path.home() / ".aliyun" / "config.json"
     if cli_config_file.is_file():
-        cli_config = json.loads(cli_config_file.read_text(encoding="utf-8"))
-        profiles = {p.get("name"): p for p in cli_config.get("profiles", [])}
+        # 这个文件是"锦上添花"的凭证来源，坏了不该抛裸 traceback（空文件 = JSONDecodeError，
+        # profiles 写成对象 = 'str' object has no attribute 'get'），说明白文件名和原因就行
+        try:
+            cli_config = json.loads(cli_config_file.read_text(encoding="utf-8"))
+            if not isinstance(cli_config, dict):
+                raise ValueError(f"顶层应是 JSON 对象，实际是 {type(cli_config).__name__}")
+            raw_profiles = cli_config.get("profiles") or []
+            if not isinstance(raw_profiles, list):
+                raise ValueError(f"profiles 应是数组，实际是 {type(raw_profiles).__name__}")
+            unknown = [p for p in raw_profiles if not isinstance(p, dict)]
+            if unknown:
+                raise ValueError(f"profiles 的每个元素应是对象，实际有 {type(unknown[0]).__name__}")
+            profiles = {p.get("name"): p for p in raw_profiles}
+        except (OSError, ValueError) as exc:
+            raise SystemExit(
+                f"本机 aliyun CLI 配置读不了（{cli_config_file}）：{exc}\n"
+                f"  可以不修它——改用作业文件的 maxcompute.access_key_id/access_key_secret，"
+                f"或设环境变量 ALIYUN_ACCESS_KEY_ID / ALIYUN_ACCESS_KEY_SECRET"
+            ) from exc
         names = [cli_profile] if cli_profile else [cli_config.get("current")]
         names += [
             name for name, item in profiles.items()
@@ -139,6 +157,9 @@ def verify_target_schema(table, table_name: str, column: str) -> None:
     检查顺序：不是视图 → 不是事务表 → 非分区列只有 json 列 → 分区列只有 pt →
     所有列都是 string。任何一条不满足都给出"要求 vs 实际"的对比，拒绝写入，
     避免把 JSON 写进宽表/事务表把线上数据搞乱。
+
+    列名比较忽略大小写：MaxCompute 标识符大小写不敏感，别人建表写成 JSON/PT 时
+    结构与要求一致，按大小写敏感比较会把能写的表拒掉。
     """
     if getattr(table, "is_virtual_view", False) or getattr(table, "is_materialized_view", False):
         raise SystemExit(f"{table_name} 是视图，不能作为写入目标")
@@ -150,7 +171,8 @@ def verify_target_schema(table, table_name: str, column: str) -> None:
     schema = table.table_schema
     partitions = [str(col.name) for col in schema.partitions]
     columns = [str(col.name) for col in schema.columns if str(col.name) not in partitions]
-    if columns != [column] or partitions != [PARTITION_COLUMN]:
+    if ([name.lower() for name in columns] != [column.lower()]
+            or [name.lower() for name in partitions] != [PARTITION_COLUMN.lower()]):
         raise SystemExit(
             f"{table_name} 表结构与框架要求不一致，拒绝写入。\n"
             f"  要求：列 [{column}] + 分区 [{PARTITION_COLUMN}]\n"
@@ -177,41 +199,48 @@ def ensure_target_table(o, project: str, table_name: str, column: str, comment: 
 # =============================================================================
 
 def write_partition(table, table_name: str, partition_value: str,
-                    rows_factory, total: int | None = None,
-                    retries: int = 3, batch_size: int = WRITE_BATCH_SIZE) -> int:
-    """先删再填一个分区（delete → create → Tunnel 分批写入），整段失败自动重试。
+                    batches_factory, total: int | None = None,
+                    retries: int = 3) -> int:
+    """先删再填一个分区（delete → create → Tunnel 写入），整段失败自动重试。
 
-    - rows_factory：一个"可重复调用"的函数，每次返回从头开始的迭代器（Spool 读回）；
+    - batches_factory：一个"可重复调用"的函数，每次返回从头开始的「批次迭代器」；
       用工厂而不是列表，是为了支持失败重试时重新读一遍，同时内存里只留一个批次。
+      批次在读取侧切好（见 SpoolWriter.iter_batches）：单条记录很大时按行数攒批会吃内存。
     - total：预期行数；写完后核对，不一致报错（调用方再与 count(*) 二次校验）。
-    - 单行超过 MAX_ROW_BYTES 直接报错（MaxCompute 单列上限 8MB，提前失败比写一半好）。
+    - 单行超过 MAX_ROW_BYTES 直接报错；检查必须在删分区之前——这类记录永远写不进去，
+      先删后失败等于白丢一天数据（重跑也救不回来，只能重拉 API）。
     """
     spec = f"{PARTITION_COLUMN}={partition_value}"
 
-    def _do() -> int:
-        table.delete_partition(spec, if_exists=True)      # 先删：重复跑/补数不会叠加
-        table.create_partition(spec, if_not_exists=True)
-        written = 0
-        batch: list[list[str]] = []
-        with table.open_writer(partition=spec) as writer:  # Tunnel 写入
-            for row in rows_factory():
+    def _check_row_sizes() -> None:
+        """通读一遍所有行，找出超长记录；顺序号从 1 数起，报错里能定位到第几条。"""
+        index = 0
+        for rows in batches_factory():
+            for row in rows:
+                index += 1
                 size = len(row.encode("utf-8"))
                 if size > MAX_ROW_BYTES:
                     raise SystemExit(
-                        f"第 {written + len(batch) + 1:,} 条记录 JSON 大小 {size:,} 字节，"
+                        f"第 {index:,} 条记录 JSON 大小 {size:,} 字节，"
                         f"超过单列上限（约 {MAX_ROW_BYTES:,} 字节）；请检查 records_path "
                         f"是否指到了大对象、或该接口记录过大"
                     )
-                batch.append([row])
-                if len(batch) >= batch_size:
-                    writer.write(batch)
-                    written += len(batch)
-                    batch = []
-                    if written % (batch_size * 10) == 0:
-                        log(f"    写入进度：{written:,} 行")
-            if batch:
-                writer.write(batch)
-                written += len(batch)
+
+    def _do() -> int:
+        """完整的"校验 → 删 → 建 → 写"一趟，交给 retry_call 重试（每趟都从头读数据）。"""
+        _check_row_sizes()
+        table.delete_partition(spec, if_exists=True)      # 先删：重复跑/补数不会叠加
+        table.create_partition(spec, if_not_exists=True)
+        # 重试要重新读一遍数据，所以 writer 与 written 都在重试时重置。
+        # reopen=True：不复用上一次失败留下的 Tunnel 上传会话——复用会把上次已上传的块
+        # 与本轮全量一起提交（写到一半失败时，pyodps 的 with 不 close、会话仍留在缓存里），
+        # 结果是分区里出现重复行。
+        with table.open_writer(partition=spec, reopen=True) as writer:  # Tunnel 写入
+            written = 0
+            for rows in batches_factory():
+                writer.write([[row] for row in rows])
+                written += len(rows)
+                progress_log(f"{table_name} pt={partition_value} 写入", written, "行")
         return written
 
     written = retry_call(_do, attempts=max(1, retries), base_delay=10,
@@ -224,8 +253,9 @@ def write_partition(table, table_name: str, partition_value: str,
 def count_partition(o, project: str, table_name: str, partition_value: str,
                     timeout: int = SQL_TIMEOUT_SECONDS) -> int:
     """SELECT COUNT(*) 校验分区行数（用于写后核对）。"""
+    literal = str(partition_value).replace("'", "''")     # 拼 SQL 前转义，避免值里有引号炸掉语句
     sql = (f"select count(*) as cnt from {project}.{table_name} "
-           f"where {PARTITION_COLUMN} = '{partition_value}'")
+           f"where {PARTITION_COLUMN} = '{literal}'")
     instance = run_sql_with_timeout(o, sql, timeout=timeout, desc=f"校验 {table_name} 行数")
     with instance.open_reader() as reader:
         for row in reader:

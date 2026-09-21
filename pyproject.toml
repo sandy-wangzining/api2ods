@@ -21,6 +21,8 @@ classifiers = [
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Database",
   "Topic :: Internet :: WWW/HTTP",
 ]
@@ -35,6 +37,9 @@ api2ods = "api2ods.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/sandy-wangzining/api2ods"
+Source = "https://github.com/sandy-wangzining/api2ods"
+Issues = "https://github.com/sandy-wangzining/api2ods/issues"
+Changelog = "https://github.com/sandy-wangzining/api2ods/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = ["ruff>=0.5"]

@@ -1,0 +1,56 @@
+name: 功能建议
+description: 提一个需求或改进想法（新数据源形态、新配置项、易用性）
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提需求前先看一眼 README 的「配置参考」——**很多需求不加代码，写配置就能表达**
+        （鉴权、分页、时间窗口、文件解析都有对应字段）。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 想解决什么问题
+      description: 描述你遇到的场景，而不是直接给方案——这样更容易找到更通用的做法
+      placeholder: |
+        例：某个接口的鉴权是"把参数按固定顺序拼完再 base64"，现有 auth 类型都不覆盖
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: 现在怎么绕过的（可选）
+      description: "比如用 auth.type: custom + signers.py 兜住，或跑之前的独立脚本"
+    validations:
+      required: false
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你设想的做法（可选）
+      placeholder: |
+        例：加一个 auth.type: xxx，配置写 {"secret_key": "...", "join_order": [...]}
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响范围
+      options:
+        - 只影响我自己的一个数据源
+        - 一类接口形态（其他人也可能遇到）
+        - 工具通用能力（配置/命令行/写入流程）
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已确认现有配置项无法表达这个需求（必要时贴出试过的配置）
+          required: false

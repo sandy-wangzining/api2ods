@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.parse
 from pathlib import Path
 
@@ -33,6 +34,8 @@ AUTH_CHOICES = (
     "6 = Onerway 式 sha256 签名（参数排序拼接 + 密钥）",
     "7 = 自定义 signers.py（高级，需自己写函数）",
 )
+# 与 AUTH_CHOICES 一一对应：用于校验用户输入的编号是否合法
+AUTH_IDS = ("0", "1", "2", "3", "4", "5", "6", "7")
 
 
 def _ask(ask, prompt: str, default: str = "") -> str:
@@ -48,6 +51,18 @@ def _ask_choice(ask, prompt: str, choices: tuple, default: str = "0", echo=print
     for line in choices:
         echo(f"    {line}")
     return _ask(ask, "请选择编号", default)
+
+
+def _ask_int(ask, prompt: str, default: int, echo=print) -> int:
+    """问一个整数；回车用默认值，填了非数字就提示后重问（不抛裸 traceback）。"""
+    for _ in range(3):
+        answer = str(_ask(ask, prompt, str(default))).strip()
+        try:
+            return int(answer)
+        except ValueError:
+            echo(f"   {answer!r} 不是整数，请填数字（如 {default}）")
+    echo(f"   连续三次没填对，先按默认值 {default} 写进配置（之后可以在文件里改）。")
+    return default
 
 
 def _split_url(raw: str) -> tuple[str, str] | None:
@@ -75,6 +90,12 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
 
         # ---------------------------------------------------------- ① 作业与接口
         job_name = _ask(ask, "① 作业名（英文/数字/下划线，用于文件名和日志）", "my_api")
+        # 作业名直接当文件名用，含路径分隔符/.. 时会写到 jobs 目录之外；
+        # 顺手统一去掉不安全字符，生成的配置里留着原名也无妨（只是日志标识）
+        safe_name = re.sub(r"[^0-9A-Za-z_\-]", "_", job_name).strip("_") or "my_api"
+        if safe_name != job_name:
+            echo(f"   提示：作业名里的特殊字符已替换为下划线，文件名用 {safe_name}")
+        job_name = safe_name
 
         raw_url = ""
         for _ in range(3):
@@ -98,6 +119,12 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
 
         # ---------------------------------------------------------- ② 鉴权
         auth_choice = _ask_choice(ask, "④ 接口怎么鉴权？", AUTH_CHOICES, "1", echo)
+        if auth_choice not in AUTH_IDS:
+            # 原来自动落到最后的 else（自定义 signers.py）分支，生成一份跑起来必报
+            # "找不到自定义签名文件"的配置；跟分页/窗口的非法编号一样回退到默认值
+            echo(f"   编号 {auth_choice} 不是有效选项（可用 {AUTH_IDS}），按「Bearer Token」继续"
+                 f"（生成的配置里可以手工改）。")
+            auth_choice = "1"
         auth: dict = {}
         if auth_choice == "0":
             auth = {"type": "none"}
@@ -143,6 +170,8 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             echo,
         )
         pagination: dict = {"type": "none"}
+        if page_choice not in ("0", "1", "2"):
+            echo(f"   编号 {page_choice} 不是有效选项，按「不翻页」继续（生成的配置里可以手工改）。")
         if page_choice == "1":
             echo("   翻页终点至少要给一个（总页数字段 或 总条数字段，形如 data.totalPages / data.totalCount）")
             total_pages_path = _ask(ask, "   总页数字段路径")
@@ -150,14 +179,25 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             if not total_pages_path and not total_items_path:
                 total_pages_path = "data.totalPages"
                 echo(f"   两个都留空了，先按 {total_pages_path} 写（跑 --check 报错后再改）")
-            pagination = {"total_pages_path": total_pages_path} if total_pages_path else {}
+            pagination = {"type": "page", "total_pages_path": total_pages_path} if total_pages_path else {}
             if total_items_path:
+                pagination.setdefault("type", "page")
                 pagination["total_items_path"] = total_items_path
             pagination["delay_seconds"] = 0.5
             # page/size 等参数用默认值（page/size/100），接口不一样时再手工补
         elif page_choice == "2":
-            cursor_path = _ask(ask, "   下一页游标在返回里的路径（如 data.nextCursor）")
-            pagination = {"cursor_path": cursor_path}
+            cursor_path = ""
+            for _ in range(3):
+                cursor_path = _ask(ask, "   下一页游标在返回里的路径（如 data.nextCursor）")
+                if cursor_path:
+                    break
+                echo("   游标路径不能为空——留空的话分页会失效、只会拉第一页，"
+                     "不知道路径可以先跑一次 --check 看返回的字段名。")
+            if not cursor_path:
+                echo("❌ 游标路径连续三次为空，已取消（没有游标路径就无法翻页）。")
+                return 1
+            # 显式写 type：只写 cursor_path 也能推断出来，但写全了更好读
+            pagination = {"type": "cursor", "cursor_path": cursor_path}
 
         # ---------------------------------------------------------- ⑤ 取数窗口
         window_choice = _ask_choice(
@@ -169,23 +209,26 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             echo,
         )
         window: dict = {}
+        if window_choice not in ("0", "1", "2"):
+            echo(f"   编号 {window_choice} 不是有效选项，按「不传时间」继续"
+                 f"（生成的配置里可以手工补 window 块）。")
         if window_choice == "1":
-            days = _ask(ask, "   每次回拉最近几天", "15")
+            days = _ask_int(ask, "   每次回拉最近几天", 15, echo)
             start_param = _ask(ask, "   开始时间参数名", DEFAULT_START_PARAM)
             end_param = _ask(ask, "   结束时间参数名（不需要就填 -）", DEFAULT_END_PARAM)
             window = {
                 "mode": "per_day",
-                "days": int(days or "15"),
+                "days": days,
                 "start_param": start_param,
                 "end_param": None if end_param == "-" else end_param,
                 "format": _ask(ask, "   时间格式（unix=秒，或 strftime 格式）", DEFAULT_TIME_FORMAT),
             }
             echo("   （时区默认 Asia/Shanghai、+08:00；要改就编辑文件里的 date_tz/api_tz）")
         elif window_choice == "2":
-            days = _ask(ask, "   每次覆盖最近几天", "7")
+            days = _ask_int(ask, "   每次覆盖最近几天", 7, echo)
             window = {
                 "mode": "range",
-                "days": int(days or "7"),
+                "days": days,
                 "start_param": _ask(ask, "   开始时间参数名", DEFAULT_START_PARAM),
                 "end_param": _ask(ask, "   结束时间参数名", DEFAULT_END_PARAM),
                 "format": _ask(ask, "   时间格式", DEFAULT_TIME_FORMAT),
@@ -259,7 +302,15 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo(f"  3) 试跑：  api2ods --job {target_path.name} --days 1 --dry-run")
         echo(f"  4) 正式：  api2ods --job {target_path.name} --bizdate ${{bizdate}}")
         return 0
-    except (KeyboardInterrupt, EOFError):
+    except (KeyboardInterrupt, EOFError, ValueError):
+        # stdin 被关闭（`api2ods --init <&-`、CI 里没接管道）时 input() 抛的是
+        # ValueError / RuntimeError，不是 EOFError，漏掉就是一屏裸 traceback
         echo("")
         echo("已取消，未生成任何文件。")
+        return 1
+    except RuntimeError as exc:                     # "lost sys.stdin"（没有标准输入）
+        if "stdin" not in str(exc):
+            raise
+        echo("")
+        echo(f"无法读取交互输入（{exc}）；--init 需要在终端里交互运行。")
         return 1

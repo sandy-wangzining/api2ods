@@ -16,6 +16,8 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
+from .utils import ConfigError
+
 ALIYUN_RPC_SIGNATURE_VERSION = "1.0"
 
 
@@ -52,10 +54,12 @@ class AuthApplier:
     """按配置给请求参数/请求头做鉴权（原地修改 params / headers）。"""
 
     def __init__(self, request_cfg: dict, job_dir: Path):
+        """job_dir 用于定位自定义签名文件 signers.py（相对路径按作业文件所在目录解析）。"""
         self.cfg = request_cfg.get("auth") or {}
         self.type = str(self.cfg.get("type") or "none").lower()
         self.job_dir = job_dir
         self._custom_func = None
+        self._custom_name = str(self.cfg.get("func") or "<未指定>")
         if self.type == "custom":
             self._custom_func = self._load_custom_func()
 
@@ -67,13 +71,23 @@ class AuthApplier:
         if not path.is_absolute():
             path = self.job_dir / path
         if not path.is_file():
-            raise SystemExit(f"找不到自定义签名文件：{path}")
-        spec = importlib.util.spec_from_file_location("api2ods_signers", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+            raise ConfigError(f"找不到自定义签名文件：{path}")
+        # spec_from_file_location 对"认不出的后缀"（如 signers.txt）返回 None，
+        # module_from_spec(None) 会抛 'NoneType' object has no attribute 'loader' 这种裸异常：
+        # 两句一起放进 try，统一归为配置错
+        try:
+            spec = importlib.util.spec_from_file_location("api2ods_signers", path)
+            if spec is None or spec.loader is None:
+                raise ImportError(f"{path.name} 不是可导入的 Python 模块（需 .py 后缀）")
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001 - signers.py 是用户代码，语法/导入错都归为配置错
+            # 包装成 ConfigError（不是 IndexError 之类）：既给出"哪个文件、错在哪"，
+            # 又不会被当成网络抖动去做整窗重试
+            raise ConfigError(f"自定义签名文件 {path} 加载失败：{exc!r}") from exc
         func = getattr(module, func_name, None)
         if not callable(func):
-            raise SystemExit(f"{path} 里没有可调用的函数：{func_name}")
+            raise ConfigError(f"{path} 里没有可调用的函数：{func_name}")
         return func
 
     def apply(self, params: dict, headers: dict, method: str = "GET") -> None:
@@ -102,7 +116,13 @@ class AuthApplier:
             return
 
         if self.type == "query":
-            for key, value in (self.cfg.get("params") or {}).items():
+            query_params = self.cfg.get("params") or {}
+            if not isinstance(query_params, dict):
+                # 写成数组/字符串时裸 AttributeError 会被上层当成网络抖动，
+                # 退避重试加起来空等十几分钟才失败
+                raise ConfigError(f"auth.params 必须是对象（键值对），"
+                                  f"实际 {type(query_params).__name__}：{query_params!r}")
+            for key, value in query_params.items():
                 params[str(key)] = value
             return
 
@@ -121,12 +141,20 @@ class AuthApplier:
 
         if self.type == "custom":
             context = {"params": params, "headers": headers, "request": self.cfg, "method": method}
-            result = self._custom_func(context)
-            if isinstance(result, dict):
-                for key, value in (result.get("params") or {}).items():
-                    params[str(key)] = value
-                for key, value in (result.get("headers") or {}).items():
-                    headers[str(key)] = value
+            try:
+                result = self._custom_func(context)
+                # 并入也放在 try 里：返回 {"params": [...]} 这种畸形结构时，
+                # 裸 AttributeError 同样会被当成网络抖动
+                if isinstance(result, dict):
+                    for key, value in (result.get("params") or {}).items():
+                        params[str(key)] = value
+                    for key, value in (result.get("headers") or {}).items():
+                        headers[str(key)] = value
+            except SystemExit:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 签名函数是纯本地计算，任何异常都是配置/代码问题
+                # 包装成 ConfigError：否则会被当成网络抖动重试 5 次（空等约 225 秒）
+                raise ConfigError(f"自定义签名函数 {self._custom_name} 执行失败：{exc!r}") from exc
             return
 
         raise SystemExit(f"未知鉴权类型：{self.type}")
