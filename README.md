@@ -149,6 +149,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `auth` | none | 见下表（`bearer` 最常用） |
 | `records_path` | 空 | 记录数组路径（如 `data.list`）；留空=整个返回就是数组 |
 | `response_type` | json | `json` / `bytes`（文件流，配 `parse`，不支持分页） |
+| `json_encoding` | 空 | JSON 接口不是 UTF-8（如 GBK）时显式指定编码；不写则按 UTF-8 → 响应头声明的 charset 严格解码，解不出直接报错（不静默变乱码写库） |
 | `records_missing` | error | `empty`：路径取不到时按空数据（零数据日接口） |
 | `add_fields` | {} | 每条记录追加固定字段（多账号打来源标记） |
 | `fail_if` | [] | 业务错误判定，如 `[{"path":"code","not_equals":"0","retry":true}]`（`response_type=bytes` 时自动跳过） |
@@ -290,8 +291,8 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | 码 | 含义 |
 |---|---|
 | 0 | 成功（含 `--dry-run`；0 行但 `--allow-empty` 时也会写空分区并返回 0） |
-| 1 | 运行失败：请求失败、写库失败、写后行数对不上、0 行保护触发、`--check` 未通过 |
-| 2 | 命令行参数问题（缺 `--job`、业务日格式不对、找不到作业文件等），**没发过请求** |
+| 1 | 运行失败：请求失败、写库失败、写后行数对不上、0 行保护触发、`--check` 未通过；作业文件不存在、业务日格式不对等配置类问题也归这里 |
+| 2 | 命令行参数问题（缺 `--job`、`--days` 不是整数等 argparse 层），**没发过请求** |
 | 130 | 用户中断（Ctrl+C） |
 
 配置类错误（作业 JSON 写错、`ConfigError`）走的是 `SystemExit`，退出码同样是 1：
@@ -302,6 +303,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | 现象 | 处理 |
 |---|---|
 | `解析失败：找不到 records_path` | 路径写错；`--check` 会打印返回的顶层字段；接口“空对象=无数据”时加 `records_missing: "empty"` |
+| JSON 接口中文变乱码 / 报“解不出来” | 源不是 UTF-8（如 GBK）：给 `request` 加 `json_encoding: "gbk"`（不配时工具不静默替换，直接报错） |
 | `HTTP 401/403/400` | 密钥/参数问题（不重试）；检查 auth 与 params |
 | `期望文件流，但接口返回了 JSON` | 文件接口的权限/参数错误（如未开通下载权限）；按提示里的 JSON 内容排查 |
 | `接口返回业务错误：code=...` | 命中 `fail_if`；限流类错误给 `"retry": true` 先重试几次 |
@@ -320,7 +322,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 283 个离线用例：不访问网络、不连数仓
+python -m unittest discover -s tests -v    # 370 个离线用例：不访问网络、不连数仓
 pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
 ```
 

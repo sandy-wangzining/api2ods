@@ -2,6 +2,69 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.4] - 2026-09-22
+
+### 修复（第四轮全文复审；每条都有"改之前会失败"的回归用例）
+
+**会静默写坏 / 丢数据**
+
+- **CSV 行边界**：`skip_rows` / `skip_until` 用 `str.splitlines()` 切行，比 `csv.reader` 多认
+  `\x0b \x0c \x1c \x1d \x1e \x85` 等 6 种字符——报表导出里的分页符会让"第几行"两边错位，
+  表头错位、列名全错还照样成功；JSONL 里合法的 U+2028（工具自己 dump 的记录就有）会被劈成两半
+- **CSV 首行是空行**：原来静默按 0 行处理（配合 `target.allow_empty` 会先删再填清空分区）；
+  现在"有内容却解析不出表头"直接报错
+- **`records_path` 命中空对象**（`Items: {}`）：原来包成一条全 NULL 的假记录写进 ODS、
+  分页时还会翻到 `max_pages`；现在按空结果处理
+- **JSON 错误体防呆**：JSON 数组错误体与含 NaN/被截断的错误体现在会报错；同时
+  `parse.format=jsonl` 的单条记录文件不再被误判成错误体（低流量源原来每天必失败）
+- **`--workers` 并发内存**：future 一直持有已落盘单元的 records 直到 fetch_all 返回，
+  回补时全窗口数据驻留内存（打破"峰值内存=单个请求单元"的口径）；现在落盘后立即释放
+- **GBK 等非 UTF-8 的 JSON 接口**：原来固定 UTF-8 + `errors="replace"`，中文静默变 U+FFFD
+  写库；现在按 `request.json_encoding` → UTF-8 → 响应头声明的 charset 严格解码，
+  解不出直接报错（新增配置项 `request.json_encoding`）
+- **`%R` / `%r` / `%s` 格式误判**：`format: "%Y-%m-%d %R"` 被当成纯日期格式，窗口塌成
+  零长度（start == end）且跳过时区换算；`_TIME_TOKENS` 补全
+- **默认业务日算两遍**：main 与 `resolve_days` 各读一次时钟，跨零点时 `pt` 与"拉哪几天"
+  错开一天（先删再填写错分区）；现在 main 算好的业务日透传给 `resolve_days`
+
+**密钥不进日志（红线 3）**
+
+- **驼峰字段名漏网**：切词正则的驼峰分支在 `lower()` 之后是死代码——`signStr` / `authKey`
+  明文进日志，而 `sign_str` 却被脱敏；现在按原大小写切词
+- **`Authorization: <scheme> <凭证>` 只遮 scheme**：`Token` / `ApiKey` 与短 Bearer 值的
+  凭证明文留下；敏感头现在整行遮掉
+- **URL 编码后的密钥不脱敏**（docstring 声称覆盖的形态）：解码后能识别出密钥就整段替换
+- **profile 报错回显明文 AK/SK**：`target.profile` 写成对象时报错把整段密钥打进日志；
+  所有配置回显统一过 `redact()`
+- **`--init` 粘贴的 URL 带 token**：提示行原文进日志文件；现在过 `redact`
+
+**配置校验与错误归位**
+
+- `request.auth` 写成字符串/数组 → 裸 `AttributeError`；现在给中文报错（唯一漏网的块）
+- `window.extra_params` 写成字符串 → 裸 `ValueError`；值写 `null` → 静默发出 `"None"`
+- `window.format` 写错（如 `unixms`）→ 字面量直发接口、`pad_hours` 被静默忽略；
+  现在报错并列出可用写法（unix 家族大小写归一）
+- `window.pad_hours: NaN` 绕过 0~24 校验 → 裸 `ValueError`
+- `window.days: 0` 原来静默变 1 天；补数模式下 `--days` 被静默忽略（现在打提示）
+- 占位符：未闭合/空键（`${secrets.token`、`${}`）原样发出；字典的**键**不替换；
+  `--config` 文件自己的 `maxcompute` 不参与 `${secrets.*}` 替换——三处都修
+- `request.timeout_seconds <= 0` 无校验：被当网络抖动白退避（单次 fetch_all 约 24 分钟）
+- `Retry-After: NaN` 夹取失效 → `time.sleep(nan)` 抛错、429 重试链一个请求都没重试
+- `fail_if` 数值比较：`0.0` 与 `0`、`200.0` 与 `200` 被当成不等（equals 方向漏判会放行
+  错误数据、not_equals 方向误杀）；现在数字/数字样字符串统一按 float 比
+- 并发模式下配置类错误（`ConfigError` / `SystemExit`）不走 `os._exit`：解释器退出阶段仍要
+  join 在飞请求（实测进程耗时随在飞请求线性增长）；现在同样硬退出
+- 运行锁探测文件用共享名 `.probe`：并发启动可能因 `FileNotFoundError` "静默"漂移到备用
+  目录，同一作业两个实例拿到两把锁（互斥失效）；改用 `mkstemp` 唯一名
+- 缺 `--job` 提前 `return 2` 时日志 sink 不摘：同进程再次调用 `main` 会继续写旧日志文件
+- `--init`：选"页码分页"后再选"文件流"会生成过不了自身校验的配置（文件流不支持分页）
+
+**文档**
+
+- README 退出码表修正：作业文件不存在/业务日格式不对实际是 1（原来写 2）
+- 新增 `request.json_encoding`（README 配置表 + 完整模板同步）
+- 用例数勘误（283 → 370）；`ruff check .` 恢复 0 告警
+
 ## [2.1.3] - 2026-09-21
 
 ### 修复（全文复审，三轮）

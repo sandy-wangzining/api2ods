@@ -59,6 +59,8 @@
 
     "response_type": "json",
     "//response_type": "json（默认）/ bytes（文件流：ZIP/CSV/JSONL，需配下面的 parse 且不能分页）",
+    "json_encoding": "",
+    "//json_encoding": "JSON 接口不是 UTF-8（如 GBK）时显式指定编码；不写则按 UTF-8 → 响应头声明严格解码，解不出直接报错",
 
     "fail_if": [
       { "path": "code", "not_equals": "0", "message_path": "message", "retry": true }

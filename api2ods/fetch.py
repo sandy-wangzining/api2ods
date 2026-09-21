@@ -162,6 +162,12 @@ class Fetcher:
 
         self.body_type = str(request_cfg.get("body_type") or "json").lower()
         self.timeout = _as_number(request_cfg.get("timeout_seconds"), 30.0, "request.timeout_seconds")
+        if self.timeout <= 0:
+            # requests 对 timeout<=0 会在连接前抛裸 ValueError（"Attempted to set connect
+            # timeout to 0"），落到重试分类里被当成网络抖动白退避十几分钟；配置错要立刻报
+            raise SystemExit(f"request.timeout_seconds 必须大于 0（秒），实际 {self.timeout:g}")
+        # 非 UTF-8（如 GBK）的 JSON 接口用显式编码；不配则按 UTF-8/响应头声明，解不出直接报错
+        self.json_encoding = str(request_cfg.get("json_encoding") or "").strip() or None
         self.response_type = str(request_cfg.get("response_type") or "json").lower()
         self.fail_if = request_cfg.get("fail_if") or []
         self.retry_times = int(_as_number(request_cfg.get("retry_times"), 5, "request.retry_times"))
@@ -270,6 +276,7 @@ class Fetcher:
             expect_json=expect_json, fail_if=self.fail_if,
             retry_times=self.retry_times, retry_delay=self.retry_delay,
             verify=self.verify, proxies=self.proxies, desc=desc,
+            json_encoding=self.json_encoding,
         )
 
     def fetch_unit(self, unit: FetchUnit, page_size_override: int | None = None,
@@ -512,10 +519,15 @@ class Fetcher:
             try:
                 futures = {pool.submit(run_unit, unit): unit for unit in units}
                 for future in as_completed(futures):
-                    unit = futures[future]
+                    unit = futures.pop(future)
                     try:
                         label, records = future.result()
                         handle(label, records)
+                        # future 会一直持有返回值（as_completed 内部的集合要到 fetch_all 返回
+                        # 才释放）：不做处理的话，--workers 回补时全窗口数据都驻留内存，打破
+                        # "峰值内存=单个请求单元"的承诺。落盘完成后立即清空（数据已进 spool）
+                        if isinstance(records, list):
+                            records.clear()
                     except FatalApiError:
                         # 不能省：下面的 except Exception 会把它吃掉，变成"每个单元各失败一次"，
                         # 而 401 对所有单元都成立，继续跑只是把同一个错误重复几十遍

@@ -15,6 +15,8 @@ import re
 import urllib.parse
 from pathlib import Path
 
+from .utils import redact
+
 # 常见默认值（都可在提问时直接回车采纳）
 DEFAULT_METHOD = "GET"
 DEFAULT_DATE_TZ = "Asia/Shanghai"
@@ -109,7 +111,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
                 continue
             base_url, path = split
             if "?" in path:
-                echo(f"   提示：地址里带了 query 参数，已放进 path；建议稍后手工挪到 request.params：{path}")
+                echo(f"   提示：地址里带了 query 参数，已放进 path；建议稍后手工挪到 request.params：{redact(path)}")
             break
         else:
             echo("❌ 地址连续三次无效，已取消。")
@@ -246,6 +248,11 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         response_type = "json"
         if response_choice == "1":
             response_type = "bytes"
+            if pagination.get("type") not in (None, "", "none"):
+                # 分页在响应类型之前问，而文件流不支持分页（config 校验会直接拒绝）：
+                # 在这里清掉并说明，避免生成一份"过不了自己校验"的配置
+                echo("   文件流不支持分页，前面选的分页设置已清除")
+                pagination = {"type": "none"}
             fmt = _ask(ask, "   文件格式（csv/tsv/jsonl）", "csv")
             parse = {"format": fmt, "encoding": "utf-8-sig"}
             if _ask(ask, "   是 ZIP 压缩包吗（y/n）", "n").lower().startswith("y"):

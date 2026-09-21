@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -34,11 +35,18 @@ def _retry_after_seconds(response) -> float | None:
     if not value:
         return None
     try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        seconds = None
+    if seconds is not None:
+        if not math.isfinite(seconds):
+            # NaN/inf 过得了 float() 却过不了 min/max 夹取（NaN 跟谁比都是 False），
+            # 原样传给 time.sleep 会抛 ValueError，让整条 429 重试链一个请求都没重试就崩；
+            # 按"没给"处理，走默认退避
+            return None
         # 下界也要夹住：服务端写个 "-1" 原样传给 time.sleep 会抛
         # "sleep length must be non-negative"，被上层当成网络抖动白退避好几轮
-        return min(max(float(value), 0.0), MAX_RETRY_AFTER)
-    except (TypeError, ValueError):
-        pass
+        return min(max(seconds, 0.0), MAX_RETRY_AFTER)
     try:
         parsed = parsedate_to_datetime(str(value))
     except (TypeError, ValueError):
@@ -52,13 +60,50 @@ def _retry_after_seconds(response) -> float | None:
     return min(max(delay, 0.0), MAX_RETRY_AFTER)
 
 
+def _decode_json_body(response, json_encoding: str | None) -> str:
+    """JSON 响应体 → 文本：显式配置 > UTF-8(sig) > 响应头声明的 charset，全都解不出就报错。
+
+    不能用 errors="replace" 兜底：GBK 等非 UTF-8 接口的中文会静默变成 U+FFFD 写进 ODS，
+    条数与写后校验全过（违反"宁可失败不可静默写坏数据"）。原实现固定 utf-8+replace，
+    连响应头里声明的编码都不看。
+    """
+    raw = response.content
+    candidates: list[str] = []
+    if json_encoding:
+        candidates.append(str(json_encoding))
+    # utf-8-sig：有些源会在 JSON 最前面带 BOM，按 utf-8 解出来是 "﻿{"，
+    # loads_json 会一直解析失败并重试到耗尽
+    candidates.append("utf-8-sig")
+    declared = str(getattr(response, "encoding", "") or "").strip()
+    # requests 对 text/* 默认给 ISO-8859-1（HTTP 规范默认值，不是服务端声明）：
+    # 它能把任何字节序列解成"看起来成功"的乱码，绝不能进候选
+    if declared and declared.lower() not in ("iso-8859-1", "latin-1"):
+        candidates.append(declared)
+    seen: set[str] = set()
+    last_exc: Exception | None = None
+    for encoding in candidates:
+        if encoding.lower() in seen:
+            continue
+        seen.add(encoding.lower())
+        try:
+            return raw.decode(encoding).lstrip("﻿")
+        except (LookupError, UnicodeDecodeError) as exc:
+            last_exc = exc
+    raise ConfigError(
+        f"接口 JSON 响应按 {'/'.join(candidates)} 都解不出来（{last_exc}）；"
+        f"源是 GBK 等非 UTF-8 编码时，请给 request 加 json_encoding（如 \"gbk\"）"
+    )
+
+
 def request_once(method: str, url: str, params: dict, headers: dict, body_type: str,
-                 timeout: float, expect_json: bool, verify: bool, proxies: dict | None):
+                 timeout: float, expect_json: bool, verify: bool, proxies: dict | None,
+                 json_encoding: str | None = None):
     """发一次 HTTP 请求（不含重试；单元测试会替换本函数）。
 
     - 429 / 5xx：抛 RetryLater（带 Retry-After 秒数），由上层退避重试；
     - 其余 4xx：抛 FatalApiError（参数/权限问题，重试无意义）；
-    - JSON 解析失败：抛 RuntimeError（可能是接口异常，重试）。
+    - JSON 解析失败：抛 RuntimeError（可能是接口异常，重试）；
+    - JSON 响应解不出编码：抛 ConfigError（确定性错误，重试无意义）。
     """
     if requests is None:
         raise FatalApiError("缺少 requests，请先 pip install requests")
@@ -83,21 +128,31 @@ def request_once(method: str, url: str, params: dict, headers: dict, body_type: 
 
     if not expect_json:
         return response.content
+    text = _decode_json_body(response, json_encoding)
     try:
-        # 显式解码：requests 默认会用响应头里声明的编码，返回值带 NaN 时也在这里挡住。
-        # utf-8-sig：有些源会在 JSON 最前面带 BOM，按 utf-8 解出来是 "﻿{"，
-        # loads_json 会一直解析失败并重试到耗尽
-        return loads_json(response.content.decode("utf-8-sig", "replace"))
+        # 返回值带 NaN/Infinity 时在 loads_json 里挡住
+        return loads_json(text)
     except ValueError as exc:
-        raise RuntimeError(f"接口返回不是 JSON 或含非法数值（{exc}）：{redact(response.text[:300])}")
+        raise RuntimeError(f"接口返回不是 JSON 或含非法数值（{exc}）：{redact(text[:300])}")
 
 
 def _normalize_compare(value):
-    """fail_if 比较用：布尔转 'true'/'false'，数字转字符串（接口返回 20000 与配置 "20000" 视为相等）。"""
+    """fail_if 比较用：布尔转 'true'/'false'；数字统一按 float，数字样字符串也按 float。
+
+    原实现把数字 str() 后比：接口返回 0.0（浮点序列化）与配置 0 会判成"不相等"——
+    equals 方向漏判（把业务错误当成功继续写库）、not_equals 方向误杀；
+    反过来 str(2e2)="200.0" 与 "200" 也对不上。统一按数值比后这些形态一致。
+    """
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, (int, float)):
-        return str(value)
+        return float(value)
+    if isinstance(value, str):
+        try:
+            number = float(value.strip())
+        except ValueError:
+            return value
+        return number if math.isfinite(number) else value
     return value
 
 
@@ -130,7 +185,8 @@ def check_fail_if(payload, fail_if: list | None) -> None:
 def request_with_retry(method: str, url: str, build_request, body_type: str,
                        timeout: float, *, expect_json: bool = True, fail_if: list | None = None,
                        retry_times: int = 5, retry_delay: float = 15,
-                       verify: bool = True, proxies: dict | None = None, desc: str = "请求"):
+                       verify: bool = True, proxies: dict | None = None, desc: str = "请求",
+                       json_encoding: str | None = None):
     """带长冷却重试的请求；业务错误按 fail_if 判定。
 
     build_request：无参函数，每次尝试前调用一次，返回 (params, headers)。
@@ -153,7 +209,7 @@ def request_with_retry(method: str, url: str, build_request, body_type: str,
         try:
             params, headers = build_request()
             payload = request_once(method, url, params, headers, body_type, timeout,
-                                   expect_json, verify, proxies)
+                                   expect_json, verify, proxies, json_encoding)
             check_fail_if(payload, fail_if)      # 200 也可能是业务错误（如 code != 0）
             return payload
         except (FatalApiError, ConfigError):

@@ -10,7 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .dates import DEFAULT_DATE_TZ, date_tz_of, env_bizdate
-from .utils import ConfigError
+from .utils import ConfigError, redact
 
 ALLOWED_AUTH_TYPES = ("none", "basic", "token", "bearer", "query", "sha256_concat", "aliyun_rpc",
                       "custom")
@@ -24,7 +24,8 @@ JOB_KEYS = {"job", "description", "secrets", "maxcompute", "profiles",
             "request", "window", "pagination", "parse", "target"}
 REQUEST_KEYS = {"base_url", "path", "method", "body_type", "timeout_seconds", "headers",
                 "params", "params_in", "auth", "records_path", "records_missing", "fail_if",
-                "response_type", "verify", "proxies", "retry_times", "retry_delay", "add_fields"}
+                "response_type", "verify", "proxies", "retry_times", "retry_delay", "add_fields",
+                "json_encoding"}
 WINDOW_KEYS = {"mode", "days", "date_tz", "api_tz", "pad_hours", "start_param", "end_param",
                "extra_params", "format"}
 PAGINATION_KEYS = {"type", "page_param", "size_param", "page_size", "param_as_string",
@@ -64,6 +65,12 @@ def load_json_file(path: Path, desc: str) -> dict:
     return data
 
 
+def _show(value) -> str:
+    """报错回显配置内容前先脱敏：整块配置里可能带 access_key_secret 这类密钥，
+    异常文本会进调度日志/告警（红线：密钥不进日志）。"""
+    return redact(repr(value))
+
+
 def _as_secrets(value, where: str) -> dict:
     """secrets 必须是键值对；写成列表/字符串/数字时给出人话报错。
 
@@ -74,7 +81,7 @@ def _as_secrets(value, where: str) -> dict:
     if value is None:
         return {}
     if not isinstance(value, dict):
-        raise ConfigError(f"{where} 必须是对象（键值对），实际 {type(value).__name__}：{value!r}")
+        raise ConfigError(f"{where} 必须是对象（键值对），实际 {type(value).__name__}：{_show(value)}")
     return dict(value)
 
 
@@ -122,7 +129,13 @@ def deep_substitute(value, context: dict):
     找不到的占位符直接报错（不静默留空，避免密钥没配却悄悄请求失败）。
     """
     if isinstance(value, dict):
-        return {key: deep_substitute(item, context) for key, item in value.items()}
+        # 键也替换：多实例共用一份作业时参数名本身常被参数化（如 {"${secrets.param_name}": "v"}），
+        # 只替换值会让带 ${...} 的键原样发出去（接口表现为"参数没生效"，日志看不出原因）
+        result = {}
+        for key, item in value.items():
+            new_key = deep_substitute(key, context) if isinstance(key, str) else key
+            result[str(new_key)] = deep_substitute(item, context)
+        return result
     if isinstance(value, list):
         return [deep_substitute(item, context) for item in value]
     if not isinstance(value, str):
@@ -131,6 +144,12 @@ def deep_substitute(value, context: dict):
     match = _PLACEHOLDER_RE.fullmatch(value)
     if match:
         return resolve_placeholder(match.group(1), context)
+
+    if value.count("${") != len(_PLACEHOLDER_RE.findall(value)):
+        # 未闭合（"${secrets.token" 少一个 }）或空键（${}）的形态不会被正则匹配到，
+        # 原样发给接口只会得到 401/参数不生效，日志里看不出是配置写错——直接报错
+        raise SystemExit(f"配置里有未闭合或写法不对的占位符：{value[:120]!r}"
+                         f"（应形如 ${{secrets.键名}}，${{ 与 }} 必须成对）")
 
     def _replace(m: re.Match) -> str:
         """字符串里混着占位符（如 "Bearer ${secrets.t}"）时的替换回调，结果一律转成字符串。"""
@@ -148,6 +167,13 @@ def render_job(job_raw: dict, config: dict, bizdate: date) -> dict:
     job = {key: value for key, value in job_raw.items() if key != "secrets"}
     rendered = deep_substitute(job, context)
     rendered["secrets"] = _as_secrets(job_raw.get("secrets"), "作业配置的 secrets")
+    # --config 文件自己的 maxcompute/profiles 也参与替换：共享凭证常写成
+    # {"maxcompute": {"access_key_id": "${secrets.ak}"}}（secrets 就在同一份文件里），
+    # 只渲染作业文件会让它原样带着 ${...} 去连 MaxCompute（鉴权失败还看不出原因）。
+    # 原地更新：config 是调用方的运行时字典，取值方随后直接读它；替换本身幂等
+    for block in ("maxcompute", "profiles"):
+        if isinstance(config.get(block), dict):
+            config[block] = deep_substitute(config[block], context)
     return rendered
 
 
@@ -162,7 +188,7 @@ def check_block_types(job: dict) -> None:
         value = job.get(block)
         if value is not None and not isinstance(value, dict):
             raise ConfigError(
-                f"作业配置的 {block} 必须是对象（键值对），实际 {type(value).__name__}：{value!r}"
+                f"作业配置的 {block} 必须是对象（键值对），实际 {type(value).__name__}：{_show(value)}"
             )
 
 
@@ -257,7 +283,7 @@ def validate_job(job: dict) -> None:
     for key, value in (job.get("profiles") or {}).items():
         if not isinstance(value, dict):
             raise SystemExit(f"作业配置的 profiles.{key} 必须是对象（键值对），"
-                             f"实际 {type(value).__name__}：{value!r}")
+                             f"实际 {type(value).__name__}：{_show(value)}")
     if request.get("add_fields") is not None and not isinstance(request["add_fields"], dict):
         raise SystemExit("request.add_fields 必须是对象（如 {\"source_account\": \"账号A\"}）")
     # 这两处写错类型会在发请求时才崩：headers 写成数组是 AttributeError，
@@ -267,13 +293,17 @@ def validate_job(job: dict) -> None:
                          ("proxies", "request.proxies")):
         value = request.get(block)
         if value is not None and not isinstance(value, dict):
-            raise SystemExit(f"{where} 必须是对象（键值对），实际 {type(value).__name__}：{value!r}")
+            raise SystemExit(f"{where} 必须是对象（键值对），实际 {type(value).__name__}：{_show(value)}")
 
     method = str(request.get("method") or "GET").upper()
     if method not in ALLOWED_METHODS:
         raise SystemExit(f"request.method 不支持：{method}（可用 {'/'.join(ALLOWED_METHODS)}）")
 
-    auth = request.get("auth") or {}
+    auth = request.get("auth")
+    if auth is not None and not isinstance(auth, dict):
+        # auth 是唯一漏网的块：写成字符串会在下一行 .get 处抛裸 AttributeError
+        raise SystemExit(f"request.auth 必须是对象（键值对），实际 {type(auth).__name__}：{_show(auth)}")
+    auth = auth or {}
     auth_type = str(auth.get("type") or "none").lower()
     if auth_type not in ALLOWED_AUTH_TYPES:
         raise SystemExit(f"request.auth.type 不支持：{auth_type}（可用 {'/'.join(ALLOWED_AUTH_TYPES)}）")
@@ -306,6 +336,24 @@ def validate_job(job: dict) -> None:
         if mode == "range" and not window.get("end_param"):
             raise SystemExit("window.mode=range 时必须给 window.end_param"
                              "（或把 start_param/end_param 都删掉，用默认 startTime/endTime）")
+        fmt = str(window.get("format") or "").strip()
+        # 既不是 unix 家族、又不含任何 strftime 指令的 format 几乎必然是笔误（如 unixms）：
+        # 原样发给接口会得到一份"时间参数没生效"的数据，而且会被当成"纯日期格式"
+        # 跳过时区换算、静默忽略 pad_hours
+        if fmt and fmt.lower() not in ("unix", "unix_s", "unix_ms", "unix_millis") and "%" not in fmt:
+            raise SystemExit(
+                f"window.format 不认识：{fmt!r}；应含 strftime 指令（如 %Y-%m-%d %H:%M:%S），"
+                f"或写 unix / unix_ms（秒/毫秒时间戳）"
+            )
+        extra_params = window.get("extra_params")
+        if extra_params is not None:
+            if not isinstance(extra_params, dict):
+                raise SystemExit(f"window.extra_params 必须是对象（键值对），"
+                                 f"实际 {type(extra_params).__name__}：{_show(extra_params)}")
+            for extra_name, extra_fmt in extra_params.items():
+                if extra_fmt is None:
+                    raise SystemExit(f"window.extra_params[{extra_name!r}] 不能为 null；"
+                                     f"值应是 strftime 格式（如 \"%Y-%m\"）或 unix/unix_ms")
 
     pagination = job.get("pagination") or {}
     page_type = str(pagination.get("type") or "none").lower()
@@ -417,7 +465,7 @@ def _profile_source(source: dict, where: str) -> dict:
         return {}
     if not isinstance(profiles, dict):
         raise SystemExit(f"{where} 的 profiles 必须是对象（形如 {{\"default\": {{...}}}}），"
-                         f"实际 {type(profiles).__name__}：{profiles!r}")
+                         f"实际 {type(profiles).__name__}：{_show(profiles)}")
     return profiles
 
 
@@ -439,17 +487,18 @@ def get_mc_profile_meta(config: dict, job: dict, args) -> dict:
             # #0 has length 1; 2 is required" 这种裸异常，看不出是哪个字段写错了
             if not isinstance(entry, dict):
                 raise SystemExit(f"{where} 的 profiles.{name} 必须是对象（键值对），"
-                                 f"实际 {type(entry).__name__}：{entry!r}")
+                                 f"实际 {type(entry).__name__}：{_show(entry)}")
             return dict(entry)
         if name == "default" and source.get("maxcompute"):
             block = source["maxcompute"]
             if not isinstance(block, dict):
                 raise SystemExit(f"{where} 的 maxcompute 必须是对象（键值对），"
-                                 f"实际 {type(block).__name__}：{block!r}")
+                                 f"实际 {type(block).__name__}：{_show(block)}")
             return dict(block)
     if name == "default":
         return {}
-    raise SystemExit(f"找不到 MaxCompute profile「{name}」；已配置：{available or ['（无）']}")
+    raise SystemExit(f"找不到 MaxCompute profile「{redact(name)}」；"
+                     f"已配置：{redact(str(available)) if available else '（无）'}")
 
 
 def build_context_doc() -> str:

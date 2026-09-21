@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 try:
     import fcntl  # Linux / macOS：进程级运行锁
@@ -247,17 +248,21 @@ _JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*["'])([^"']*)(["'])""
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
 # 请求头行：'X-Api-Key: xxx' / 'X-Api-Key=xxx'（requests 抛错时带的 headers 是这种形态）。
-# 上一条 Authorization 规则只认 Basic/Bearer 两种值，其余自定义头名要靠这里兜
-# 值里排除冒号和空格：头值本身不含这些，带上会让匹配越界吃掉后面的内容
-_HEADER_RE = re.compile(r"(?im)^(\s*([A-Za-z0-9_.\-]{1,64})\s*[:=]\s*)([^\s:]+)")
+# 上一条 Authorization 规则只认 Basic/Bearer 两种值，其余自定义头名要靠这里兜。
+# 值要吃到行尾：只吃第一个词的话，"Authorization: Token abc…" 会变成 "*** abc…"
+#（凭证明文留下）；整行遮掉最安全，行边界由 (?m) 的 ^/$ 兜住
+_HEADER_RE = re.compile(r"(?im)^(\s*([A-Za-z0-9_.\-]{1,64})\s*[:=]\s*)(.+)$")
 
 
 def _is_sensitive_key(name) -> bool:
     """字段名是否含密钥语义（按词切分，避免 "task=1" 这类含 sk 的普通参数被误伤）。"""
-    lowered = str(name).lower()
-    words = _WORD_RE.findall(lowered)
-    if any(word in _SENSITIVE_WORDS for word in words):
+    original = str(name)
+    # 切词要保留原大小写：_WORD_RE 的驼峰分支（[A-Z][a-z0-9]*）在已经 lower 的串上
+    # 永远匹配不到——signStr / authKey 这类驼峰名会漏（而 snake_case 的孪生名却命中）
+    words = _WORD_RE.findall(original)
+    if any(word.lower() in _SENSITIVE_WORDS for word in words):
         return True
+    lowered = original.lower()
     # 不用分隔符的写法：accesstoken / secretkey / accesskeyid
     # （"key" 不单独做子串规则，否则 monkey / keywords 这类普通参数会被误伤）
     return any(word in lowered for word in
@@ -294,13 +299,21 @@ def redact(text: str) -> str:
     def _query(match: re.Match) -> str:
         """URL 查询串里的 key=value：命中密钥词才替换值，其余原样返回。
 
-        没命中的值仍递归脱敏一次：值是 URL 编码的整串（target=https%3A%2F%2F…%3Ftoken%3Dx）
-        或值里就带着 'Authorization=Bearer xxx' 时，
-        只按 key 判断会让密钥整串漏进日志。
+        没命中的值再看两层：① 递归脱敏（值里可能嵌着 'Authorization=Bearer xxx'）；
+        ② 值是 URL 编码的整串（target=https%3A%2F%2F…%3Ftoken%3Dx）时，编码后的
+        'token%3D…' 任何规则都匹配不到——解码后能识别出密钥就整段遮掉（宁可多脱敏）。
         """
         if _is_sensitive_key(match.group(1)):
             return f"{match.group(1)}=***"
-        return f"{match.group(1)}={redact(match.group(2))}"
+        value = match.group(2)
+        if "%" in value:
+            try:
+                decoded = unquote(value)
+            except Exception:  # noqa: BLE001 - 解码失败按原文处理
+                decoded = value
+            if decoded != value and redact(decoded) != decoded:
+                return f"{match.group(1)}=***"
+        return f"{match.group(1)}={redact(value)}"
 
     def _header(match: re.Match) -> str:
         """多行文本里的一行 "Header: value"：只吃头名命中密钥词的行。"""
