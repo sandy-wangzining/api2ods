@@ -11,6 +11,7 @@
   },
 
   "//maxcompute": "本作业的 MaxCompute 凭证（推荐直接写这）；也支持 profiles 多套 + target.profile 指定",
+  "//maxcompute_短写": "access_key_id/access_key_secret 可简写成 ak/sk；endpoint 不写默认 us-west-1",
   "maxcompute": {
     "project": "<项目名>",
     "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
@@ -38,16 +39,15 @@
     "auth": {
       "//": "=== 选一种写法（保留 type 对应的那几行即可）===",
       "//none": "{ \"type\": \"none\" }",
-      "//token": "{ \"type\": \"token\", \"header\": \"Authorization\", \"prefix\": \"Bearer \", \"value\": \"<token>\" }",
+      "//bearer": "{ \"type\": \"bearer\", \"token\": \"<最常用：Authorization Bearer>\" }",
+      "//token": "{ \"type\": \"token\", \"header\": \"X-Api-Key\", \"value\": \"<token>\" }",
       "//query": "{ \"type\": \"query\", \"params\": { \"token\": \"<token>\" } }",
       "//basic": "{ \"type\": \"basic\", \"username\": \"u\", \"password\": \"p\" }",
       "//sha256_concat": "{ \"type\": \"sha256_concat\", \"secret_key\": \"<密钥>\", \"sign_field\": \"sign\", \"sign_in\": \"body\" }",
       "//aliyun_rpc": "{ \"type\": \"aliyun_rpc\", \"access_key_id\": \"<AK>\", \"access_key_secret\": \"<SK>\" }",
       "//custom": "{ \"type\": \"custom\", \"module\": \"signers.py\", \"func\": \"my_sign\" }",
-      "type": "token",
-      "header": "Authorization",
-      "prefix": "Bearer ",
-      "value": "${secrets.my_token}"
+      "type": "bearer",
+      "token": "<token>"
     },
 
     "records_path": "data.list",
@@ -75,6 +75,7 @@
 
   "window": {
     "//mode": "per_day（每天一次请求，推荐）/ range（一次请求覆盖整个区间）",
+    "//defaults": "start_param 默认 startTime、end_param 默认 endTime；date_tz 默认 Asia/Shanghai、api_tz 默认 +08:00、pad_hours 默认 0",
     "mode": "per_day",
     "days": 15,
     "//days": "每次回拉最近几天（含基准日）；命令行 --days 可覆盖",
@@ -86,7 +87,7 @@
     "//pad_hours": "窗口前后各多拉几小时（防边界丢数，重复数据由 DWD 去重）",
     "start_param": "startTime",
     "end_param": "endTime",
-    "//end_param": "end_param 可省略（如“按天+月份”查询的接口只需要开始参数）",
+    "//end_param": "不需要结束时间参数时写 null（如阿里云按天+月份查询）；range 模式必须有",
     "format": "%Y-%m-%d %H:%M:%S",
     "//format": "%开头是 strftime 格式；unix=秒、unix_ms=毫秒（时间戳接口用）",
     "extra_params": { "BillingCycle": "%Y-%m" },
@@ -94,7 +95,8 @@
   },
 
   "pagination": {
-    "//type": "none（默认，不翻页）/ page（页码）/ cursor（游标）",
+    "//type": "none / page / cursor；不写会自动推断（有 cursor_path→cursor；有 total_* 或 page_param→page）",
+    "//defaults": "page 类型默认 page_param=page、size_param=size、page_size=100；cursor 类型默认 cursor_param=cursor",
     "type": "page",
     "page_param": "page",
     "size_param": "size",

@@ -95,6 +95,12 @@ class AuthApplier:
             headers[header] = f"{prefix}{value}"
             return
 
+        if self.type == "bearer":
+            # 最常见的写法：Authorization: Bearer <token>（配置只需 token 一个字段）
+            token = str(self.cfg.get("token") or self.cfg.get("value") or "")
+            headers["Authorization"] = f"Bearer {token}"
+            return
+
         if self.type == "query":
             for key, value in (self.cfg.get("params") or {}).items():
                 params[str(key)] = value

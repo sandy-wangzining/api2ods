@@ -47,7 +47,8 @@
     "api_tz": "+08:00",
     "pad_hours": 0,
     "start_param": "BillingDate",
-    "//end_param": "该接口按 BillingDate + BillingCycle 查询，没有结束时间参数，故不配 end_param",
+    "end_param": null,
+    "//end_param": "该接口按 BillingDate + BillingCycle 查询，没有结束时间参数；写 null 表示不要 endTime 默认值",
     "format": "%Y-%m-%d",
     "extra_params": { "BillingCycle": "%Y-%m" }
   },

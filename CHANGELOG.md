@@ -2,6 +2,22 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.0] - 2026-09-21
+
+### 新增
+
+- `auth.type: bearer`：最常见的 `Authorization: Bearer <token>`，配置只写一个字段
+- 配置默认值与自动推断（让新作业配置明显变短，旧配置完全兼容）：
+  - `pagination.type` 可省略，自动推断（`cursor_path`→cursor；`total_pages_path`/`total_items_path`/`page_param`→page）
+  - page 分页默认 `page_param=page`、`size_param=size`、`page_size=100`；cursor 默认 `cursor_param=cursor`
+  - `window.start_param`/`end_param` 默认 `startTime`/`endTime`；**显式写 `"end_param": null` 表示不要结束时间参数**（阿里云账单等）
+- 交互式向导 `--init` 精简（Bearer 一步搞定；翻页/窗口只问必要问题）
+
+### 修复
+
+- Windows 非 UTF-8 控制台（cp1252 等）打印中文/符号日志会抛 `UnicodeEncodeError`：现在自动切 UTF-8，
+  切不了时按可替换字符降级输出（CI 在 windows-latest 上发现）
+
 ## [2.0.0] - 2026-09-21
 
 首个可公开发布的版本。

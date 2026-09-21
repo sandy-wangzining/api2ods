@@ -6,4 +6,4 @@
     api2ods --job jobs/xxx.json ...               # pip/pipx 安装后（console script）
 """
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"

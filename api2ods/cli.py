@@ -24,6 +24,7 @@ from .config import (
     collect_warnings,
     get_mc_profile_meta,
     load_json_file,
+    normalize_job,
     render_job,
     resolve_target,
     validate_job,
@@ -332,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
             bizdate = datetime.now(tz).date() - timedelta(days=1)
 
         job = render_job(job_raw, config, bizdate)   # 替换 ${secrets.x}/${bizdate} 等占位符
+        job = normalize_job(job)                     # 补齐默认值（翻页方式/参数名等），让配置尽量短
         validate_job(job)
         for warning in collect_warnings(job):        # 未知字段告警（拼写错误提示）
             log(f"⚠️ {warning}")

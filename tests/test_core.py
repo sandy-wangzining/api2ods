@@ -156,17 +156,26 @@ class TestValidateJob(OfflineTestCase):
         with self.assertRaises(SystemExit):
             config_mod.validate_job(job)
 
-    def test_window_start_param_required(self):
+    def test_window_defaults_param_names(self):
         job = minimal_job()
-        job["window"] = {"days": 3, "end_param": "endTime"}
-        with self.assertRaises(SystemExit):
-            config_mod.validate_job(job)
+        job["window"] = {"days": 3}
+        got = config_mod.normalize_job(job)
+        self.assertEqual(got["window"]["start_param"], "startTime")
+        self.assertEqual(got["window"]["end_param"], "endTime")
+        config_mod.validate_job(got)          # 补完默认值后必须能过校验
 
     def test_range_needs_end_param(self):
         job = minimal_job()
-        job["window"] = {"mode": "range", "start_param": "startTime"}
+        job["window"] = {"mode": "range", "start_param": "startTime", "end_param": None}
         with self.assertRaises(SystemExit):
             config_mod.validate_job(job)
+
+    def test_range_gets_default_end_param(self):
+        job = minimal_job()
+        job["window"] = {"mode": "range", "start_param": "startTime"}
+        got = config_mod.normalize_job(job)
+        self.assertEqual(got["window"]["end_param"], "endTime")
+        config_mod.validate_job(got)
 
     def test_bytes_needs_parse_format(self):
         job = minimal_job()
@@ -186,6 +195,12 @@ class TestValidateJob(OfflineTestCase):
     def test_custom_auth_needs_func(self):
         job = minimal_job()
         job["request"]["auth"] = {"type": "custom"}
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
+    def test_bearer_auth_needs_token(self):
+        job = minimal_job()
+        job["request"]["auth"] = {"type": "bearer"}
         with self.assertRaises(SystemExit):
             config_mod.validate_job(job)
 
@@ -353,6 +368,12 @@ class TestAuth(OfflineTestCase):
         headers = {}
         applier.apply({"a": "1"}, headers)
         self.assertIn("X-Sign", headers)
+
+    def test_bearer(self):
+        applier = auth_mod.AuthApplier({"auth": {"type": "bearer", "token": "tok1"}}, Path("."))
+        headers = {}
+        applier.apply({}, headers)
+        self.assertEqual(headers["Authorization"], "Bearer tok1")
 
     def test_token_with_prefix(self):
         applier = auth_mod.AuthApplier({"auth": {"type": "token", "header": "Authorization",
@@ -854,21 +875,18 @@ class TestInitWizard(OfflineTestCase):
             "作业名": "demo_api",
             "API 完整地址": "https://api.example.com/v1/items",
             "请求方法": "",                    # 直接回车 = GET
-            "请求头名字": "",                  # Authorization
-            "值前缀": "",                      # Bearer
-            "Token/Key 的值": "tok123",
+            "Token 的值": "tok123",            # 鉴权选择 Bearer
             "记录列表在返回": "data.list",
-            "页码参数名": "", "每页条数参数名": "", "每页条数": "",   # page/size/100
             "总页数字段路径": "data.totalPages",
             "总条数字段路径": "",
-            "最近几天": "15",
-            "额外派生参数": "",
-            "项目名": "", "表名": "",          # demo_project / ods_demo_api_json_di
+            "每次回拉最近几天": "15",
+            "项目名": "",                      # my_project
+            "表名": "",                        # ods_demo_api_json_di
             "AccessKeyId": "AKID",
             "AccessKeySecret": "SECRET",
             "endpoint": "",                    # 默认 us-west-1
         }
-        # 选择题顺序：鉴权=1（Header Token）、翻页=1（页码）、窗口=1（按天）、返回=0（JSON）
+        # 选择题顺序：鉴权=1（Bearer）、翻页=1（页码）、窗口=1（按天）、返回=0（JSON）
         ask = self._answers(mapping, ["1", "1", "1", "0"])
         with tempfile.TemporaryDirectory() as tmp:
             code = init_wizard.run_init(out_path=str(Path(tmp) / "demo_api.json"),
@@ -878,14 +896,14 @@ class TestInitWizard(OfflineTestCase):
         self.assertEqual(job["job"], "demo_api")
         self.assertEqual(job["request"]["base_url"], "https://api.example.com")
         self.assertEqual(job["request"]["path"], "/v1/items")
-        self.assertEqual(job["request"]["auth"]["value"], "tok123")
+        self.assertEqual(job["request"]["auth"], {"type": "bearer", "token": "tok123"})
         self.assertEqual(job["request"]["records_path"], "data.list")
-        self.assertEqual(job["pagination"]["type"], "page")
         self.assertEqual(job["pagination"]["total_pages_path"], "data.totalPages")
         self.assertEqual(job["window"]["mode"], "per_day")
         self.assertEqual(job["target"]["table"], "ods_demo_api_json_di")
         self.assertEqual(job["maxcompute"]["access_key_id"], "AKID")
-        config_mod.validate_job(job)          # 生成的配置必须能通过校验
+        normalized = config_mod.normalize_job(job)
+        config_mod.validate_job(normalized)   # 生成的配置（补默认值后）必须能通过校验
 
     def test_cancel_on_eof(self):
         def ask(_prompt=""):
@@ -951,6 +969,46 @@ class FakeWriter:
 
     def __exit__(self, *exc_info):
         self.closed = True
+
+
+class TestNormalizeJob(OfflineTestCase):
+    """配置瘦身：缺省字段自动补齐 / 推断（让新源配置尽量短）。"""
+
+    def test_pagination_infers_page_with_defaults(self):
+        job = minimal_job(pagination={"total_pages_path": "data.totalPages"})
+        got = config_mod.normalize_job(job)
+        self.assertEqual(got["pagination"]["type"], "page")
+        self.assertEqual(got["pagination"]["page_param"], "page")
+        self.assertEqual(got["pagination"]["size_param"], "size")
+        self.assertEqual(got["pagination"]["page_size"], 100)
+        config_mod.validate_job(got)
+
+    def test_pagination_infers_cursor(self):
+        got = config_mod.normalize_job(minimal_job(pagination={"cursor_path": "data.next"}))
+        self.assertEqual(got["pagination"]["type"], "cursor")
+        self.assertEqual(got["pagination"]["cursor_param"], "cursor")
+        config_mod.validate_job(got)
+
+    def test_pagination_delay_only_becomes_none(self):
+        got = config_mod.normalize_job(minimal_job(pagination={"delay_seconds": 1}))
+        self.assertEqual(got["pagination"]["type"], "none")
+
+    def test_user_values_win(self):
+        job = minimal_job(pagination={"page_param": "PageNum", "size_param": "PageSize",
+                                      "page_size": 300, "total_items_path": "Data.TotalCount"})
+        got = config_mod.normalize_job(job)
+        self.assertEqual(got["pagination"]["page_param"], "PageNum")
+        self.assertEqual(got["pagination"]["page_size"], 300)
+
+    def test_window_defaults(self):
+        got = config_mod.normalize_job(minimal_job(window={"days": 7}))
+        self.assertEqual(got["window"]["start_param"], "startTime")
+        self.assertEqual(got["window"]["end_param"], "endTime")
+
+    def test_window_explicit_null_end_stays_null(self):
+        got = config_mod.normalize_job(minimal_job(window={"days": 7, "start_param": "BillingDate",
+                                                           "end_param": None}))
+        self.assertIsNone(got["window"]["end_param"])
 
 
 class TestTargetTable(OfflineTestCase):

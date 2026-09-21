@@ -8,7 +8,7 @@ import re
 from datetime import date
 from pathlib import Path
 
-ALLOWED_AUTH_TYPES = ("none", "basic", "token", "query", "sha256_concat", "aliyun_rpc", "custom")
+ALLOWED_AUTH_TYPES = ("none", "basic", "token", "bearer", "query", "sha256_concat", "aliyun_rpc", "custom")
 ALLOWED_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
 ALLOWED_RESPONSE_TYPES = ("json", "bytes")
 ALLOWED_PARSE_FORMATS = ("csv", "tsv", "jsonl")
@@ -117,6 +117,47 @@ def render_job(job_raw: dict, config: dict, bizdate: date) -> dict:
     return rendered
 
 
+def normalize_job(job: dict) -> dict:
+    """把作业配置补齐成"带默认值"的完整形态（让用户配置尽量短）。
+
+    规则（都只在字段缺失时生效，用户写了就以用户的为准）：
+    - pagination：
+        · type 缺失时自动推断：有 cursor_path → cursor；有 total_pages_path/total_items_path/page_param → page；否则 none
+        · page 类型补默认 page_param=page、size_param=size、page_size=100
+        · cursor 类型补默认 cursor_param=cursor
+    - window：
+        · start_param 默认 startTime；end_param 默认 endTime
+        · 显式写 "end_param": null 表示"不要结束时间参数"（如阿里云按天+月份查询的接口）
+    """
+    job = dict(job)
+    pagination = dict(job.get("pagination") or {})
+    if pagination:
+        page_type = str(pagination.get("type") or "").lower()
+        if not page_type:
+            if pagination.get("cursor_path"):
+                page_type = "cursor"
+            elif (pagination.get("total_pages_path") or pagination.get("total_items_path")
+                  or pagination.get("page_param")):
+                page_type = "page"
+            else:
+                page_type = "none"
+        pagination["type"] = page_type
+        if page_type == "page":
+            pagination.setdefault("page_param", "page")
+            pagination.setdefault("size_param", "size")
+            pagination.setdefault("page_size", 100)
+        elif page_type == "cursor":
+            pagination.setdefault("cursor_param", "cursor")
+        job["pagination"] = pagination
+
+    window = dict(job.get("window") or {})
+    if window:
+        window.setdefault("start_param", "startTime")
+        window.setdefault("end_param", "endTime")
+        job["window"] = window
+    return job
+
+
 # =============================================================================
 # 校验
 # =============================================================================
@@ -167,6 +208,8 @@ def validate_job(job: dict) -> None:
         raise SystemExit(f"request.auth.type 不支持：{auth_type}（可用 {'/'.join(ALLOWED_AUTH_TYPES)}）")
     if auth_type == "custom" and not auth.get("func"):
         raise SystemExit("auth.type=custom 必须给 auth.func（函数名）")
+    if auth_type == "bearer" and not (auth.get("token") or auth.get("value")):
+        raise SystemExit("auth.type=bearer 必须给 auth.token（如 {\"type\": \"bearer\", \"token\": \"xxx\"}）")
     if auth_type == "aliyun_rpc":
         for field in ("access_key_id", "access_key_secret"):
             if not auth.get(field):
@@ -189,18 +232,14 @@ def validate_job(job: dict) -> None:
     if window:
         if mode not in ALLOWED_WINDOW_MODES:
             raise SystemExit(f"window.mode 不支持：{mode}（可用 per_day/range）")
-        if not window.get("start_param"):
-            raise SystemExit("配置了 window 时必须给 window.start_param（起始时间参数名）")
         if mode == "range" and not window.get("end_param"):
-            raise SystemExit("window.mode=range 时必须给 window.end_param（区间结束时间参数名）")
+            raise SystemExit("window.mode=range 时必须给 window.end_param（或删掉 end_param 让它用默认 endTime）")
 
     pagination = job.get("pagination") or {}
     page_type = str(pagination.get("type") or "none").lower()
     if page_type not in ALLOWED_PAGINATION_TYPES:
         raise SystemExit(f"pagination.type 不支持：{page_type}（可用 none/page/cursor）")
     if page_type == "page":
-        if not (pagination.get("page_param") and pagination.get("size_param")):
-            raise SystemExit("分页类型 page 必须给 pagination.page_param 和 pagination.size_param")
         if not (pagination.get("total_pages_path") or pagination.get("total_items_path")):
             raise SystemExit(
                 "分页类型 page 必须给 pagination.total_pages_path 或 pagination.total_items_path"

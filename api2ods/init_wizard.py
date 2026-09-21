@@ -20,21 +20,18 @@ DEFAULT_DATE_TZ = "Asia/Shanghai"
 DEFAULT_API_TZ = "+08:00"
 DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
-DEFAULT_PAGE_PARAM = "page"
-DEFAULT_SIZE_PARAM = "size"
-DEFAULT_PAGE_SIZE = 100
-DEFAULT_CURSOR_PARAM = "cursor"
 DEFAULT_START_PARAM = "startTime"
 DEFAULT_END_PARAM = "endTime"
 
 AUTH_CHOICES = (
     "0 = 不需要鉴权",
-    "1 = Header 里放 Token（最常见，如 Authorization: Bearer xxx）",
-    "2 = URL 参数里放 Token（如 ?token=xxx）",
-    "3 = Basic 用户名密码",
-    "4 = 阿里云 RPC 签名（AK/SK，账单/OpenAPI 用）",
-    "5 = Onerway 式 sha256 签名（参数排序拼接 + 密钥）",
-    "6 = 自定义 signers.py（高级，需自己写函数）",
+    "1 = Authorization: Bearer <token>（最常用）",
+    "2 = 自定义请求头里放 Token（如 X-Api-Key: xxx）",
+    "3 = URL 参数里放 Token（如 ?token=xxx）",
+    "4 = Basic 用户名密码",
+    "5 = 阿里云 RPC 签名（AK/SK，账单/OpenAPI 用）",
+    "6 = Onerway 式 sha256 签名（参数排序拼接 + 密钥）",
+    "7 = 自定义 signers.py（高级，需自己写函数）",
 )
 
 
@@ -105,23 +102,25 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         if auth_choice == "0":
             auth = {"type": "none"}
         elif auth_choice == "1":
-            header = _ask(ask, "   请求头名字", "Authorization")
-            prefix = _ask(ask, "   值前缀（如 Bearer 后面带空格；没有就留空）", "Bearer ")
-            value = _ask(ask, "   Token/Key 的值（直接粘贴）")
-            auth = {"type": "token", "header": header, "prefix": prefix, "value": value}
+            token = _ask(ask, "   Token 的值（直接粘贴）")
+            auth = {"type": "bearer", "token": token}
         elif auth_choice == "2":
+            header = _ask(ask, "   请求头名字", "X-Api-Key")
+            value = _ask(ask, "   Token/Key 的值")
+            auth = {"type": "token", "header": header, "value": value}
+        elif auth_choice == "3":
             name = _ask(ask, "   URL 参数名", "token")
             value = _ask(ask, "   Token 的值")
             auth = {"type": "query", "params": {name: value}}
-        elif auth_choice == "3":
+        elif auth_choice == "4":
             username = _ask(ask, "   用户名")
             password = _ask(ask, "   密码")
             auth = {"type": "basic", "username": username, "password": password}
-        elif auth_choice == "4":
+        elif auth_choice == "5":
             ak = _ask(ask, "   AccessKeyId")
             sk = _ask(ask, "   AccessKeySecret")
             auth = {"type": "aliyun_rpc", "access_key_id": ak, "access_key_secret": sk}
-        elif auth_choice == "5":
+        elif auth_choice == "6":
             secret = _ask(ask, "   商户密钥（Secret key）")
             sign_field = _ask(ask, "   签名字段名", "sign")
             auth = {"type": "sha256_concat", "secret_key": secret,
@@ -145,30 +144,20 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         )
         pagination: dict = {"type": "none"}
         if page_choice == "1":
-            page_param = _ask(ask, "   页码参数名", DEFAULT_PAGE_PARAM)
-            size_param = _ask(ask, "   每页条数参数名", DEFAULT_SIZE_PARAM)
-            page_size = _ask(ask, "   每页条数", str(DEFAULT_PAGE_SIZE))
-            echo("   翻页终点至少要给一个：总页数字段 或 总条数字段（形如 data.totalPages / data.totalCount）")
+            echo("   翻页终点至少要给一个（总页数字段 或 总条数字段，形如 data.totalPages / data.totalCount）")
             total_pages_path = _ask(ask, "   总页数字段路径")
             total_items_path = _ask(ask, "   总条数字段路径")
             if not total_pages_path and not total_items_path:
                 total_pages_path = "data.totalPages"
                 echo(f"   两个都留空了，先按 {total_pages_path} 写（跑 --check 报错后再改）")
-            pagination = {
-                "type": "page",
-                "page_param": page_param,
-                "size_param": size_param,
-                "page_size": int(page_size or DEFAULT_PAGE_SIZE),
-                "delay_seconds": 0.5,
-            }
-            if total_pages_path:
-                pagination["total_pages_path"] = total_pages_path
+            pagination = {"total_pages_path": total_pages_path} if total_pages_path else {}
             if total_items_path:
                 pagination["total_items_path"] = total_items_path
+            pagination["delay_seconds"] = 0.5
+            # page/size 等参数用默认值（page/size/100），接口不一样时再手工补
         elif page_choice == "2":
-            cursor_param = _ask(ask, "   游标参数名", DEFAULT_CURSOR_PARAM)
             cursor_path = _ask(ask, "   下一页游标在返回里的路径（如 data.nextCursor）")
-            pagination = {"type": "cursor", "cursor_param": cursor_param, "cursor_path": cursor_path}
+            pagination = {"cursor_path": cursor_path}
 
         # ---------------------------------------------------------- ⑤ 取数窗口
         window_choice = _ask_choice(
@@ -183,28 +172,20 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         if window_choice == "1":
             days = _ask(ask, "   每次回拉最近几天", "15")
             start_param = _ask(ask, "   开始时间参数名", DEFAULT_START_PARAM)
-            end_param = _ask(ask, "   结束时间参数名", DEFAULT_END_PARAM)
+            end_param = _ask(ask, "   结束时间参数名（不需要就填 -）", DEFAULT_END_PARAM)
             window = {
                 "mode": "per_day",
                 "days": int(days or "15"),
-                "date_tz": _ask(ask, "   业务日期时区", DEFAULT_DATE_TZ),
-                "api_tz": _ask(ask, "   传给接口的时间时区", DEFAULT_API_TZ),
-                "pad_hours": float(_ask(ask, "   窗口前后多拉几小时（防边界丢数）", "0") or "0"),
                 "start_param": start_param,
-                "end_param": end_param,
+                "end_param": None if end_param == "-" else end_param,
                 "format": _ask(ask, "   时间格式（unix=秒，或 strftime 格式）", DEFAULT_TIME_FORMAT),
             }
-            extra = _ask(ask, "   额外派生参数（如 BillingCycle=%Y-%m；没有留空）")
-            if extra and "=" in extra:
-                name, fmt = extra.split("=", 1)
-                window["extra_params"] = {name.strip(): fmt.strip()}
+            echo("   （时区默认 Asia/Shanghai、+08:00；要改就编辑文件里的 date_tz/api_tz）")
         elif window_choice == "2":
             days = _ask(ask, "   每次覆盖最近几天", "7")
             window = {
                 "mode": "range",
                 "days": int(days or "7"),
-                "date_tz": _ask(ask, "   业务日期时区", DEFAULT_DATE_TZ),
-                "api_tz": _ask(ask, "   传给接口的时间时区", DEFAULT_API_TZ),
                 "start_param": _ask(ask, "   开始时间参数名", DEFAULT_START_PARAM),
                 "end_param": _ask(ask, "   结束时间参数名", DEFAULT_END_PARAM),
                 "format": _ask(ask, "   时间格式", DEFAULT_TIME_FORMAT),
@@ -254,7 +235,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             },
             "target": {"project": project, "table": table, "pt": "${bizdate}", "column": "json"},
         }
-        if pagination["type"] != "none":
+        if pagination.get("type") != "none":     # page/cursor 分支不带 type，交给 normalize 推断
             job["pagination"] = pagination
         if window:
             job["window"] = window

@@ -62,6 +62,25 @@ api2ods --job jobs/my_api.json --dates 2026-09-01,2026-09-05                    
 api2ods --job jobs/my_api.json --bizdate ${bizdate} --workers 3                 # 调度（并发拉）
 ```
 
+一个最简单的作业配置长这样（**没写的字段都有默认值**：翻页方式自动推断、page/size/100、
+startTime/endTime、时区、`pt=${bizdate}`……）：
+
+```json
+{
+  "job": "demo_api",
+  "maxcompute": { "project": "<项目名>", "ak": "<AK>", "sk": "<SK>" },
+  "request": {
+    "base_url": "https://api.example.com",
+    "path": "/v1/items",
+    "auth": { "type": "bearer", "token": "<token>" },
+    "records_path": "data.list"
+  },
+  "window": { "days": 15 },
+  "pagination": { "total_pages_path": "data.totalPages" },
+  "target": { "table": "ods_demo_api_json_di" }
+}
+```
+
 ## 它是怎么工作的
 
 ```
@@ -91,7 +110,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `job` | 否 | 作业名（日志用） |
 | `description` | 否 | 一句话描述（日志用） |
 | `secrets` | 否 | 密钥键值对；`request` 里用 `${secrets.键名}` 引用。**也可以直接把密钥写在用到的地方** |
-| `maxcompute` | 是* | 目标项目与凭证：`project` / `endpoint` / `access_key_id` / `access_key_secret`（* 或走环境变量/aliyun CLI） |
+| `maxcompute` | 是* | 目标项目与凭证：`project` / `endpoint`（默认 us-west-1）/ `access_key_id`+`access_key_secret`（可简写 `ak`/`sk`） |
 | `profiles` | 否 | 多套 MaxCompute 凭证，配合 `target.profile` 切换 |
 
 > 占位符：`${secrets.键名}`、`${bizdate}`（YYYYMMDD）、`${bizdate_iso}`、`${today}`、`${today_iso}`。
@@ -116,12 +135,13 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `retry_times` / `retry_delay` | 5 / 15 | 请求重试次数 / 首次冷却秒数（指数退避） |
 | `verify` / `proxies` | true / - | HTTPS 证书校验 / 代理 |
 
-### auth（鉴权，七选一）
+### auth（鉴权，八选一）
 
 | type | 关键字段 | 适用 |
 |---|---|---|
 | `none` | - | 公开接口 |
-| `token` | `header` / `prefix` / `value` | 最常见：`Authorization: Bearer xxx` |
+| `bearer` | `token` | **最常用**：`Authorization: Bearer xxx`（只写一个字段） |
+| `token` | `header` / `prefix` / `value` | 自定义头，如 `X-Api-Key: xxx` |
 | `query` | `params` | 密钥放 URL 参数 |
 | `basic` | `username` / `password` | HTTP Basic |
 | `sha256_concat` | `secret_key` / `sign_field` / `sign_in` | 参数按 key 排序拼接+密钥做 sha256（Onerway） |
@@ -137,17 +157,17 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `date_tz` | Asia/Shanghai | “最近 N 天”按哪个时区切 |
 | `api_tz` | +08:00 | 传给接口的时间时区 |
 | `pad_hours` | 0 | 窗口前后多拉几小时（防边界丢数） |
-| `start_param` / `end_param` | - | 起止时间参数名；`end_param` 可省略 |
+| `start_param` / `end_param` | startTime / endTime | 起止时间参数名（可省略用默认）；**不要结束参数写 `"end_param": null`** |
 | `format` | %Y-%m-%d %H:%M:%S | 时间格式；`unix`=秒、`unix_ms`=毫秒 |
 | `extra_params` | - | 额外派生参数，如 `{"BillingCycle": "%Y-%m"}`（基于窗口日起算） |
 
 ### pagination（分页，不写=单页）
 
-| 字段 | 说明 |
-|---|---|
-| `type` | `none`（默认）/ `page` / `cursor` |
-| `page_param` / `size_param` / `page_size` / `param_as_string` | 页码分页四件套 |
-| `total_pages_path` / `total_items_path` | page 分页至少给一个（翻页终点）；两个都给时先满足者停 |
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `type` | 自动推断 | `none` / `page` / `cursor`；不写时：有 `cursor_path`→cursor、有 `total_*` 或 `page_param`→page |
+| `page_param` / `size_param` / `page_size` / `param_as_string` | page / size / 100 / false | 页码分页四件套（前三个可省略用默认） |
+| `total_pages_path` / `total_items_path` | - | page 分页至少给一个（翻页终点）；两个都给时先满足者停 |
 | `cursor_param` / `cursor_path` / `cursor_start` | 游标分页 |
 | `delay_seconds` / `max_pages` / `window_retries` | 翻页间隔 / 最大页数保护 / 单窗口失败重试次数 |
 
@@ -222,7 +242,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 109 个离线用例：不访问网络、不连数仓
+python -m unittest discover -s tests -v    # 120 个离线用例：不访问网络、不连数仓
 ```
 
 代码检查（可选，开发用）：`pip install ruff && ruff check .`（配置在 `pyproject.toml`，
