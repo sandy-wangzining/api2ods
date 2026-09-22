@@ -5320,7 +5320,9 @@ class TestEighthPassReview(OfflineTestCase):
         value = datetime(2026, 9, 18, 15, 30, 0)
         stamp = int(value.timestamp())
         self.assertEqual(dates_mod.format_time(value, "%Y-%s"), f"2026-{stamp}")
-        self.assertEqual(dates_mod.format_time(value, "前%s后"), f"前{stamp}后")
+        # 只拿 ASCII 文字包夹：Windows 的 3.9-3.11 上 strftime 格式串要过 locale 编码，
+        # 非 ASCII 会先抛 UnicodeEncodeError（3.12+ 才改），与本修复要验证的点无关
+        self.assertEqual(dates_mod.format_time(value, "pre-%s-post"), f"pre-{stamp}-post")
         self.assertEqual(dates_mod.format_time(value, "%s%P"), f"{stamp}pm")
         self.assertEqual(dates_mod.format_time(value, "%s-%P"), f"{stamp}-pm")
         # 修复前：%Y-%s 在 Windows 抛 ValueError（裸 traceback、日志一个字没有），
