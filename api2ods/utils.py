@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import sys
@@ -157,7 +158,15 @@ class RunLock:
         """拿锁；已被别人持有就抛 SystemExit（不等待），拿不到直接让本次运行退出。"""
         if fcntl is None and msvcrt is None:
             return self
-        self.fh = open(self.path, "w")
+        try:
+            # "a+" 而不是 "w"：w 会在打开时把文件截断，持锁进程刚写进去的 pid 就被抹掉了
+            # （锁本身是文件区域锁，与文件内容无关，互斥不受影响；丢的是排障用的"谁在跑"）
+            self.fh = open(self.path, "a+")
+        except OSError as exc:
+            # 父目录被删/路径过长（Windows MAX_PATH）时给一句人话，
+            # 而不是让 FileNotFoundError 以裸 traceback 的形式糊在用户脸上
+            raise SystemExit(f"无法创建运行锁文件 {self.path}（{exc}）；"
+                             f"请检查该路径所在目录是否存在/可写，或用 --job 指定别处的作业")
         if not _try_lock(self.fh):
             self.fh.close()
             self.fh = None
@@ -166,6 +175,10 @@ class RunLock:
                 f"确认没有任务在跑时可删除该文件后重试。"
             )
         try:
+            # 拿到锁之后才截断+写自己的 pid：拿不到锁时绝不能动内容，
+            # 否则每一次被拦下的启动都会把持锁进程的标记清掉
+            self.fh.seek(0)
+            self.fh.truncate()
             self.fh.write(str(os.getpid()))
             self.fh.flush()
         except OSError:          # 写进程号只是标记，失败不影响加锁
@@ -219,14 +232,44 @@ def as_bool(value, default: bool) -> bool:
 
     JSON 里写 "false"（带引号）是很常见的笔误，直接按真值判断会当成开，静默走错分支
     ——对 allow_empty 这类开关来说，走错的代价是"把已有分区清空"。
+
+    纯空白串按"没填"处理（返回 default）：原来 strip 后落进 falsy 列表返回 False，
+    `verify: " "` 会静默关掉 TLS 校验、`pagination.strict: " "` 会静默放宽丢数检查。
     """
     if value is None:
         return default
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value.strip().lower() not in ("false", "0", "no", "off", "")
+        text = value.strip().lower()
+        if text == "":
+            return default
+        return text not in ("false", "0", "no", "off")
     return bool(value)
+
+
+def check_header_values(headers: dict) -> None:
+    """请求头的值必须是"能直接发出去"的字符串，否则提前给配置错。
+
+    requests 对"值首尾有空白/含换行/含非 latin-1 字符"只会抛 InvalidHeader，
+    而且**消息里带着头的原值**——密钥会跟着进日志与最终异常（实测一次运行漏十几行）。
+    更糟的是它属于"一个字节都没发出去"的确定性错误，被当成网络抖动退避能白等 20 多分钟。
+    所以在这里提前拦下，报错只给头名、不回显值。
+    """
+    for name, value in (headers or {}).items():
+        text = str(value)
+        if text != text.strip() or "\r" in text or "\n" in text:
+            raise ConfigError(
+                f"请求头 {name} 的值首尾有空白或含换行（配置或密钥里多半抄多了空格/换行）；"
+                f"值不回显以免泄漏密钥"
+            )
+        try:
+            text.encode("latin-1")
+        except UnicodeEncodeError:
+            raise ConfigError(
+                f"请求头 {name} 的值含非 latin-1 字符（中文等），HTTP 头发不出去；"
+                f"值不回显以免泄漏密钥"
+            )
 
 
 # =============================================================================
@@ -238,15 +281,24 @@ def as_bool(value, default: bool) -> bool:
 _SENSITIVE_WORDS = {
     "sign", "signature", "sig", "token", "secret", "password", "passwd", "authorization",
     "auth", "apikey", "key", "accesskey", "sk", "ak",
+    # 常见简写与 scheme 名：?pwd= / ?pw= / ?pass= / bearer: <token>
+    "pwd", "pw", "pass", "bearer",
 }
 _WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 # 参数名做左边界限制（不用 \b：下划线在正则里算词字符，client_secret 会被漏掉）
 _QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})=([^&\s\"']+)")
 # 同时认单引号：异常里直接插值的 dict（f"{cfg}"）和 repr（{exc!r}）都是单引号形态，
-# 只认双引号会让含密钥的 KeyError/ValueError 消息把密钥原样带进日志
-_JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*["'])([^"']*)(["'])""")
+# 只认双引号会让含密钥的 KeyError/ValueError 消息把密钥原样带进日志。
+# 值用「回引号」收尾而不是 [^"']*：repr 对「值里含单引号」的串会改用双引号包裹
+# （{'password': "ab'SECRET"}），按"遇到任意引号就停"会在第一个单引号处截断，
+# 引号之后的部分原样漏进日志
+_JSON_RE = re.compile(
+    r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!(?P=q))[\s\S])*)(?P=q)""")
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
+# URL 里的 userinfo（https://user:pass@host）：代理/接口地址常把账号密码写在地址里，
+# requests 自己的 ProxyError 不带密码，但配置报错与 --check 概要会原样回显整条地址
+_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@")
 # 请求头行：'X-Api-Key: xxx' / 'X-Api-Key=xxx'（requests 抛错时带的 headers 是这种形态）。
 # 上一条 Authorization 规则只认 Basic/Bearer 两种值，其余自定义头名要靠这里兜。
 # 值要吃到行尾：只吃第一个词的话，"Authorization: Token abc…" 会变成 "*** abc…"
@@ -288,13 +340,31 @@ def redact(text: str) -> str:
         """Bearer / Basic 形态：scheme 保留，值换掉。"""
         return match.group(1) + "***"
 
+    def _url_auth(match: re.Match) -> str:
+        """URL 里的 userinfo：只留账号，密码换掉（scheme://user:***@host）。"""
+        return f"{match.group(1)}:***@"
+
     def _json(match: re.Match) -> str:
         """JSON/配置片段里的 "key": "value"：只吃字符串值，保留引号结构。"""
+        quote = match.group("q")
+        prefix, value = match.group(1), match.group(4)
         if _is_sensitive_key(match.group(2)):
-            return f"{match.group(1)}***{match.group(4)}"
+            return f"{prefix}{quote}***{quote}"
+        # 值本身可能是"被 JSON 编码成字符串的一整段 JSON"（接口把内层 JSON 当字符串返回，
+        # 异常里就是 {"data": "{\"token\": \"xxx\"}"} 这种形态），这时内层的引号是 \"、
+        # 任何按引号认边界的规则都匹配不到。反转义 → 脱敏 → 再转义回去
+        if '\\"' in value:
+            try:
+                decoded = json.loads(f'"{value}"')
+            except ValueError:
+                decoded = None
+            if decoded is not None:
+                redacted = redact(decoded)
+                if redacted != decoded:
+                    return f"{prefix}{quote}{json.dumps(redacted, ensure_ascii=False)[1:-1]}{quote}"
         # 键名不敏感时值里也可能藏着密钥（'X-Api-Key: xxx' 这种头行、查询串、
         # 嵌套的 {"auth": {"token": "…"}}），递归脱敏一次再放回去
-        return f"{match.group(1)}{redact(match.group(3))}{match.group(4)}"
+        return f"{prefix}{quote}{redact(value)}{quote}"
 
     def _query(match: re.Match) -> str:
         """URL 查询串里的 key=value：命中密钥词才替换值，其余原样返回。
@@ -324,10 +394,125 @@ def redact(text: str) -> str:
     out = str(text)
     out = _BEARER_RE.sub(_bearer, out)
     out = _BASIC_RE.sub(_bearer, out)
+    out = _URL_AUTH_RE.sub(_url_auth, out)
     out = _JSON_RE.sub(_json, out)
     out = _QUERY_RE.sub(_query, out)
     # 头行规则放最后：它最宽松（只要求行首是 name: value），前面几条先处理过更精确的形态
     return _HEADER_RE.sub(_header, out)
+
+
+# =============================================================================
+# 值级脱敏：配置里的密钥值本身
+# =============================================================================
+
+_SECRET_MIN_LEN = 4
+"""短于该长度的密钥值不做值级替换：`1` / `ok` 这种在普通文本里出现概率太高，
+替换只会把报错信息搅乱，而真实凭证不会这么短。"""
+
+# auth 配置里承载凭证的字段名（auth.py 各类型的取值字段：token 的 value、bearer 的
+# token、basic 的 password、sha256_concat 的 secret_key、aliyun_rpc 的 access_key_*）。
+# 结构性字段（type/header/prefix/sign_field…）不在此列。
+_AUTH_SECRET_KEYS = frozenset({
+    "password", "value", "token", "secret_key", "secret",
+    "access_key_id", "access_key_secret", "client_secret", "private_key",
+})
+_SECRET_HEADER_KEYS = frozenset({
+    "authorization", "proxy-authorization", "cookie", "set-cookie",
+    "x-api-key", "api-key", "apikey", "x-auth-token", "x-access-token",
+})
+_AUTH_SCHEMES = frozenset({"basic", "bearer", "token", "digest"})
+# 结构性字段后缀：值为配置项名/位置（sign_field="sign"、sign_in="body"），
+# 不是凭证；不排除的话 "sign"、"body" 会被当密钥值把报错文本里这些常见词遮掉
+_AUTH_STRUCT_SUFFIXES = ("_field", "_in", "_name", "_param")
+
+
+def _auth_carrier(name: str) -> bool:
+    """auth 配置里的键是否承载凭证：显式字段名、query 型的 params，
+    或其余含密钥语义的键（自定义签名函数的字段名），但结构字段除外。"""
+    if name in _AUTH_SECRET_KEYS or name == "params":
+        return True
+    return _is_sensitive_key(name) and not name.endswith(_AUTH_STRUCT_SUFFIXES)
+
+
+def _leaf_strings(value) -> list[str]:
+    """递归收集 dict/list/tuple/set 里的字符串叶子（数字也按 str 收：
+    商户号/ID 类密钥写起来就是数字，报错里回显的是它的十进制形式）。"""
+    if isinstance(value, dict):
+        return [item for sub in value.values() for item in _leaf_strings(sub)]
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [item for sub in value for item in _leaf_strings(sub)]
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return [str(value)]
+    return []
+
+
+def _with_scheme_bare(value: str) -> list[str]:
+    """`Bearer sk-xxx` 除整串外再收集裸 token：接口常常只回显后半截。"""
+    head, sep, tail = value.partition(" ")
+    if sep and head.lower() in _AUTH_SCHEMES and tail.strip():
+        return [value, tail.strip()]
+    return [value]
+
+
+def collect_secret_values(job: dict) -> list[str]:
+    """收集作业配置里"可能被接口回显"的密钥字面量，按值脱敏的输入。
+
+    形态识别（redact）盖不住接口把凭证写进**自由文本**的报错（如
+    `Invalid token: sk-xxx`），但这类回显的内容必然是请求里用过的凭证，而凭证就
+    躺在这几处配置里：job.secrets、request.auth 的凭证字段、request.headers 的
+    密钥头、maxcompute 的 access key。收集出来按值替换即可。
+    返回值已去重并按从长到短排序：短值先替会把长密钥切成半截、留下可辨认的碎片。
+    """
+    if not isinstance(job, dict):
+        return []
+    values: list[str] = _leaf_strings(job.get("secrets"))
+    request_cfg = job.get("request")
+    if isinstance(request_cfg, dict):
+        auth_cfg = request_cfg.get("auth")
+        if isinstance(auth_cfg, dict):
+            for key, val in auth_cfg.items():
+                if _auth_carrier(str(key)):
+                    values += [part for value in _leaf_strings(val) for part in _with_scheme_bare(value)]
+        # 固定请求参数里也可能直接夹着凭证（不经 auth 块的 API），按参数名判断
+        params = request_cfg.get("params")
+        if isinstance(params, dict):
+            for key, val in params.items():
+                if _is_sensitive_key(str(key)):
+                    values += _leaf_strings(val)
+        headers = request_cfg.get("headers")
+        if isinstance(headers, dict):
+            for key, val in headers.items():
+                name = str(key).lower()
+                if name in _SECRET_HEADER_KEYS or _is_sensitive_key(name):
+                    values += [part for value in _leaf_strings(val) for part in _with_scheme_bare(value)]
+    maxcompute = job.get("maxcompute")
+    if isinstance(maxcompute, dict):
+        for key, val in maxcompute.items():
+            if _is_sensitive_key(str(key)):
+                values += _leaf_strings(val)
+    cleaned = (value.strip() for value in values)
+    return sorted({value for value in cleaned if len(value) >= _SECRET_MIN_LEN}, key=len, reverse=True)
+
+
+def redact_secrets(values, text: str) -> str:
+    """值级 + 形态级双重脱敏：配置里的密钥值原样出现时也遮掉。
+
+    形态规则认的是 `token=…` / `Bearer …` / `"key": "value"` 这类写法；接口若把
+    凭证写进自由文本（`Invalid token: sk-xxx`），只有按配置值精确替换才挡得住。
+    两条路互不替代，值级先遮、再走形态兜底。
+    """
+    if not text:
+        return text
+    text = str(text)   # 与 redact 同样的宽容度：调用方直接传异常对象/数字也不会炸
+    for value in sorted(set(values or ()), key=len, reverse=True):
+        # 短值（< _SECRET_MIN_LEN）连值级替换也要挡：否则 "SEC" 会把别的密钥切成
+        # "***RET-…"——既没遮住，还把报错信息搅乱。值从 collect_secret_values 来时
+        # 已经过滤过，这里再守一道是为了直接调用本函数的入口（防以后新调用方）。
+        if len(value) >= _SECRET_MIN_LEN and value in text:
+            text = text.replace(value, "***")
+    return redact(text)
 
 
 # =============================================================================

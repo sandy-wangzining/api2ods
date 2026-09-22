@@ -46,7 +46,17 @@ from .mc import (
     write_partition,
 )
 from .spool import SpoolWriter, dump_record
-from .utils import FatalApiError, RunLock, as_bool, log, redact, reset_log_once, setup_console
+from .utils import (
+    FatalApiError,
+    RunLock,
+    as_bool,
+    collect_secret_values,
+    log,
+    redact,
+    redact_secrets,
+    reset_log_once,
+    setup_console,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG_PATH = ROOT / "config.json"
@@ -94,7 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dates", default="", help="逗号分隔的日期列表（补零散几天），指定后忽略 --bizdate/--days")
     parser.add_argument("--start-date", default="", help="补数起始日期（含），与 --end-date 成对使用")
     parser.add_argument("--end-date", default="", help="补数结束日期（含），与 --start-date 成对使用")
-    parser.add_argument("--pt", default="", help="覆盖分区值（默认取作业 target.pt，即 ${bizdate}）")
+    parser.add_argument("--pt", default="",
+                        help="覆盖分区值；不指定时 target.pt 必须是 8 位业务日 yyyyMMdd，"
+                             "显式指定时可写特殊分区（如测试用 test_20260921——注意调度与 DWD 只自动读 yyyyMMdd 分区）")
     parser.add_argument("--workers", type=int, default=1, help="并按天/按区间并发拉取，默认 1；回补历史可用 2~4")
     parser.add_argument("--dry-run", action="store_true", help="只拉取统计，不写数仓")
     parser.add_argument("--allow-empty", action="store_true", help="本次 0 行时也清空并写空分区（默认拒绝）")
@@ -181,6 +193,12 @@ def _lock_path(job_path: Path) -> Path:
     return Path(tempfile.gettempdir()) / f"api2ods-{name}.lock"
 
 
+def _redact_job(job: dict, text) -> str:
+    """作业上下文下的脱敏：先按配置里的密钥值遮（形态规则盖不住的自由文本回显），
+    再走形态输助。错误只在真出错时走这里，每次重收密钥值的开销可忽略。"""
+    return redact_secrets(collect_secret_values(job), str(text))
+
+
 def _job_summary(job: dict) -> list[str]:
     """体检时打印的作业概要（让用户一眼确认配置理解正确）。"""
     request = job.get("request") or {}
@@ -200,7 +218,7 @@ def _job_summary(job: dict) -> list[str]:
         + (f" —— {job['description']}" if job.get("description") else ""),
         # path 允许带查询串（--init 就是这么把签名类 URL 存下来的），
         # 概要会落进 --check 日志和 --log-file，必须过一遍脱敏
-        "  接口      : " + redact(endpoint),
+        "  接口      : " + _redact_job(job, endpoint),
         f"  响应      : {response_text}",
         f"  窗口      : {window_text}",
         f"  分页      : {pagination.get('type') or 'none'}"
@@ -226,7 +244,9 @@ def run_check(job: dict, config: dict, config_path: Path, args, bizdate, job_pat
         label, count = fetcher.probe([bizdate])
         log(f"  ✅ {label} 请求成功，拿到 {count:,} 条记录")
     except Exception as exc:  # noqa: BLE001
-        log(f"  ❌ 请求失败：{exc}")
+        # 统一走 redact：接口的错误体常回显 token/签名（fail_if 的 message_path
+        # 往往是整段错误消息），run_sync 的同类分支一直是脱敏的，这里不能搞两套标准
+        log(f"  ❌ 请求失败：{_redact_job(job, exc)}")
         return 1
 
     log("")
@@ -244,10 +264,10 @@ def run_check(job: dict, config: dict, config_path: Path, args, bizdate, job_pat
             has_pt = table.exist_partition(f"{PARTITION_COLUMN}={pt}")
             log(f"  ✅ {table_name} 结构符合；pt={pt} 分区{'已存在' if has_pt else '不存在（运行时创建）'}")
     except SystemExit as exc:
-        log(f"  ❌ {exc}")
+        log(f"  ❌ {_redact_job(job, exc)}")
         return 1
     except Exception as exc:  # noqa: BLE001
-        log(f"  ❌ 连接/校验失败：{exc}")
+        log(f"  ❌ 连接/校验失败：{_redact_job(job, exc)}")
         return 1
 
     log("")
@@ -268,7 +288,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     try:
         fetcher = Fetcher(job, job_dir)
     except SystemExit as exc:
-        log(f"❌ {exc}")
+        log(f"❌ {_redact_job(job, exc)}")
         return 1
     unit_count = fetcher.unit_count(days)
     log(f"{job.get('job') or '作业'} 启动：{days[0]} ~ {days[-1]}（{len(days)} 天，{unit_count} 次请求计划），"
@@ -293,7 +313,8 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             log("")
             log("以下请求失败，本次不写库（避免分区缺数，重跑即可）：")
             for label, err in failures:
-                log(f"  - {label}: {err}")
+                # fetch_all 已脱敏，这里再走一遍兜底：除 fetch 之外的失败源也要进同一道口
+                log(f"  - {label}: {_redact_job(job, err)}")
             return 1
 
         log(f"拉取完成：{spool.count:,} 条记录，约 {spool.bytes / 1024 / 1024:.2f} MB，"
@@ -314,12 +335,17 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         # ③ 写库：自动建表 → 先删再填 → Tunnel 写入 → 行数与 count(*) 双重校验
         try:
             lifecycle_days = None
-            if target_cfg.get("lifecycle_days"):
-                try:
-                    lifecycle_days = int(target_cfg["lifecycle_days"])
-                except (TypeError, ValueError):
-                    raise SystemExit(f"target.lifecycle_days 必须是整数（天），"
-                                     f"实际 {target_cfg['lifecycle_days']!r}")
+            raw_lifecycle = target_cfg.get("lifecycle_days")
+            if raw_lifecycle is not None and raw_lifecycle != "":
+                # 布尔要单独挡：JSON 里写 true 时 int(True) == 1，新表会拿到 lifecycle 1，
+                # 建表当天数据就被生命周期回收；浮点静默截断、负数原样写进 DDL 同理
+                if isinstance(raw_lifecycle, bool) or not isinstance(raw_lifecycle, (int, float)):
+                    raise SystemExit(f"target.lifecycle_days 必须是正整数（天），"
+                                     f"实际 {raw_lifecycle!r}")
+                if float(raw_lifecycle) != int(raw_lifecycle) or int(raw_lifecycle) <= 0:
+                    raise SystemExit(f"target.lifecycle_days 必须是正整数（天），"
+                                     f"实际 {raw_lifecycle!r}")
+                lifecycle_days = int(raw_lifecycle)
             profile = get_mc_profile_meta(config, job, args)
             o = connect_odps(config, _cred_source_label(config_path, job_path), profile, project,
                              endpoint=str(args.endpoint or ""), cli_profile=args.cli_profile)
@@ -350,7 +376,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             raise
         except Exception as exc:  # noqa: BLE001 - SQL/Tunnel 失败统一按失败退出（调度可告警）
             keep_spool = args.keep_spool
-            log(f"❌ 写库失败：{exc}")
+            log(f"❌ 写库失败：{_redact_job(job, exc)}")
             return 1
 
         log(f"校验通过：pt={pt} 共 {actual:,} 行")
@@ -360,7 +386,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         # 4xx（密钥错/参数错/没权限）：不写库、不打整窗重试，直接把接口给的原因打出来。
         # 这类错误在 fetch_all 里就已经跳过重试了，这里只是把出口做得干净些
         keep_spool = args.keep_spool
-        log(f"❌ 接口返回不可重试的错误，本次不写库：{redact(str(exc))}")
+        log(f"❌ 接口返回不可重试的错误，本次不写库：{_redact_job(job, exc)}")
         return 1
     except KeyboardInterrupt:
         keep_spool = args.keep_spool
@@ -490,12 +516,19 @@ def main(argv: list[str] | None = None) -> int:
             # 配置类错误（ConfigError 是 SystemExit 子类）从 run_sync 里冒泡时同样带着
             # 在飞请求：不走 _exit_now 的话，解释器退出阶段仍要 join 它们（实测进程耗时
             # 随在飞请求线性增长）。消息可能是配置片段，log 前统一过脱敏
-            log(f"❌ {redact(str(exc))}")
+            log(f"❌ {_redact_job(job, exc)}")
             return _exit_now(1)
         except KeyboardInterrupt:
             # 准备阶段（还没进 run_sync）被 Ctrl+C：没有线程要等，但走同一条出口更省心
             log("已中断（尚未开始运行），退出")
             return _exit_now(130)
+    except SystemExit as exc:
+        # 准备阶段的配置错（bizdate 畸形、缺 request.base_url、占位符写错、validate_job
+        # 的各类报错、运行锁拿不到）原来直接冒泡出 main：退出码虽然是对的，但控制台那句
+        # 没有时间戳、--log-file 里一个字都没有，调度侧翻日志文件看不到任何原因。
+        # 这里统一按运行期错误的格式记一笔，并且同样过脱敏
+        log(f"❌ {redact(str(exc))}")
+        return 1
     finally:
         _detach_log_sink(log_handle)
 

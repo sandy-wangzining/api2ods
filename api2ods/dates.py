@@ -23,6 +23,16 @@ _OFFSET_RE = re.compile(r"^([+-])(\d{1,2})(?::?(\d{2}))?$")
 _TIME_TOKENS = ("%H", "%I", "%M", "%S", "%f", "%p", "%P", "%X", "%T", "%R", "%r", "%s",
                 "%c", "%z", "%Z")
 _UNIX_FORMATS = ("unix", "unix_s", "unix_ms", "unix_millis")
+# strftime 指令白名单 = Windows 与 glibc 都认的交集（外加我们自己实现的 %s / %P）。
+# 实测 MSVC 不认的：k l N P q s v 与所有修饰符（%-d/%_d/%0d/%^B）；glibc 则是不认的
+# 原样输出。取交集才能保证"同一份配置在 Linux 与 Windows 上行为一致"，
+# 而不是一边崩、一边把 "%Q" 当参数值发给接口
+_STRFTIME_CODES = set("aAbBcCdDeFgGhHIjmMnprRStTuUVWwWxXyYzZ%") | {"s", "P"}
+_DIRECTIVE_RE = re.compile(r"%(.)", re.S)
+_MODIFIERS = "-_0^#"
+# 日期参数白名单：只认紧凑与 ISO 两种写法（见 parse_day_arg 的说明）
+_DAY_COMPACT_RE = re.compile(r"\A\d{8}\Z")
+_DAY_ISO_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 
 def is_date_only_format(fmt: str) -> bool:
@@ -80,14 +90,26 @@ def date_tz_of(job: dict) -> ZoneInfo:
 
 
 def parse_day_arg(text: str) -> date:
-    """解析日期参数：YYYYMMDD 或 YYYY-MM-DD。"""
+    """解析日期参数：YYYYMMDD 或 YYYY-MM-DD。
+
+    两条正则白名单而不是 date.fromisoformat：3.11 起 fromisoformat 还认 ISO 周日期
+    （"2026-W36-1" 会静默解析成 2026-08-31）与紧凑写法，同一个 --bizdate 在不同
+    Python 版本上行为不同，写错的日子会静默写进错分区。
+    """
     value = str(text or "").strip()
-    if len(value) == 8 and value.isdigit():
-        value = f"{value[:4]}-{value[4:6]}-{value[6:]}"
-    try:
-        return date.fromisoformat(value)
-    except ValueError:
-        raise SystemExit(f"日期格式应为 YYYYMMDD 或 YYYY-MM-DD：{text!r}")
+    if _DAY_COMPACT_RE.match(value):
+        try:
+            return date(int(value[:4]), int(value[4:6]), int(value[6:]))
+        except ValueError as exc:
+            # 形态对但日期不存在（20261301、20260230）：与 ISO 写法给同样的提示，
+            # 不能让裸 ValueError 冒到用户脸上
+            raise SystemExit(f"日期不存在：{text!r}（{exc}）")
+    if _DAY_ISO_RE.match(value):
+        try:
+            return date(int(value[:4]), int(value[5:7]), int(value[8:10]))
+        except ValueError as exc:
+            raise SystemExit(f"日期不存在：{text!r}（{exc}）")
+    raise SystemExit(f"日期格式应为 YYYYMMDD 或 YYYY-MM-DD：{text!r}")
 
 
 def env_bizdate(strict: bool = True) -> date | None:
@@ -180,15 +202,100 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
     return sorted(set(days))
 
 
+def check_format_string(fmt: str, field: str = "window.format") -> None:
+    """按白名单校验 strftime 格式串里的指令（跨平台一致）。
+
+    各平台 C 库对"不认识的指令"反应不同：MSVC 抛 ValueError（裸 traceback），
+    glibc 原样输出 `%Q`——于是同一个配置在 Linux 上会把"%Q"当成参数值发给接口，
+    在 Windows 上直接崩。与其两边行为都对不上，不如在配置阶段就挡掉。
+
+    field 只用于报错文案：同一个白名单也要校验 window.extra_params 的值。
+    """
+    def _check(match: re.Match) -> str:
+        char = match.group(1)
+        if char in _MODIFIERS:
+            raise ConfigError(
+                f"{field} 不支持带修饰符的指令 %{char}…：{fmt!r}；"
+                f"（如 %-d 去零填充只有 glibc 认，Windows 会直接报错）"
+            )
+        if char not in _STRFTIME_CODES:
+            raise ConfigError(
+                f"{field} 里有不支持的格式指令 %{char}：{fmt!r}；"
+                f"epoch 秒请写 unix 或 %s，毫秒写 unix_ms"
+            )
+        return ""
+
+    rest = _DIRECTIVE_RE.sub(_check, str(fmt))
+    if "%" in rest:
+        raise ConfigError(f"{field} 里有写坏的格式指令（孤立的 %）：{fmt!r}")
+
+
+def _protect_extension(fmt: str, code: str, sentinel: str) -> str:
+    """把「未被 %% 转义掉的 %<code>」替换成哨兵，`%%` 原样保留。
+
+    不能用 `(?<!%)%P` 这类后行断言：它只看前一个字符，`%%%P` 里第二个 `%` 是转义符、
+    第三个 `%` 开头的才是真指令，却被当成"前面有 % 所以已转义"漏掉（Windows 抛
+    ValueError、Linux 输出 `%pm`——同一份配置的跨平台差异正是这么来的）。这里按 `%%`
+    成对消费逐段扫描，奇偶天然正确：`%%s`/`%%P` 是字面量，`%s`/`%P` 才替换。
+    """
+    out: list[str] = []
+    index = 0
+    length = len(fmt)
+    while index < length:
+        char = fmt[index]
+        if char != "%":
+            out.append(char)
+            index += 1
+            continue
+        if index + 1 >= length:          # 结尾孤立 %（check_format_string 已拦，兜底不崩）
+            out.append(char)
+            index += 1
+            continue
+        nxt = fmt[index + 1]
+        if nxt == "%":                   # %% → 字面量 %
+            out.append("%%")
+        elif nxt == code:                # 未转义的目标指令 → 哨兵
+            out.append(sentinel)
+        else:                            # 其它指令原样保留（两字符）
+            out.append("%" + nxt)
+        index += 2
+    return "".join(out)
+
+
 def format_time(value: datetime, fmt: str):
-    """按配置格式化时间：支持 unix（秒）/ unix_ms（毫秒）两种特殊格式。"""
+    """按配置格式化时间：支持 unix（秒）/ unix_ms（毫秒），并自己实现 %s / %P。
+
+    `%s`（epoch 秒）与 `%P`（小写 am/pm）是 glibc/BSD 扩展，MSVC 的 strftime 不认：
+    同一份配置在 Linux 能跑、到 Windows 直接抛 ValueError（裸 traceback，退出码 1，
+    --log-file 里什么都没有）；反过来 glibc 会把混在格式串里的 %s 展开成 epoch 秒
+    （看起来就是个普通大整数）。这两个指令在格式串的**任何位置**都由这里自己实现，
+    跨平台一致；其余认不出的指令由 check_format_string 挡掉。
+
+    fmt 恰好是 "%s" 时返回 int（保持"时间戳"语义，_moment 直接当参数发出去）；
+    与其它文本混用时返回 str（如 "%Y-%s" → "2026-1789889400"）。
+    """
     fmt = str(fmt or DEFAULT_TIME_FORMAT)
     lowered = fmt.lower()
     if lowered in ("unix", "unix_s"):
         return int(value.timestamp())
     if lowered in ("unix_ms", "unix_millis"):
         return int(value.timestamp() * 1000)
-    return value.strftime(fmt)
+    if fmt == "%s":
+        return int(value.timestamp())
+    check_format_string(fmt)
+    # %s / %P 先换成哨兵再交给 strftime（不这么绕的话，Windows 上 strftime 会直接抛错）。
+    # 哨兵不能用 \x00：strftime 收的是 C 字符串，NUL 会把它后面的内容整段截掉（Linux 实测输出空串）。
+    # 替换按 %% 转义规则逐段扫描：只换真正是"指令"的那个，%%s / %%P 是字面量。
+    s_sentinel = "\x01s\x01"
+    p_sentinel = "\x01P\x01"
+    protected = _protect_extension(fmt, "s", s_sentinel)
+    protected = _protect_extension(protected, "P", p_sentinel)
+    out = value.strftime(protected)
+    if s_sentinel in out:
+        out = out.replace(s_sentinel, str(int(value.timestamp())))
+    if p_sentinel in out:
+        out = out.replace(p_sentinel, "am" if value.hour < 12 else "pm")
+    return out
 
 
 def _moment(value: datetime, fmt: str, api_tz) -> str | int:

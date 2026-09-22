@@ -16,7 +16,7 @@ import urllib.parse
 import uuid
 from pathlib import Path
 
-from .utils import ConfigError
+from .utils import ConfigError, redact
 
 ALIYUN_RPC_SIGNATURE_VERSION = "1.0"
 
@@ -84,7 +84,7 @@ class AuthApplier:
         except Exception as exc:  # noqa: BLE001 - signers.py 是用户代码，语法/导入错都归为配置错
             # 包装成 ConfigError（不是 IndexError 之类）：既给出"哪个文件、错在哪"，
             # 又不会被当成网络抖动去做整窗重试
-            raise ConfigError(f"自定义签名文件 {path} 加载失败：{exc!r}") from exc
+            raise ConfigError(f"自定义签名文件 {path} 加载失败：{redact(repr(exc))}") from exc
         func = getattr(module, func_name, None)
         if not callable(func):
             raise ConfigError(f"{path} 里没有可调用的函数：{func_name}")
@@ -119,9 +119,12 @@ class AuthApplier:
             query_params = self.cfg.get("params") or {}
             if not isinstance(query_params, dict):
                 # 写成数组/字符串时裸 AttributeError 会被上层当成网络抖动，
-                # 退避重试加起来空等十几分钟才失败
+                # 退避重试加起来空等十几分钟才失败。
+                # 不回显实际值：写成数组时里面往往就是密钥本身
+                # （["tok", "${secrets.tok}"]），而 Python list 的 repr 任何脱敏规则都盖不住
                 raise ConfigError(f"auth.params 必须是对象（键值对），"
-                                  f"实际 {type(query_params).__name__}：{query_params!r}")
+                                  f"实际 {type(query_params).__name__}；"
+                                  f"写成数组时里面通常就是密钥值，故不回显内容")
             for key, value in query_params.items():
                 params[str(key)] = value
             return
@@ -154,7 +157,8 @@ class AuthApplier:
                 raise
             except Exception as exc:  # noqa: BLE001 - 签名函数是纯本地计算，任何异常都是配置/代码问题
                 # 包装成 ConfigError：否则会被当成网络抖动重试 5 次（空等约 225 秒）
-                raise ConfigError(f"自定义签名函数 {self._custom_name} 执行失败：{exc!r}") from exc
+                raise ConfigError(f"自定义签名函数 {self._custom_name} 执行失败："
+                                  f"{redact(repr(exc))}") from exc
             return
 
         raise SystemExit(f"未知鉴权类型：{self.type}")

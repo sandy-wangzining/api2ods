@@ -179,7 +179,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `api_tz` | +08:00 | 传给接口的时间按哪个时区算：固定偏移（`+08:00` / `+0800` / `+08`）或时区名（`America/New_York`，自动处理夏令时） |
 | `pad_hours` | 0 | 窗口前后多拉几小时（防边界丢数），取值 0~24。**只要 >0，相邻两天的窗口就会重合 2×pad_hours 小时**（同一笔数据拉两遍，靠 DWD 按主键去重兜底）。`format` 只到日期时本项**被忽略并告警**：日期参数减 pad 不是多拉一段，而是把日期整体顶到前一天 |
 | `start_param` / `end_param` | startTime / endTime | 起止时间参数名。**两个都不写**才启用默认；自定义了 `start_param` 就不补 `end_param`（只要开始时间只写 `start_param`，不要结束时间写 `"end_param": null`） |
-| `format` | %Y-%m-%d %H:%M:%S | 时间格式；`unix`=秒、`unix_ms`=毫秒。**只到日期（无时分秒）时按 `date_tz` 直接输出那一天，不做时区换算** |
+| `format` | %Y-%m-%d %H:%M:%S | 时间格式；`unix`=秒、`unix_ms`=毫秒；`%s`（epoch 秒）与 `%P`（am/pm）可在格式串任意位置用（自己实现，跨平台一致；`%s` 单用返回纯数字）。**只到日期（无时分秒）时按 `date_tz` 直接输出那一天，不做时区换算** |
 | `extra_params` | - | 额外派生参数，如 `{"BillingCycle": "%Y-%m"}`（基于窗口日起算） |
 
 > **时区怎么配**（美东源这种最容易错，先看这段）：
@@ -224,14 +224,14 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `unzip` / `entry_contains` | 解 ZIP / 只取文件名含指定串的条目。ZIP 里有多个文件又没写 `entry_contains` 时报错，确实要全解析时加 `allow_multi_entry: true` |
 | `strict_encoding` | `true` 时按 `encoding` 解码失败直接报错；默认 `false`（解出乱码会打警告，仍按替换字符解析）——源方文件编码可能变过时建议打开 |
 | `allow_multi_entry` | 见 `unzip`：ZIP 多文件时是否允许全部解析 |
-| `entry_field` | 给每条记录加一列“来源文件名” |
+| `entry_field` | 给每条记录加一列“来源文件名”（仅 `unzip: true` 时生效；没开 `unzip` 会告警） |
 
 ### target（目标表）
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `project` / `table` | - / 必填 | 目标项目（缺省用 maxcompute.project）/ 表名 |
-| `pt` | ${bizdate} | 分区值模板；`--pt` 可覆盖 |
+| `pt` | ${bizdate} | 分区值模板，必须是 8 位业务日 `yyyyMMdd`（调度与 DWD 按它读取）；`--pt` 可显式覆盖成特殊分区（测试/对比/补数用，如 `test_20260921`——注意特殊分区不会被调度与 DWD 自动读到） |
 | `column` | json | json 列名 |
 | `comment` / `stored_as` / `lifecycle_days` | - | 建表注释 / 存储格式 / 生命周期 |
 | `allow_empty` | false | 本次 0 行时是否允许写空分区 |
@@ -269,7 +269,8 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 5. 默认拒绝写 0 行（防接口异常时清空分区），要写空分区显式 `--allow-empty`；
 6. 单行超过约 7MB 提前报错（MaxCompute 单列上限 8MB）；
 7. 建表/删分区/校验 SQL 有超时保护（默认 600 秒，超时主动取消）；
-8. 日志与异常里的 token/sign/secret 一律脱敏；
+8. 日志与异常里的 token/sign/secret 一律脱敏（形态规则 + 按配置里的密钥值精确遮蔽，
+   接口把凭证写进自由文本报错时也不会漏）；
 9. 429/5xx 按 `Retry-After` 退避重试，4xx 直接失败（参数/密钥问题快速暴露）；
    每次重试都重新鉴权（一次性签名如阿里云 `SignatureNonce` 不会因复用被判 400）；
    连接抖动（ConnectionError / Timeout / SSL 错误）走请求级退避重试；
@@ -322,12 +323,12 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 370 个离线用例：不访问网络、不连数仓
+python -m unittest discover -s tests -v    # 481 个离线用例：不访问网络、不连数仓
 pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
 ```
 
-CI 在 ubuntu / windows / macos × Python 3.9 / 3.12 六种组合上跑同一套用例
-（见 `.github/workflows/tests.yml`）。想改代码或加数据源，先看 `CONTRIBUTING.md`
+CI 在 ubuntu / windows / macos × Python 3.9 / 3.10 / 3.11 / 3.12 / 3.13 / 3.14
+十八种组合上跑同一套用例（见 `.github/workflows/tests.yml`）。想改代码或加数据源，先看 `CONTRIBUTING.md`
 ——里面写了这个工具的几条"设计红线"（先删再填、宁可失败不可静默丢数、密钥不进日志……），
 不少看着顺手的改法会踩到它们。
 

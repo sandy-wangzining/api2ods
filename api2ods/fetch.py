@@ -25,7 +25,7 @@ from .auth import AuthApplier
 from .dates import window_param_sets
 from .http import request_with_retry
 from .parsers import ensure_object_records, extract_json_records, get_path, parse_payload
-from .utils import ConfigError, FatalApiError, as_bool, log, redact
+from .utils import ConfigError, FatalApiError, as_bool, check_header_values, collect_secret_values, log, redact_secrets
 
 # 体检用 page_size=1 被拒时的判据：宁缺毋滥，命中不了的接口最多少回退一次。
 # 不收录光秃秃的 "limit"：报错说"时段超限/调用次数 limit"的接口会被误判成拒绝页大小，
@@ -185,6 +185,13 @@ class Fetcher:
         self.params_in = str(request_cfg.get("params_in") or "query").lower()
         self.auth = AuthApplier(request_cfg, job_dir)
         self._job_dir = job_dir
+        # 值级脱敏的输入：接口把凭证写进自由文本报错时，形态规则（redact）盖不住，
+        # 按配置里出现过的密钥值再遮一道（见 self.redact）
+        self._secret_values = collect_secret_values(job)
+
+    def redact(self, text) -> str:
+        """值级 + 形态级两道脱敏：请求/响应/落盘错误进日志前统一走这里。"""
+        return redact_secrets(self._secret_values, str(text))
 
     # ------------------------------------------------------------------ 计划
 
@@ -232,7 +239,7 @@ class Fetcher:
             # 这不是"接口不通"，按配置里的页大小再试一次，别把能用的源拒之门外
             if size_override is None or not _looks_like_size_error(str(exc)):
                 raise
-            log(f"  体检用 page_size=1 被接口拒绝（{exc}），改回配置的页大小重试一次")
+            log(f"  体检用 page_size=1 被接口拒绝（{self.redact(exc)}），改回配置的页大小重试一次")
             records = self.fetch_unit(unit, max_pages_override=1, stop_after_first_page=True)
         return unit.label, len(records)
 
@@ -269,6 +276,9 @@ class Fetcher:
             if self.params_in == "headers":
                 headers.update({str(key): str(value) for key, value in attempt_params.items()})
                 attempt_params.clear()
+            # 头值首尾空白/换行/非 latin-1 是"发不出去"的确定性配置错：
+            # 提前拦下，别让 requests 抛的 InvalidHeader 把头的原值（密钥）带进日志
+            check_header_values(headers)
             return attempt_params, headers
 
         return request_with_retry(
@@ -276,7 +286,7 @@ class Fetcher:
             expect_json=expect_json, fail_if=self.fail_if,
             retry_times=self.retry_times, retry_delay=self.retry_delay,
             verify=self.verify, proxies=self.proxies, desc=desc,
-            json_encoding=self.json_encoding,
+            json_encoding=self.json_encoding, redactor=self.redact,
         )
 
     def fetch_unit(self, unit: FetchUnit, page_size_override: int | None = None,
@@ -399,11 +409,16 @@ class Fetcher:
                 if marker_items is not None:
                     last_total_items = max(last_total_items or 0, marker_items)
                 total_items = last_total_items
-                if total_pages is not None and current >= total_pages:
-                    break
                 # 用「已累计条数」而不是 页码×page_size 估算：接口把 PageSize 压小
                 # （返回条数少于请求的 page_size）时，估算会提前判定拉完，静默丢数
                 reached_end = total_items is not None and len(records) >= total_items
+                if total_pages is not None and current >= total_pages:
+                    # 两个终点都配时，接口的 totalPages 可能按「请求的 page_size」算
+                    # （实际每页给得更少），或者中途变小——这时页数说翻完了、条数说还差，
+                    # 以条数为准继续翻：宁可多翻一页（真翻过头会拿到空页，由下面的检查
+                    # 报出来），也不能静默少拉。只配了页数终点时行为不变
+                    if total_items is None or reached_end:
+                        break
                 if page_records:
                     if reached_end:
                         break
@@ -484,12 +499,12 @@ class Fetcher:
                     if attempt == attempts:
                         break
                     log(f"  [{unit.label}] 第 {attempt}/{attempts - 1} 次失败："
-                        f"{redact(str(exc))}；{delay}s 后整窗重试")
+                        f"{self.redact(exc)}；{delay}s 后整窗重试")
                     time.sleep(delay)
                     delay *= 2
             # 走得到这里的只有可重试的异常（FatalApiError / ConfigError 在循环里就抛了），
             # 统一按普通失败上报；消息要脱敏，重试日志里也不该出现密钥
-            raise RuntimeError(redact(str(last_err))) from last_err
+            raise RuntimeError(self.redact(last_err)) from last_err
 
         def handle(label: str, records: list[dict]) -> None:
             """单元拉完后的统一收尾：先落盘、再统计条数、最后打日志。"""
@@ -511,8 +526,10 @@ class Fetcher:
                     # 必然同样失败，继续跑只是把错误重复几十遍
                     raise
                 except Exception as exc:  # noqa: BLE001
-                    failures.append((unit.label, str(exc)))
-                    log(f"  ❌ {unit.label} 拉取失败：{exc}")
+                    # 统一 redact：on_records（落盘）的报错里可能带着记录原文/密钥，
+                    # 它没走 run_unit 的脱敏包装，这是最后一道口
+                    failures.append((unit.label, self.redact(exc)))
+                    log(f"  ❌ {unit.label} 拉取失败：{self.redact(exc)}")
         else:
             # 并发：只并发网络等待；回调在主线程的 as_completed 循环里，天然串行安全
             pool = ThreadPoolExecutor(max_workers=workers)
@@ -533,8 +550,9 @@ class Fetcher:
                         # 而 401 对所有单元都成立，继续跑只是把同一个错误重复几十遍
                         raise
                     except Exception as exc:  # noqa: BLE001
-                        failures.append((unit.label, str(exc)))
-                        log(f"  ❌ {unit.label} 拉取失败：{exc}")
+                        # 同上：on_records（落盘）抛出的报错不经 run_unit，必须自己脱敏
+                        failures.append((unit.label, self.redact(exc)))
+                        log(f"  ❌ {unit.label} 拉取失败：{self.redact(exc)}")
             finally:
                 # 不用 with：它的 __exit__ 是 shutdown(wait=True)，Ctrl+C 之后还要等
                 # 所有在飞的请求（可能正卡在 180s 超时或整窗重试的 sleep 里）跑完才退出。
