@@ -26,9 +26,14 @@ def aliyun_encode(value) -> str:
     return urllib.parse.quote(str(value), safe="~")
 
 
-def sign_aliyun_rpc(params: dict, access_key_id: str, access_key_secret: str,
-                    method: str = "GET", nonce: str | None = None,
-                    timestamp: str | None = None) -> str:
+def sign_aliyun_rpc(
+    params: dict,
+    access_key_id: str,
+    access_key_secret: str,
+    method: str = "GET",
+    nonce: str | None = None,
+    timestamp: str | None = None,
+) -> str:
     """给 params 原地补齐阿里云 RPC 公共参数并写入 Signature，返回签名值。
 
     nonce / timestamp 参数只为单测固定值用；生产走默认（随机 nonce + 当前 UTC 时间）。
@@ -40,9 +45,7 @@ def sign_aliyun_rpc(params: dict, access_key_id: str, access_key_secret: str,
     params["Timestamp"] = timestamp or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     params["AccessKeyId"] = access_key_id
 
-    canonical = "&".join(
-        f"{aliyun_encode(key)}={aliyun_encode(value)}" for key, value in sorted(params.items())
-    )
+    canonical = "&".join(f"{aliyun_encode(key)}={aliyun_encode(value)}" for key, value in sorted(params.items()))
     string_to_sign = f"{method.upper()}&{aliyun_encode('/')}&{aliyun_encode(canonical)}"
     digest = hmac.new((access_key_secret + "&").encode(), string_to_sign.encode(), hashlib.sha1).digest()
     signature = base64.b64encode(digest).decode()
@@ -122,9 +125,11 @@ class AuthApplier:
                 # 退避重试加起来空等十几分钟才失败。
                 # 不回显实际值：写成数组时里面往往就是密钥本身
                 # （["tok", "${secrets.tok}"]），而 Python list 的 repr 任何脱敏规则都盖不住
-                raise ConfigError(f"auth.params 必须是对象（键值对），"
-                                  f"实际 {type(query_params).__name__}；"
-                                  f"写成数组时里面通常就是密钥值，故不回显内容")
+                raise ConfigError(
+                    f"auth.params 必须是对象（键值对），"
+                    f"实际 {type(query_params).__name__}；"
+                    f"写成数组时里面通常就是密钥值，故不回显内容"
+                )
             for key, value in query_params.items():
                 params[str(key)] = value
             return
@@ -157,8 +162,7 @@ class AuthApplier:
                 raise
             except Exception as exc:  # noqa: BLE001 - 签名函数是纯本地计算，任何异常都是配置/代码问题
                 # 包装成 ConfigError：否则会被当成网络抖动重试 5 次（空等约 225 秒）
-                raise ConfigError(f"自定义签名函数 {self._custom_name} 执行失败："
-                                  f"{redact(repr(exc))}") from exc
+                raise ConfigError(f"自定义签名函数 {self._custom_name} 执行失败：{redact(repr(exc))}") from exc
             return
 
         raise SystemExit(f"未知鉴权类型：{self.type}")

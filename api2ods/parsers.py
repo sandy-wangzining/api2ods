@@ -38,7 +38,7 @@ _CSV_FIELD_LIMIT = 7_000_000
 try:
     csv.field_size_limit(_CSV_FIELD_LIMIT)
 except OverflowError:  # pragma: no cover - 32 位平台上 C long 装不下
-    csv.field_size_limit(10 ** 7)
+    csv.field_size_limit(10**7)
 
 
 def _as_int(value, fallback: int, field: str) -> int:
@@ -96,8 +96,7 @@ def _json_snippet(payload, limit: int = 300) -> str:
     return "".join(chunks)[:limit]
 
 
-def _marker_outside_quotes(line: str, marker: str, quoted: bool,
-                          delimiter: str = ",") -> tuple[bool, bool]:
+def _marker_outside_quotes(line: str, marker: str, quoted: bool, delimiter: str = ",") -> tuple[bool, bool]:
     """marker 是否出现在"引号外"，并返回处理完这一行之后的引号状态。
 
     逐字符走一遍而不是数引号个数：标记可能落在引号**开始**的那一行里
@@ -169,15 +168,17 @@ def extract_json_records(payload, request_cfg: dict, label: str, missing_ok: boo
             return []
         top_keys = list(payload)[:10] if isinstance(payload, dict) else type(payload).__name__
         snippet = _json_snippet(payload)
-        hint = (f"找不到 records_path={records_path!r}（顶层键：{top_keys}）" if records_path
-                else "records_path 为空且返回不是记录数组")
+        hint = (
+            f"找不到 records_path={records_path!r}（顶层键：{top_keys}）"
+            if records_path
+            else "records_path 为空且返回不是记录数组"
+        )
         raise RuntimeError(f"{label} 解析失败：{hint}；返回片段：{snippet}")
     # 空对象（Items: {} 这类"这次没有数据"的写法）由 ensure_object_records 统一归一成空列表
     return ensure_object_records(records, label)
 
 
-def _parse_text(text: str, parse_cfg: dict, entry: str = "",
-                label: str = "") -> list[dict]:
+def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") -> list[dict]:
     """文本 → 记录列表：csv / tsv / jsonl。"""
     fmt = str(parse_cfg.get("format") or "csv").lower()
     delimiter = str(parse_cfg.get("delimiter") or ("\t" if fmt == "tsv" else ","))
@@ -185,8 +186,9 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
         # 写 "\t"（转义后的两个字面字符）而不是制表符是常见笔误：3.11 起
         # csv 会当"多字符分隔符"静默按它切分，3.10 及以前直接 TypeError，
         # 同一份配置跨 Python 版本行为完全不同——不如直接拒绝
-        raise ConfigError(f"parse.delimiter 必须是单个字符，实际 {delimiter!r}"
-                          f"（TSV 请用 \\t 表示制表符，或直接改用 format=tsv）")
+        raise ConfigError(
+            f"parse.delimiter 必须是单个字符，实际 {delimiter!r}（TSV 请用 \\t 表示制表符，或直接改用 format=tsv）"
+        )
     skip_rows = _as_int(parse_cfg.get("skip_rows"), 0, "parse.skip_rows")
     skip_until = str(parse_cfg.get("skip_until") or "")
     entry_field = str(parse_cfg.get("entry_field") or "")
@@ -200,8 +202,10 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
         if before.strip() and not text.strip():
             # 文件本来有内容，被 skip_rows 一行不剩地跳空了：要么 skip_rows 配大了，
             # 要么源文件结构缩水（比如错误页只有两行）。空结果是静默的，得留个痕
-            log(f"  警告：{label or '文件'} 按 skip_rows={skip_rows} 跳过之后没有任何内容"
-                f"（原文件 {len(_split_lines(before))} 行）；请核对 parse.skip_rows 与文件结构")
+            log(
+                f"  警告：{label or '文件'} 按 skip_rows={skip_rows} 跳过之后没有任何内容"
+                f"（原文件 {len(_split_lines(before))} 行）；请核对 parse.skip_rows 与文件结构"
+            )
     if skip_until and not text.strip():
         # 配置了两个跳过项、且 skip_rows 正好把内容全跳空了：按空结果处理。
         # 这条要放在冲突检测前面——"文件里有内容"这个前提不成立时，
@@ -261,14 +265,12 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
             # 文件本身为空才是 0 行；"有内容却解析不出表头"说明文件结构变了
             if text.strip():
                 raise RuntimeError(
-                    f"{label or '文件'} 的第一行是空行（表头为空），无法解析；"
-                    f"文件开头：{text.lstrip()[:120]!r}"
+                    f"{label or '文件'} 的第一行是空行（表头为空），无法解析；文件开头：{text.lstrip()[:120]!r}"
                 )
             return []
         try:
             for line_no, row in enumerate(reader, start=2):
-                if (all(v is None or str(v).strip() == "" for v in row.values())
-                        and len(fieldnames) > 1):
+                if all(v is None or str(v).strip() == "" for v in row.values()) and len(fieldnames) > 1:
                     # 全空白行：多列文件里是排版垃圾，跳过；单列文件里它更像"值为空"的
                     # 一条记录，保留下来（下游自己判空）。
                     # 注意：真正一个字符都没有的行 csv 模块在迭代时就吞掉了，
@@ -294,8 +296,7 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
         # 同名列会让前面的列被后面的覆盖、空列名的键是 ""（下游 get_json_object 取不到），
         # 都等于静默丢列（表头都是字符串时才可能出现）
         if fieldnames and any(str(name).strip() == "" for name in fieldnames):
-            raise RuntimeError(
-                f"{label or '文件'} 的 CSV 表头有空列名（行尾多了一个分隔符？）：{fieldnames}")
+            raise RuntimeError(f"{label or '文件'} 的 CSV 表头有空列名（行尾多了一个分隔符？）：{fieldnames}")
         if fieldnames and len(fieldnames) != len(set(fieldnames)):
             raise RuntimeError(f"{label or '文件'} 的 CSV 表头有重复列名，解析会丢列：{fieldnames}")
     elif fmt == "jsonl":
@@ -305,7 +306,7 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
                 continue
             try:
                 item = loads_json(line)
-            except ValueError as exc:      # 含 NaN/Infinity 的非法数值
+            except ValueError as exc:  # 含 NaN/Infinity 的非法数值
                 raise RuntimeError(f"JSONL 解析失败（{exc}）；行片段：{line[:120]!r}")
             # JSONL 的定义是「每行一个 JSON 对象」：数组/数字/字符串行会原样落进
             # ODS 的 json 列，下游 get_json_object 解不出来（静默变 NULL）
@@ -322,6 +323,72 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
     return records
 
 
+def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str = "") -> None:
+    """防呆：接口出错时经常用 HTTP 200 回一段 JSON，而不是文件流；这里给出可读报错。
+
+    不拦的话，这段错误体会被按文件格式解析并当成"一条正常记录"写进 ODS——JSON 列里有数据、
+    条数校验也过，下游 get_json_object 却全取空。所以按"宁失败勿写错"在这里拦下。
+
+    两种形态：
+    - 解不出来、又以 }/] 收尾：大概率是含 NaN/Infinity 或被截断的 JSON 错误体；
+      （CSV 表头以 { [ 开头虽罕见但合法，所以只在这个更窄的形态上报错）
+    - 整包能作为一个 JSON 值解析且是 dict/list：接口返回的是 JSON 文档。
+
+    parse.format=jsonl 时，**整个响应恰好是一个 JSON 值**与"只有一条记录"在内容上无法区分，
+    所以一律先按错误体拦下，再由 parse.allow_single_record 显式放行低流量源。判断依据是
+    "整包能不能作为一个 JSON 值解析"，不是"末尾有没有换行"：错误体后面带一个 \n 太常见
+    （nginx/框架/工具自己补），而 JSONL 规范（jsonlines.org）明确允许最后一行不带换行分隔符，
+    `{"a":1}\n{"b":2}` 这种多行 JSONL 整包也解不成一个 JSON 值，照常解析。
+    """
+    probe = data.lstrip(b" \t\r\n\xef\xbb\xbf")
+    if probe[:1] not in (b"{", b"["):
+        # 不以 {/[ 开头（整个 ZIP 响应也在这里）不可能是 JSON 错误体
+        return
+    fmt = str(parse_cfg.get("format") or "").lower()
+    # 按配置的编码试，再按 utf-8-sig 试（源是 GBK 时 JSON 错误体同样要抓得住）
+    encodings = []
+    for name in (str(parse_cfg.get("encoding") or "utf-8-sig"), "utf-8-sig"):
+        if name.lower() not in [seen.lower() for seen in encodings]:
+            encodings.append(name)
+    payload = None
+    parsed = False
+    for name in encodings:
+        try:
+            text = data.decode(name, "replace")
+        except LookupError:
+            return  # 编码名写错：交给 decode() 报"parse.encoding 不是有效的编码名"
+        try:
+            payload = loads_json(text)
+        except ValueError:
+            continue
+        parsed = True
+        break
+    if not parsed:
+        # 解不出来又以 }/] 收尾：大概率是含 NaN/被截断的 JSON 错误体。
+        # （CSV 表头以 { [ 开头虽罕见但合法，所以只在这个更窄的形态上报错）
+        # jsonl 不走这一支：多行 JSONL 本来就不是一个 JSON 值，整包解不出来是正常的，
+        # 真有坏行由 _parse_text 带着行号报出来，比这里的"疑似被截断"准得多
+        if fmt != "jsonl" and probe[-1:] in (b"}", b"]"):
+            raise RuntimeError(
+                f"{label} {where}期望文件流，但响应像一个无法解析的 JSON（含 NaN/Infinity 或被截断）："
+                f"{data[:200].decode('utf-8', 'replace')!r}"
+            )
+        return
+    if not isinstance(payload, (dict, list)):
+        return
+    hint = ""
+    if fmt == "jsonl":
+        if as_bool(parse_cfg.get("allow_single_record"), default=False, field="parse.allow_single_record"):
+            return
+        hint = (
+            "；如果这确实是你要的那一条记录（整个响应就是一个 JSON 对象，和错误体无法区分），"
+            "请设 parse.allow_single_record=true 显式放行"
+        )
+    raise RuntimeError(
+        f"{label} {where}期望文件流，但接口返回了 JSON（多半是错误信息）：{_json_snippet(payload)}{hint}"
+    )
+
+
 def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
     """文件类响应 → 记录列表：整包 CSV/TSV/JSONL，或 ZIP（可筛条目、逐条解析）。
 
@@ -331,34 +398,12 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
     表头/格式不对会直接报错（宁失败勿写错），空行自动跳过。
     """
     encoding = str(parse_cfg.get("encoding") or "utf-8-sig")
-    unzip = as_bool(parse_cfg.get("unzip"), default=False)
-    strict_encoding = as_bool(parse_cfg.get("strict_encoding"), default=False)
-    allow_multi_entry = as_bool(parse_cfg.get("allow_multi_entry"), default=False)
+    unzip = as_bool(parse_cfg.get("unzip"), default=False, field="parse.unzip")
+    strict_encoding = as_bool(parse_cfg.get("strict_encoding"), default=False, field="parse.strict_encoding")
+    allow_multi_entry = as_bool(parse_cfg.get("allow_multi_entry"), default=False, field="parse.allow_multi_entry")
     entry_contains = str(parse_cfg.get("entry_contains") or "")
-
-    # 防呆：接口出错时经常返回 JSON（HTTP 200），而不是文件流；这里直接给出可读报错。
-    # lstrip b"\xef\xbb\xbf"：带 BOM 的 JSON 错误体前缀不是 "{"，漏掉会给出"期望 ZIP"的误导报错。
-    # parse.format=jsonl 时跳过：JSONL 文件本身就是一行一个 JSON 对象，"只有 1 条记录的文件"
-    # 与 JSON 错误体在内容上无法区分，拦下来会让低流量源（每天 1 条）永远跑不通
-    probe = data.lstrip(b" \t\r\n\xef\xbb\xbf")
-    if (probe[:1] in (b"{", b"[")
-            and str(parse_cfg.get("format") or "").lower() != "jsonl"):
-        payload = None
-        try:
-            payload = loads_json(data.decode("utf-8-sig", "replace"))
-        except ValueError:
-            # 解不出来又以 }/] 收尾：大概率是含 NaN/被截断的 JSON 错误体。
-            # （CSV 表头以 { [ 开头虽罕见但合法，所以只在这个更窄的形态上报错）
-            if probe[-1:] in (b"}", b"]"):
-                raise RuntimeError(
-                    f"{label} 期望文件流，但响应像一个无法解析的 JSON（含 NaN/Infinity 或被截断）："
-                    f"{data[:200].decode('utf-8', 'replace')!r}"
-                )
-        if isinstance(payload, (dict, list)):
-            raise RuntimeError(
-                f"{label} 期望文件流，但接口返回了 JSON（多半是错误信息）："
-                f"{_json_snippet(payload)}"
-            )
+    # 接口回 JSON 错误体时不要把它当数据（整包与 ZIP 条目各查一遍）
+    _reject_json_error_body(data, parse_cfg, label)
 
     def decode(raw: bytes, where: str) -> str:
         """按配置编码解码；strict_encoding=true 时拒绝"解出乱码还照写"。
@@ -377,17 +422,17 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
             # 编码名写错（如 "utf8sig"、"utf-8-sig " 带空格）：decode 抛的是 LookupError，
             # 既不是可重试的网络抖动、也不是 ConfigError，会被整窗重试白等十几分钟
             raise ConfigError(
-                f"parse.encoding 不是有效的编码名：{encoding!r}；"
-                f"常见取值：utf-8 / utf-8-sig / gbk / gb18030 / utf-16"
+                f"parse.encoding 不是有效的编码名：{encoding!r}；常见取值：utf-8 / utf-8-sig / gbk / gb18030 / utf-16"
             )
         except UnicodeDecodeError as exc:
             raise RuntimeError(
-                f"{label} {where}按 {encoding} 解码失败（{exc}）；"
-                f"接口可能换了文件编码，请改 parse.encoding（如 gbk）"
+                f"{label} {where}按 {encoding} 解码失败（{exc}）；接口可能换了文件编码，请改 parse.encoding（如 gbk）"
             )
         if "�" in text:
-            log(f"  警告：{label} {where}按 {encoding} 解码出现替换字符（乱码），"
-                f"建议核对 parse.encoding；需要「解码失败即报错」时设 parse.strict_encoding=true")
+            log(
+                f"  警告：{label} {where}按 {encoding} 解码出现替换字符（乱码），"
+                f"建议核对 parse.encoding；需要「解码失败即报错」时设 parse.strict_encoding=true"
+            )
         return text
 
     if not unzip:
@@ -403,8 +448,9 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
         if entry_contains:
             names = [n for n in names if entry_contains in n]
         if not names:
-            raise RuntimeError(f"{label} ZIP 里没有匹配 entry_contains={entry_contains!r} 的文件："
-                               f"{archive.namelist()[:10]}")
+            raise RuntimeError(
+                f"{label} ZIP 里没有匹配 entry_contains={entry_contains!r} 的文件：{archive.namelist()[:10]}"
+            )
         # 不筛条目时，多文件（明细+汇总、多语言副本等）会被无脑串成一份记录：
         # 表头还可能各不相同。要么用 entry_contains 指定，要么明确接受全部。
         if len(names) > 1 and not entry_contains and not allow_multi_entry:
@@ -416,21 +462,34 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
         if len(names) > 1:
             # 指定了 entry_contains 却命中多个条目：常见用法（按地区/批次分包、表头一致）
             # 需要合并，所以不拦；但表头不一致时会拼出字段不齐的记录，得让用户看见
-            log(f"  提示：{label} ZIP 里匹配 entry_contains={entry_contains!r} 的条目有 "
-                f"{len(names)} 个，将按文件名顺序合并：{sorted(names)[:5]}")
+            log(
+                f"  提示：{label} ZIP 里匹配 entry_contains={entry_contains!r} 的条目有 "
+                f"{len(names)} 个，将按文件名顺序合并：{sorted(names)[:5]}"
+            )
         records: list[dict] = []
         for name in sorted(names):
             try:
                 raw = archive.read(name)
-            except zipfile.BadZipFile as exc:      # 条目损坏（截断包等）
+            except zipfile.BadZipFile as exc:  # 条目损坏（截断包等）：可能重拉就好，仍按可重试
                 raise RuntimeError(f"{label} ZIP 条目 {name!r} 读取失败：{exc}")
-            records.extend(_parse_text(decode(raw, f"条目 {name!r} "), parse_cfg,
-                                       entry=name, label=label))
+            except (RuntimeError, NotImplementedError) as exc:
+                # 条目加密时 zipfile 抛的正是 RuntimeError("File ... is encrypted, password
+                # required")，压缩方式不认识（deflate64/PPMd 等）抛 NotImplementedError。
+                # 这两种跟"包在传输中坏了"不同，是源侧导出方式的问题：重试多少次都是同一份包、
+                # 同一个结果，原来会被当成可重试错误白等十几分钟退避。改成 ConfigError
+                # （不可重试）快速失败，并把"要不要在源侧改导出口径"说清楚。
+                raise ConfigError(
+                    f"{label} ZIP 条目 {name!r} 读取失败：{exc}；"
+                    f"加密包、压缩方式不支持的包请在源侧换一种导出方式（如不带密码的 ZIP）"
+                ) from exc
+            # 条目单独再过一道：整包是 ZIP（PK 开头）时上面的检查看不到条目内容，
+            # 导出失败的 ZIP 里常有一个 {"code":500,...} 的错误体条目，不能当数据写进去
+            _reject_json_error_body(raw, parse_cfg, label, where=f"条目 {name!r} ")
+            records.extend(_parse_text(decode(raw, f"条目 {name!r} "), parse_cfg, entry=name, label=label))
         return records
 
 
-def parse_payload(payload, request_cfg: dict, parse_cfg: dict, label: str,
-                  missing_ok: bool = False) -> list:
+def parse_payload(payload, request_cfg: dict, parse_cfg: dict, label: str, missing_ok: bool = False) -> list:
     """按 response_type 分派：json → records_path；bytes → 文件解析。"""
     response_type = str(request_cfg.get("response_type") or "json").lower()
     if response_type == "bytes":

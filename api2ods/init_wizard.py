@@ -55,14 +55,19 @@ def _ask_choice(ask, prompt: str, choices: tuple, default: str = "0", echo=print
     return _ask(ask, "请选择编号", default)
 
 
-def _ask_int(ask, prompt: str, default: int, echo=print) -> int:
-    """问一个整数；回车用默认值，填了非数字就提示后重问（不抛裸 traceback）。"""
+def _ask_int(ask, prompt: str, default: int, echo=print, minimum: int | None = None) -> int:
+    """问一个整数；回车用默认值，填了非数字/越界值就提示后重问（不抛裸 traceback）。"""
     for _ in range(3):
         answer = str(_ask(ask, prompt, str(default))).strip()
         try:
-            return int(answer)
+            value = int(answer)
         except ValueError:
             echo(f"   {answer!r} 不是整数，请填数字（如 {default}）")
+            continue
+        if minimum is not None and value < minimum:
+            echo(f"   {value} 必须不小于 {minimum}，请重新填写（如 {default}）")
+            continue
+        return value
     echo(f"   连续三次没填对，先按默认值 {default} 写进配置（之后可以在文件里改）。")
     return default
 
@@ -124,8 +129,10 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         if auth_choice not in AUTH_IDS:
             # 原来自动落到最后的 else（自定义 signers.py）分支，生成一份跑起来必报
             # "找不到自定义签名文件"的配置；跟分页/窗口的非法编号一样回退到默认值
-            echo(f"   编号 {auth_choice} 不是有效选项（可用 {AUTH_IDS}），按「Bearer Token」继续"
-                 f"（生成的配置里可以手工改）。")
+            echo(
+                f"   编号 {auth_choice} 不是有效选项（可用 {AUTH_IDS}），按「Bearer Token」继续"
+                f"（生成的配置里可以手工改）。"
+            )
             auth_choice = "1"
         auth: dict = {}
         if auth_choice == "0":
@@ -152,8 +159,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         elif auth_choice == "6":
             secret = _ask(ask, "   商户密钥（Secret key）")
             sign_field = _ask(ask, "   签名字段名", "sign")
-            auth = {"type": "sha256_concat", "secret_key": secret,
-                    "sign_field": sign_field, "sign_in": "body"}
+            auth = {"type": "sha256_concat", "secret_key": secret, "sign_field": sign_field, "sign_in": "body"}
         else:
             module = _ask(ask, "   signers.py 的函数名（文件放作业同目录）", "my_sign")
             auth = {"type": "custom", "module": "signers.py", "func": module}
@@ -164,10 +170,9 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
 
         # ---------------------------------------------------------- ④ 分页
         page_choice = _ask_choice(
-            ask, "⑥ 接口怎么翻页？",
-            ("0 = 不翻页（一次返回全部）",
-             "1 = 页码分页（第几页/每页多少条）",
-             "2 = 游标分页（返回里带下一页游标）"),
+            ask,
+            "⑥ 接口怎么翻页？",
+            ("0 = 不翻页（一次返回全部）", "1 = 页码分页（第几页/每页多少条）", "2 = 游标分页（返回里带下一页游标）"),
             "0",
             echo,
         )
@@ -193,8 +198,10 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
                 cursor_path = _ask(ask, "   下一页游标在返回里的路径（如 data.nextCursor）")
                 if cursor_path:
                     break
-                echo("   游标路径不能为空——留空的话分页会失效、只会拉第一页，"
-                     "不知道路径可以先跑一次 --check 看返回的字段名。")
+                echo(
+                    "   游标路径不能为空——留空的话分页会失效、只会拉第一页，"
+                    "不知道路径可以先跑一次 --check 看返回的字段名。"
+                )
             if not cursor_path:
                 echo("❌ 游标路径连续三次为空，已取消（没有游标路径就无法翻页）。")
                 return 1
@@ -203,19 +210,21 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
 
         # ---------------------------------------------------------- ⑤ 取数窗口
         window_choice = _ask_choice(
-            ask, "⑦ 要不要按时间窗口取数？",
-            ("0 = 不传时间（每次全量或接口自带默认范围）",
-             "1 = 按天窗口（推荐：每次回拉最近 N 天，时间参数由脚本生成）",
-             "2 = 整区间窗口（一次请求覆盖 N 天）"),
+            ask,
+            "⑦ 要不要按时间窗口取数？",
+            (
+                "0 = 不传时间（每次全量或接口自带默认范围）",
+                "1 = 按天窗口（推荐：每次回拉最近 N 天，时间参数由脚本生成）",
+                "2 = 整区间窗口（一次请求覆盖 N 天）",
+            ),
             "1",
             echo,
         )
         window: dict = {}
         if window_choice not in ("0", "1", "2"):
-            echo(f"   编号 {window_choice} 不是有效选项，按「不传时间」继续"
-                 f"（生成的配置里可以手工补 window 块）。")
+            echo(f"   编号 {window_choice} 不是有效选项，按「不传时间」继续（生成的配置里可以手工补 window 块）。")
         if window_choice == "1":
-            days = _ask_int(ask, "   每次回拉最近几天", 15, echo)
+            days = _ask_int(ask, "   每次回拉最近几天", 15, echo, minimum=1)
             start_param = _ask(ask, "   开始时间参数名", DEFAULT_START_PARAM)
             end_param = _ask(ask, "   结束时间参数名（不需要就填 -）", DEFAULT_END_PARAM)
             window = {
@@ -227,7 +236,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             }
             echo("   （时区默认 Asia/Shanghai、+08:00；要改就编辑文件里的 date_tz/api_tz）")
         elif window_choice == "2":
-            days = _ask_int(ask, "   每次覆盖最近几天", 7, echo)
+            days = _ask_int(ask, "   每次覆盖最近几天", 7, echo, minimum=1)
             window = {
                 "mode": "range",
                 "days": days,
@@ -238,9 +247,9 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
 
         # ---------------------------------------------------------- ⑥ 响应类型
         response_choice = _ask_choice(
-            ask, "⑧ 接口返回什么？",
-            ("0 = JSON（绝大多数接口）",
-             "1 = 文件流（ZIP/CSV/JSONL，如导出接口）"),
+            ask,
+            "⑧ 接口返回什么？",
+            ("0 = JSON（绝大多数接口）", "1 = 文件流（ZIP/CSV/JSONL，如导出接口）"),
             "0",
             echo,
         )
@@ -279,8 +288,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         # ---------------------------------------------------------- ⑧ 组装并写出
         job = {
             "job": job_name,
-            "maxcompute": {"project": project, "endpoint": endpoint,
-                           "access_key_id": ak, "access_key_secret": sk},
+            "maxcompute": {"project": project, "endpoint": endpoint, "access_key_id": ak, "access_key_secret": sk},
             "request": {
                 "base_url": base_url,
                 "path": path,
@@ -290,7 +298,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             },
             "target": {"project": project, "table": table, "pt": "${bizdate}", "column": "json"},
         }
-        if pagination.get("type") != "none":     # page/cursor 分支不带 type，交给 normalize 推断
+        if pagination.get("type") != "none":  # page/cursor 分支不带 type，交给 normalize 推断
             job["pagination"] = pagination
         if window:
             job["window"] = window
@@ -304,12 +312,13 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         if target_path.is_dir():
             # --init-out 指到目录（如 --init-out jobs）：Windows 上抛的是 PermissionError
             # 而不是 IsADirectoryError，露给用户是裸 traceback；给一句人话 + 建议文件名
-            raise SystemExit(f"--init-out 指向的是目录，需要给文件名：{target_path}"
-                             f"（例如 {target_path / (job_name + '.json')}）")
+            raise SystemExit(
+                f"--init-out 指向的是目录，需要给文件名：{target_path}（例如 {target_path / (job_name + '.json')}）"
+            )
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if os.name != "nt":
-            os.chmod(target_path, 0o600)   # 含密钥，收紧权限（Windows 忽略）
+            os.chmod(target_path, 0o600)  # 含密钥，收紧权限（Windows 忽略）
 
         echo("")
         echo(f"✅ 已生成：{target_path}")
@@ -325,7 +334,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo("")
         echo("已取消，未生成任何文件。")
         return 1
-    except RuntimeError as exc:                     # "lost sys.stdin"（没有标准输入）
+    except RuntimeError as exc:  # "lost sys.stdin"（没有标准输入）
         if "stdin" not in str(exc):
             raise
         echo("")

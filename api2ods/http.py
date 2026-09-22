@@ -52,7 +52,7 @@ def _retry_after_seconds(response) -> float | None:
         parsed = parsedate_to_datetime(str(value))
     except (TypeError, ValueError):
         return None
-    if parsed.tzinfo is None:      # 个别服务端给不带时区的日期，按 GMT 解释
+    if parsed.tzinfo is None:  # 个别服务端给不带时区的日期，按 GMT 解释
         parsed = parsed.replace(tzinfo=timezone.utc)
     try:
         delay = (parsed - datetime.now(timezone.utc)).total_seconds()
@@ -74,6 +74,31 @@ def _is_latin1_alias(encoding) -> bool:
         return False
 
 
+def _json_key_set(text: str) -> set[str] | None:
+    """解析 JSON 并收集所有对象键；解析失败返回 None。
+
+    只用于"显式编码与 UTF-8 都能解开、但内容不同"时的冲突判断：如果两边的键名
+    完全不同，说明按显式编码很可能把 UTF-8 的键名解成了乱码；如果键名一致、只有
+    值不同，则可能是 GBK 字节恰好也能被 UTF-8 解成合法字符，不能据此武断报错。
+    """
+    try:
+        payload = loads_json(text)
+    except ValueError:
+        return None
+    keys: set[str] = set()
+    stack = [payload]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if isinstance(key, str):
+                    keys.add(key)
+                stack.append(item)
+        elif isinstance(value, list):
+            stack.extend(value)
+    return keys
+
+
 def _decode_json_body(response, json_encoding: str | None) -> str:
     """JSON 响应体 → 文本：显式配置 > UTF-8(sig) > 响应头声明的 charset，全都解不出就报错。
 
@@ -90,7 +115,7 @@ def _decode_json_body(response, json_encoding: str | None) -> str:
         if _is_latin1_alias(json_encoding):
             raise ConfigError(
                 f"request.json_encoding 不能是 {json_encoding!r}：它能把任何字节序列解成乱码"
-                f"而不报错；源是 GBK 之类请写具体编码（如 \"gbk\"），是 UTF-8 就删掉这一项"
+                f'而不报错；源是 GBK 之类请写具体编码（如 "gbk"），是 UTF-8 就删掉这一项'
             )
         candidates.append(str(json_encoding))
     # utf-8-sig：有些源会在 JSON 最前面带 BOM，按 utf-8 解出来是 "﻿{"，
@@ -116,24 +141,58 @@ def _decode_json_body(response, json_encoding: str | None) -> str:
     if resolved is None:
         raise ConfigError(
             f"接口 JSON 响应按 {'/'.join(candidates)} 都解不出来（{last_exc}）；"
-            f"源是 GBK 等非 UTF-8 编码时，请给 request 加 json_encoding（如 \"gbk\"）"
+            f'源是 GBK 等非 UTF-8 编码时，请给 request 加 json_encoding（如 "gbk"）'
         )
     if json_encoding:
-        # 显式配置与 utf-8-sig 结果不一致、且 utf-8-sig 也解得出来：多半是配错了编码，
-        # 解出来的乱码会照常写进 ODS（键名对不上，下游取不到值）。打个警告留痕
+        # 显式配置与 utf-8-sig 都能解出来、但内容不一致：多半是把 UTF-8 接口错配成了
+        # gbk 之类——解出来的是乱码键名，JSON 照样解析成功、写库也照样校验通过，下游
+        # get_json_object 全取空。原来只打一条警告就照写，属于"静默写坏数据"，这里改成
+        # 直接报配置错（ConfigError 不可重试，快速暴露）。
+        #
+        # 但 UTF-16/UTF-32 这类定宽编码会产出含 \x00 的字节串，它同样能被 utf-8-sig
+        # "解出来"（内容是一堆 \x00 夹杂）——那不是"源是 UTF-8"的证据，要排除掉，
+        # 否则合法的 UTF-16 源会被这条冲突检查误杀。
         try:
             fallback = raw.decode("utf-8-sig")
         except UnicodeDecodeError:
             fallback = None
+        if fallback is not None and "\x00" in fallback:
+            fallback = None
         if fallback is not None and fallback != resolved:
-            log_once(f"  警告：request.json_encoding={json_encoding!r} 解出的内容与 "
-                     f"utf-8-sig 不一致，接口可能就是 UTF-8；解出的键名对不上下游会全取空")
+            configured_keys = _json_key_set(resolved)
+            utf8_keys = _json_key_set(fallback)
+            if configured_keys is not None and utf8_keys is not None and configured_keys != utf8_keys:
+                # 键名完全不同是很强的信号：UTF-8 的键名被按 GBK 解成了另一组汉字，
+                # 下游 get_json_object('$.原键名') 会全取空。
+                raise ConfigError(
+                    f"request.json_encoding={json_encoding!r} 解出的 JSON 键名与 utf-8-sig "
+                    f"不一致（{sorted(configured_keys)[:5]} vs {sorted(utf8_keys)[:5]}），"
+                    f"无法确定接口真实编码；按 json_encoding 写库可能是乱码键名。若接口是 UTF-8，"
+                    f"请删掉 request.json_encoding；若接口确实是 {json_encoding!r}，请核对源编码"
+                )
+            # 键名一致、只有值不同：GBK 双字节序列恰好也是合法 UTF-8 的情况真实存在
+            # （例如 '一'.encode('gbk') 能被 utf-8-sig 解成 'һ'）。显式 json_encoding
+            # 是用户最强的信号，不能因为这种歧义直接拒绝合法 GBK 数据；打一条告警留痕。
+            log_once(
+                f"  警告：request.json_encoding={json_encoding!r} 解出的内容与 utf-8-sig "
+                f"不一致，但两者都是合法 JSON；已优先按显式 json_encoding 处理。若接口其实是 "
+                f"UTF-8，请删掉 request.json_encoding，否则下游可能取不到字段"
+            )
     return resolved
 
 
-def request_once(method: str, url: str, params: dict, headers: dict, body_type: str,
-                 timeout: float, expect_json: bool, verify: bool, proxies: dict | None,
-                 json_encoding: str | None = None):
+def request_once(
+    method: str,
+    url: str,
+    params: dict,
+    headers: dict,
+    body_type: str,
+    timeout: float,
+    expect_json: bool,
+    verify: bool,
+    proxies: dict | None,
+    json_encoding: str | None = None,
+):
     """发一次 HTTP 请求（不含重试；单元测试会替换本函数）。
 
     - 429 / 5xx：抛 RetryLater（带 Retry-After 秒数），由上层退避重试；
@@ -156,9 +215,14 @@ def request_once(method: str, url: str, params: dict, headers: dict, body_type: 
 
     try:
         response = requests.request(method, url, **kwargs)
-    except (requests.exceptions.MissingSchema, requests.exceptions.InvalidSchema,
-            requests.exceptions.InvalidURL, requests.exceptions.InvalidHeader,
-            requests.exceptions.URLRequired, UnicodeError) as exc:
+    except (
+        requests.exceptions.MissingSchema,
+        requests.exceptions.InvalidSchema,
+        requests.exceptions.InvalidURL,
+        requests.exceptions.InvalidHeader,
+        requests.exceptions.URLRequired,
+        UnicodeError,
+    ) as exc:
         # 这几类异常在"一个字节都没发出去"时就抛了（地址没写 https://、头值带换行/中文），
         # 是确定性的配置错。当成网络抖动去退避，一次能白等 20 多分钟（实测 17 轮 1425 秒）。
         # 不转发原始消息：InvalidHeader 的消息里带着请求头原值，密钥会原样进日志
@@ -214,8 +278,9 @@ def check_fail_if(payload, fail_if: list | None) -> None:
         return
     for cond in fail_if or []:
         value = _normalize_compare(get_path(payload, cond.get("path", ""), default=None))
-        bad = ("equals" in cond and value == _normalize_compare(cond["equals"])) or \
-              ("not_equals" in cond and value != _normalize_compare(cond["not_equals"]))
+        bad = ("equals" in cond and value == _normalize_compare(cond["equals"])) or (
+            "not_equals" in cond and value != _normalize_compare(cond["not_equals"])
+        )
         if not bad:
             continue
         message = f"接口返回业务错误：{cond['path']}={value!r}"
@@ -229,11 +294,23 @@ def check_fail_if(payload, fail_if: list | None) -> None:
         raise FatalApiError(message)
 
 
-def request_with_retry(method: str, url: str, build_request, body_type: str,
-                       timeout: float, *, expect_json: bool = True, fail_if: list | None = None,
-                       retry_times: int = 5, retry_delay: float = 15,
-                       verify: bool = True, proxies: dict | None = None, desc: str = "请求",
-                       json_encoding: str | None = None, redactor=None):
+def request_with_retry(
+    method: str,
+    url: str,
+    build_request,
+    body_type: str,
+    timeout: float,
+    *,
+    expect_json: bool = True,
+    fail_if: list | None = None,
+    retry_times: int = 5,
+    retry_delay: float = 15,
+    verify: bool = True,
+    proxies: dict | None = None,
+    desc: str = "请求",
+    json_encoding: str | None = None,
+    redactor=None,
+):
     """带长冷却重试的请求；业务错误按 fail_if 判定。
 
     build_request：无参函数，每次尝试前调用一次，返回 (params, headers)。
@@ -260,9 +337,10 @@ def request_with_retry(method: str, url: str, build_request, body_type: str,
     for attempt in range(1, attempts + 1):
         try:
             params, headers = build_request()
-            payload = request_once(method, url, params, headers, body_type, timeout,
-                                   expect_json, verify, proxies, json_encoding)
-            check_fail_if(payload, fail_if)      # 200 也可能是业务错误（如 code != 0）
+            payload = request_once(
+                method, url, params, headers, body_type, timeout, expect_json, verify, proxies, json_encoding
+            )
+            check_fail_if(payload, fail_if)  # 200 也可能是业务错误（如 code != 0）
             return payload
         except (FatalApiError, ConfigError):
             # 鉴权/配置类错误：重试不会变好，快速失败让调度看到真实原因。
