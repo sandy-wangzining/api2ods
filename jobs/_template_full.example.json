@@ -137,7 +137,7 @@
     "entry_field": "__file",
     "//strict_encoding": "true 时解码失败直接报错；默认 false（解出乱码打警告，仍按替换字符解析，建议打开）",
     "//allow_multi_entry": "ZIP 里有多个文件且没写 entry_contains 时是否允许全部解析；默认 false（报错提醒）",
-    "//entry_field": "给每条记录加一列来源文件名（DWD 可区分）"
+    "//entry_field": "给每条记录加一列来源文件名（DWD 可区分）；只在 unzip=true 时生效，与 entry_field 同时要开着 unzip"
   },
 
   "target": {
@@ -146,7 +146,7 @@
     "table": "ods_demo_json_di",
     "//table": "表不存在会自动按 json string + pt string 建表；已存在会校验结构",
     "pt": "${bizdate}",
-    "//pt": "分区值模板，默认 ${bizdate}（YYYYMMDD）；命令行 --pt 可覆盖",
+    "//pt": "分区值模板，必须是 8 位业务日 yyyyMMdd（调度与 DWD 按它读取）；命令行 --pt 可显式覆盖成特殊分区（测试/对比用，注意不会被调度与 DWD 自动读到）",
     "column": "json",
     "//column": "json 列名，默认 json",
     "comment": "示例表：接口原始 JSON 原样落库",

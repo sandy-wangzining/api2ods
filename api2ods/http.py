@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import codecs
 import math
 import time
 from datetime import datetime, timezone
@@ -10,7 +11,7 @@ from email.utils import parsedate_to_datetime
 
 from .parsers import get_path
 from .spool import loads_json
-from .utils import ConfigError, FatalApiError, log, redact
+from .utils import ConfigError, FatalApiError, log, log_once, redact
 
 try:
     import requests
@@ -60,6 +61,19 @@ def _retry_after_seconds(response) -> float | None:
     return min(max(delay, 0.0), MAX_RETRY_AFTER)
 
 
+def _is_latin1_alias(encoding) -> bool:
+    """编码名是不是 latin-1（含 latin_1 / iso8859-1 / iso_8859_1 / cp819 / 8859 / L1 等别名）。
+
+    只比较字面量会漏掉别名：上面这些名字 codecs.lookup 全都归一到 iso8859-1，
+    解码行为一样——"任何字节序列都能解成看起来成功的乱码"，正是要挡掉的东西。
+    认不出的编码名返回 False（交给解码循环去报，不在这里提升为配置错）。
+    """
+    try:
+        return codecs.lookup(str(encoding or "").strip()).name == "iso8859-1"
+    except (LookupError, TypeError, ValueError):
+        return False
+
+
 def _decode_json_body(response, json_encoding: str | None) -> str:
     """JSON 响应体 → 文本：显式配置 > UTF-8(sig) > 响应头声明的 charset，全都解不出就报错。
 
@@ -70,6 +84,14 @@ def _decode_json_body(response, json_encoding: str | None) -> str:
     raw = response.content
     candidates: list[str] = []
     if json_encoding:
+        # latin-1 能把任何字节序列解成"看起来成功"的乱码，和响应头声明一样要挡掉：
+        # 显式配置成它时，UTF-8 的接口会被解出乱码键名，JSON 解析照样成功、写库也照样
+        # 校验通过，下游 get_json_object 全取空——属于静默写坏数据
+        if _is_latin1_alias(json_encoding):
+            raise ConfigError(
+                f"request.json_encoding 不能是 {json_encoding!r}：它能把任何字节序列解成乱码"
+                f"而不报错；源是 GBK 之类请写具体编码（如 \"gbk\"），是 UTF-8 就删掉这一项"
+            )
         candidates.append(str(json_encoding))
     # utf-8-sig：有些源会在 JSON 最前面带 BOM，按 utf-8 解出来是 "﻿{"，
     # loads_json 会一直解析失败并重试到耗尽
@@ -77,22 +99,36 @@ def _decode_json_body(response, json_encoding: str | None) -> str:
     declared = str(getattr(response, "encoding", "") or "").strip()
     # requests 对 text/* 默认给 ISO-8859-1（HTTP 规范默认值，不是服务端声明）：
     # 它能把任何字节序列解成"看起来成功"的乱码，绝不能进候选
-    if declared and declared.lower() not in ("iso-8859-1", "latin-1"):
+    if declared and not _is_latin1_alias(declared):
         candidates.append(declared)
     seen: set[str] = set()
     last_exc: Exception | None = None
+    resolved: str | None = None
     for encoding in candidates:
         if encoding.lower() in seen:
             continue
         seen.add(encoding.lower())
         try:
-            return raw.decode(encoding).lstrip("﻿")
+            resolved = raw.decode(encoding).lstrip("﻿")
+            break
         except (LookupError, UnicodeDecodeError) as exc:
             last_exc = exc
-    raise ConfigError(
-        f"接口 JSON 响应按 {'/'.join(candidates)} 都解不出来（{last_exc}）；"
-        f"源是 GBK 等非 UTF-8 编码时，请给 request 加 json_encoding（如 \"gbk\"）"
-    )
+    if resolved is None:
+        raise ConfigError(
+            f"接口 JSON 响应按 {'/'.join(candidates)} 都解不出来（{last_exc}）；"
+            f"源是 GBK 等非 UTF-8 编码时，请给 request 加 json_encoding（如 \"gbk\"）"
+        )
+    if json_encoding:
+        # 显式配置与 utf-8-sig 结果不一致、且 utf-8-sig 也解得出来：多半是配错了编码，
+        # 解出来的乱码会照常写进 ODS（键名对不上，下游取不到值）。打个警告留痕
+        try:
+            fallback = raw.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            fallback = None
+        if fallback is not None and fallback != resolved:
+            log_once(f"  警告：request.json_encoding={json_encoding!r} 解出的内容与 "
+                     f"utf-8-sig 不一致，接口可能就是 UTF-8；解出的键名对不上下游会全取空")
+    return resolved
 
 
 def request_once(method: str, url: str, params: dict, headers: dict, body_type: str,
@@ -118,7 +154,18 @@ def request_once(method: str, url: str, params: dict, headers: dict, body_type: 
     else:
         kwargs["json"] = params
 
-    response = requests.request(method, url, **kwargs)
+    try:
+        response = requests.request(method, url, **kwargs)
+    except (requests.exceptions.MissingSchema, requests.exceptions.InvalidSchema,
+            requests.exceptions.InvalidURL, requests.exceptions.InvalidHeader,
+            requests.exceptions.URLRequired, UnicodeError) as exc:
+        # 这几类异常在"一个字节都没发出去"时就抛了（地址没写 https://、头值带换行/中文），
+        # 是确定性的配置错。当成网络抖动去退避，一次能白等 20 多分钟（实测 17 轮 1425 秒）。
+        # 不转发原始消息：InvalidHeader 的消息里带着请求头原值，密钥会原样进日志
+        raise ConfigError(
+            f"请求无法发出（{type(exc).__name__}）：请检查 request.base_url 是否带 http(s)://、"
+            f"request.headers / 鉴权配置的值有没有首尾空白、换行或非 latin-1 字符"
+        )
     status = response.status_code
     if status == 429 or 500 <= status < 600:
         raise RetryLater(_retry_after_seconds(response), f"HTTP {status}")
@@ -186,12 +233,16 @@ def request_with_retry(method: str, url: str, build_request, body_type: str,
                        timeout: float, *, expect_json: bool = True, fail_if: list | None = None,
                        retry_times: int = 5, retry_delay: float = 15,
                        verify: bool = True, proxies: dict | None = None, desc: str = "请求",
-                       json_encoding: str | None = None):
+                       json_encoding: str | None = None, redactor=None):
     """带长冷却重试的请求；业务错误按 fail_if 判定。
 
     build_request：无参函数，每次尝试前调用一次，返回 (params, headers)。
     做成回调是为了让每次重试都重新鉴权——一次性签名（阿里云 RPC 的 SignatureNonce）
     复用同一个 nonce 会被服务端判 400。
+
+    redactor：可选的掩码函数。重试日志在这里就打完了，上游（Fetcher / CLI）的
+    值级脱敏还没机会出手；调用方传自己的 redactor 才能盖住接口把凭证写进自由文本
+    的报错（如 500 的 `bad token sk-xxx`）。不传时退化为形态级 redact。
 
     重试策略（和"失败快、成功稳"的调度需求对齐）：
     - FatalApiError（4xx 参数/权限类）：直接抛出，不浪费时间重试；
@@ -203,6 +254,7 @@ def request_with_retry(method: str, url: str, build_request, body_type: str,
     # retry_times 是"失败后最多再试几次"，不是"总共几次"：0 就是只发一次请求、不做退避。
     # 原来的 range(1, max(1, 0)+1) 会把 0 当成 1，发完还白睡一轮再报"重试 0 次仍失败"
     attempts = max(1, int(retry_times) + 1) if retry_times else 1
+    mask = redactor or redact
     delay = retry_delay
     last_err = None
     for attempt in range(1, attempts + 1):
@@ -223,14 +275,14 @@ def request_with_retry(method: str, url: str, build_request, body_type: str,
                 break
             wait = exc.seconds if exc.seconds else delay
             # 业务错误（fail_if）的文案可能带接口返回的原文，一样过脱敏
-            log(f"  [{desc}] {redact(str(exc))}（第 {attempt}/{attempts - 1} 次），{wait:g}s 后重试")
+            log(f"  [{desc}] {mask(str(exc))}（第 {attempt}/{attempts - 1} 次），{wait:g}s 后重试")
             time.sleep(wait)
             delay = min(delay * 2, 300)
         except Exception as exc:  # noqa: BLE001 - 网络/解析类错误统一重试
             last_err = exc
             if attempt >= attempts:
                 break
-            log(f"  [{desc}] 第 {attempt}/{attempts - 1} 次失败：{redact(str(exc))}；{delay:g}s 后重试")
+            log(f"  [{desc}] 第 {attempt}/{attempts - 1} 次失败：{mask(str(exc))}；{delay:g}s 后重试")
             time.sleep(delay)
             delay = min(delay * 2, 300)
-    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{redact(str(last_err))}")
+    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{mask(str(last_err))}")

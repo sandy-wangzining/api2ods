@@ -76,6 +76,59 @@ def get_path(data, path: str, default=None):
     return current
 
 
+def _json_snippet(payload, limit: int = 300) -> str:
+    """把 payload 转成"最多 limit 个字符"的片段，用于报错信息。
+
+    直接 `json.dumps(payload)[:300]` 会先把整份 payload 序列化成一个巨大的临时字符串
+    （百 MB 级响应时可能先 MemoryError 再给出本该有的"找不到 records_path"提示）。
+    这里用增量编码器边编边停。"""
+    if not isinstance(payload, (dict, list)):
+        return str(payload)[:limit]
+    chunks, size = [], 0
+    try:
+        for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(payload):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size >= limit:
+                break
+    except (TypeError, ValueError, RecursionError):
+        return str(payload)[:limit]
+    return "".join(chunks)[:limit]
+
+
+def _marker_outside_quotes(line: str, marker: str, quoted: bool,
+                          delimiter: str = ",") -> tuple[bool, bool]:
+    """marker 是否出现在"引号外"，并返回处理完这一行之后的引号状态。
+
+    逐字符走一遍而不是数引号个数：标记可能落在引号**开始**的那一行里
+    （`"明细里也出现了 序号\\n继续",2`），只按"行首是否在引号内"判断会漏掉它。
+
+    引号只在"确实是 csv 引号段"时才算定界：字段开头的 `"` 才开启引号段，引号段里
+    遇到非双写的 `"` 就收尾（`""` 表示值里的引号，不收尾；收尾后面即使跟着别的
+    字符也与 csv 模块一致，按普通字段内容继续）。字段中间的裸 `"`（报表里很常见，
+    TSV 尤其多）只是普通字符，不能拿它翻转状态——否则标记会被误判成"在引号里"，
+    文件有内容却报"找不到明细段"，还指不清方向。
+    """
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if char == '"':
+            if quoted:
+                if line.startswith('""', index):
+                    # 值里的转义引号：吃掉两个字符，仍留在引号段里
+                    index += 2
+                    continue
+                quoted = False
+            elif index == 0 or line[index - 1] == delimiter:
+                quoted = True
+            index += 1
+            continue
+        if not quoted and line.startswith(marker, index):
+            return True, quoted
+        index += 1
+    return False, quoted
+
+
 def ensure_object_records(records, label: str) -> list[dict]:
     """把记录数组规整成"每个元素都是对象"的列表，不合规直接报错。
 
@@ -83,6 +136,12 @@ def ensure_object_records(records, label: str) -> list[dict]:
     下游 get_json_object 解出来全是 NULL 却显示成功（JSONL 路径对同样输入是报错的）。
     少任何一条路径都会让这种记录悄悄进 ODS。
     """
+    if isinstance(records, dict) and not records:
+        # 路径落在空对象上（Items: {}、data: {}）——接口用它表示"这次没有数据"。
+        # 原样包成一条 {} 会往 ODS 写一条全 NULL 的假记录（下游取不到任何字段、
+        # 行数校验也自洽），分页时它还会让"零数据日"的豁免失效、一路空翻到 max_pages。
+        # 这条归一必须放在这里而不是只放在单页路径：分页路径同样会拿到空对象
+        return []
     if isinstance(records, dict):
         records = [records]
     if not isinstance(records, list):
@@ -109,16 +168,11 @@ def extract_json_records(payload, request_cfg: dict, label: str, missing_ok: boo
         if missing_ok:
             return []
         top_keys = list(payload)[:10] if isinstance(payload, dict) else type(payload).__name__
-        snippet = (json.dumps(payload, ensure_ascii=False) if isinstance(payload, (dict, list))
-                   else str(payload))[:300]
+        snippet = _json_snippet(payload)
         hint = (f"找不到 records_path={records_path!r}（顶层键：{top_keys}）" if records_path
                 else "records_path 为空且返回不是记录数组")
         raise RuntimeError(f"{label} 解析失败：{hint}；返回片段：{snippet}")
-    if isinstance(records, dict) and not records:
-        # 路径落在空对象上（Items: {}、data: {}）——接口用它表示"这次没有数据"。
-        # 原样包成一条 {} 会往 ODS 写一条全 NULL 的假记录；分页时它还会让"零数据日"
-        # 的豁免失效，一路翻到 max_pages 才报错
-        return []
+    # 空对象（Items: {} 这类"这次没有数据"的写法）由 ensure_object_records 统一归一成空列表
     return ensure_object_records(records, label)
 
 
@@ -167,10 +221,22 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
         # keepends=True + 直接叠加：用 splitlines() 再 join 会把「引号里跨行的 CSV 字段」
         # 的换行重建掉，字段内容被悄悄改掉
         lines = _split_lines(text, keepends=True)
+        # 标记行可能先出现在"引号里跨行字段"的内容中（比如汇总段里引了一段明细文本），
+        # 从那里开始解析会把半个字段当表头、真表头行被当数据行，列名全错却照样写库成功。
+        # 所以要判断标记出现的位置是不是在引号内——注意不能只看"这一行是否以引号开头"：
+        # `"明细里也出现了 序号\n继续",2` 这样的字段，标记正好落在引号**开始**的那一行里
+        quoted = False
+        hit = None
         for index, line in enumerate(lines):
-            if skip_until in line:
-                text = "".join(lines[index:])
+            if fmt in ("csv", "tsv"):
+                found, quoted = _marker_outside_quotes(line, skip_until, quoted, delimiter)
+            else:
+                found = skip_until in line
+            if found:
+                hit = index
                 break
+        if hit is not None:
+            text = "".join(lines[hit:])
         else:
             if not any(line.strip() for line in lines):
                 return []
@@ -201,12 +267,13 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "",
             return []
         try:
             for line_no, row in enumerate(reader, start=2):
-                if row is None:
-                    continue
                 if (all(v is None or str(v).strip() == "" for v in row.values())
                         and len(fieldnames) > 1):
-                    # 全空白行：多列文件里是排版垃圾，跳过；单列文件里它就是"值为空"的
-                    # 一条合法记录，丢掉等于静默少数
+                    # 全空白行：多列文件里是排版垃圾，跳过；单列文件里它更像"值为空"的
+                    # 一条记录，保留下来（下游自己判空）。
+                    # 注意：真正一个字符都没有的行 csv 模块在迭代时就吞掉了，
+                    # 到不了这里——所以"单列文件的空行能作为空值记录保留"只对
+                    # "有分隔符/空格"的空白行成立
                     continue
                 # 列数比表头多：多出来的字段会落进 restkey=None，静默丢字段等于写错数据
                 extra = row.pop(None, None)
@@ -290,7 +357,7 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
         if isinstance(payload, (dict, list)):
             raise RuntimeError(
                 f"{label} 期望文件流，但接口返回了 JSON（多半是错误信息）："
-                f"{json.dumps(payload, ensure_ascii=False)[:300]}"
+                f"{_json_snippet(payload)}"
             )
 
     def decode(raw: bytes, where: str) -> str:
@@ -300,17 +367,24 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
         但整份文件编码不对（如 UTF-8 接口换成 GBK/UTF-16）时，replace 会把列名和值
         全变成 U+FFFD 且行数照常 > 0，静默写进 ODS——不确定编码的源建议打开这个开关。
         """
-        if strict_encoding:
-            try:
+        try:
+            if strict_encoding:
                 # 这里也必须去 BOM：非严格分支有 lstrip，漏掉会让同一个开关下
                 # 列名变成 "﻿date"，下游 get_json_object('$.date') 静默取空
                 return raw.decode(encoding).lstrip("﻿")
-            except UnicodeDecodeError as exc:
-                raise RuntimeError(
-                    f"{label} {where}按 {encoding} 解码失败（{exc}）；"
-                    f"接口可能换了文件编码，请改 parse.encoding（如 gbk）"
-                )
-        text = raw.decode(encoding, "replace").lstrip("﻿")
+            text = raw.decode(encoding, "replace").lstrip("﻿")
+        except LookupError:
+            # 编码名写错（如 "utf8sig"、"utf-8-sig " 带空格）：decode 抛的是 LookupError，
+            # 既不是可重试的网络抖动、也不是 ConfigError，会被整窗重试白等十几分钟
+            raise ConfigError(
+                f"parse.encoding 不是有效的编码名：{encoding!r}；"
+                f"常见取值：utf-8 / utf-8-sig / gbk / gb18030 / utf-16"
+            )
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(
+                f"{label} {where}按 {encoding} 解码失败（{exc}）；"
+                f"接口可能换了文件编码，请改 parse.encoding（如 gbk）"
+            )
         if "�" in text:
             log(f"  警告：{label} {where}按 {encoding} 解码出现替换字符（乱码），"
                 f"建议核对 parse.encoding；需要「解码失败即报错」时设 parse.strict_encoding=true")

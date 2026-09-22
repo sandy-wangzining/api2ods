@@ -15,7 +15,7 @@ import tempfile
 import threading
 from pathlib import Path
 
-from .utils import progress_log
+from .utils import progress_log, redact
 
 # JSON 序列化参数：紧凑（不产生多余空格）、中文不转义（和后端存储口径一致）、
 # allow_nan=False：NaN/Infinity 不是合法 JSON，落盘后 MaxCompute 侧取不到值
@@ -42,7 +42,10 @@ def dump_record(record) -> str:
     try:
         return json.dumps(record, **_JSON_KWARGS)
     except ValueError as exc:
-        snippet = str(record)[:200]
+        # 先过 redact 再截断：这条报错的正文会被上层原样打进控制台 / --log-file /
+        # 调度告警，前 200 字符里完全可能带着 token / 手机号这类密钥与 PII
+        # （dump_record 是唯一序列化出口，在这里堵住就断掉了整条泄漏链）
+        snippet = redact(str(record))[:200]
         raise RuntimeError(
             f"记录里有无法序列化的值（{exc}）：{snippet}；"
             f"源接口返回了 NaN/Infinity 之类的非法 JSON，写进 ODS 后下游取不到值，已中止"

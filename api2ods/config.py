@@ -9,8 +9,8 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .dates import DEFAULT_DATE_TZ, date_tz_of, env_bizdate
-from .utils import ConfigError, redact
+from .dates import DEFAULT_DATE_TZ, check_format_string, date_tz_of, env_bizdate
+from .utils import ConfigError, as_bool, redact
 
 ALLOWED_AUTH_TYPES = ("none", "basic", "token", "bearer", "query", "sha256_concat", "aliyun_rpc",
                       "custom")
@@ -41,7 +41,11 @@ _PLACEHOLDER_RE = re.compile(r"\$\{([^}]+)\}")
 # 不挂在模块上：模块级缓存会让告警串到下一次调用（测试里、库被复用时的下一次运行都会串）
 _WARNINGS_KEY = "__warnings__"
 # \A...\Z 而不是 ^...$：$ 会放过结尾的换行（"20260920\n" 静默通过校验）
-_PT_RE = re.compile(r"\A[A-Za-z0-9_\-]+\Z")
+# 默认分区（target.pt / 业务日）只认 8 位业务日：pt 是"一次运行写一个分区"的口径，
+# 写错形态的数据没人读；--pt 显式指定时放宽（测试/对比/补数用的特殊分区），
+# 只要求是合法分区名——那时"有没有人读"由使用者自己负责
+_PT_RE = re.compile(r"\A\d{8}\Z")
+_PT_ANY_RE = re.compile(r"\A[A-Za-z0-9_\-]+\Z")
 
 
 # =============================================================================
@@ -345,6 +349,11 @@ def validate_job(job: dict) -> None:
                 f"window.format 不认识：{fmt!r}；应含 strftime 指令（如 %Y-%m-%d %H:%M:%S），"
                 f"或写 unix / unix_ms（秒/毫秒时间戳）"
             )
+        if fmt and fmt.lower() not in ("unix", "unix_s", "unix_ms", "unix_millis"):
+            # 白名单校验提到配置阶段（原来拖到构造请求时才跑）：%Q / %-d 这类写法
+            # 在 --check 里会伪装成"请求失败"、正式跑时在 Windows 裸崩溃（glibc 则把
+            # %Q 当参数值发出去），而 --log-file 一个字都看不到
+            check_format_string(fmt)
         extra_params = window.get("extra_params")
         if extra_params is not None:
             if not isinstance(extra_params, dict):
@@ -354,15 +363,20 @@ def validate_job(job: dict) -> None:
                 if extra_fmt is None:
                     raise SystemExit(f"window.extra_params[{extra_name!r}] 不能为 null；"
                                      f"值应是 strftime 格式（如 \"%Y-%m\"）或 unix/unix_ms")
+                text = str(extra_fmt).strip()
+                if text.lower() not in ("unix", "unix_s", "unix_ms", "unix_millis"):
+                    check_format_string(text, field=f"window.extra_params[{extra_name!r}]")
 
     pagination = job.get("pagination") or {}
     page_type = str(pagination.get("type") or "none").lower()
     if page_type not in ALLOWED_PAGINATION_TYPES:
         raise SystemExit(f"pagination.type 不支持：{page_type}（可用 none/page/cursor）")
-    if (page_type == "none" and "page_size" in pagination
-            and pagination.get("size_param") is not None):
+    if (page_type == "none"
+            and ("page_size" in pagination or pagination.get("size_param") is not None)):
         # 只配了"页大小"没有页码/终点：请求里会带上 size 但永远只拉一页，
-        # 数据量一大就静默少拿（看着像配了分页）
+        # 数据量一大就静默少拿（看着像配了分页）。
+        # 条件是"或"不是"与"：只写 page_size（最像"我配好分页了"的写法）或只写
+        # size_param 时原来都不告警，静默只发一次请求、条数校验还拿这"一页"自比
         job.setdefault(_WARNINGS_KEY, []).append(
             "pagination 里只配了 size_param/page_size，没有页码或翻页终点，"
             "本次只会请求一次（等于 type=none）；确实要分页请补 page_param + "
@@ -374,8 +388,17 @@ def validate_job(job: dict) -> None:
                 "分页类型 page 必须给 pagination.total_pages_path 或 pagination.total_items_path"
                 "（否则无法判断何时翻完）"
             )
-    if page_type == "cursor" and not pagination.get("cursor_path"):
-        raise SystemExit("分页类型 cursor 必须给 pagination.cursor_path（从返回里取下一页游标的路径）")
+    if page_type == "cursor":
+        if not pagination.get("cursor_path"):
+            raise SystemExit("分页类型 cursor 必须给 pagination.cursor_path（从返回里取下一页游标的路径）")
+        # 终点字段只在 page 分页里参与判断：cursor 作业写了它等于没写，
+        # 用户以为"配了总数校验"，实际一路照着游标翻（配错游标字段就静默只拉一页）
+        stale = [name for name in ("total_pages_path", "total_items_path") if pagination.get(name)]
+        if stale:
+            job.setdefault(_WARNINGS_KEY, []).append(
+                f"pagination.type=cursor 时 {'/'.join(stale)} 不生效（只用 cursor_path 判断何时翻完）；"
+                f"确认是笔误请删掉，想按总数兜底请改用 type=page"
+            )
     if response_type == "bytes" and page_type != "none":
         raise SystemExit("response_type=bytes（文件类响应）不支持分页，请把 pagination.type 设为 none")
 
@@ -390,6 +413,14 @@ def validate_job(job: dict) -> None:
         parse_format = str(parse.get("format")).lower()
         if parse_format not in ALLOWED_PARSE_FORMATS:
             raise SystemExit(f"parse.format 不支持：{parse_format}（可用 {'/'.join(ALLOWED_PARSE_FORMATS)}）")
+    if parse.get("entry_field") and not as_bool(parse.get("unzip"), default=False):
+        # entry_field 只有在 unzip 多条目合并时才有来源可标：没开 unzip 时
+        # _parse_text 拿到的 entry 是空串，每条记录会被多写一个恒为空的字段。
+        # 不报错只告警：字段恒空不影响数据正确性，但用户多半是漏开了 unzip
+        job.setdefault(_WARNINGS_KEY, []).append(
+            f"parse.entry_field={str(parse.get('entry_field'))!r} 只在 parse.unzip=true（ZIP 多条目）"
+            f"时生效：当前每条记录会多出一个恒为空的字段；不需要请删掉它，需要就用 unzip 打开"
+        )
 
     fail_if = request.get("fail_if") or []
     if not isinstance(fail_if, list):
@@ -444,9 +475,25 @@ def resolve_target(job: dict, config: dict, args, bizdate: date) -> tuple[str, s
             "  用法：--bizdate 20260920 --start-date 2026-07-01 --end-date 2026-09-20\n"
             "  含义：整段补数数据写进 pt=20260920（一个分区装一次运行，与调度口径一致）"
         )
-    pt = str(getattr(args, "pt", "") or target.get("pt") or bizdate.strftime("%Y%m%d"))
-    if not _PT_RE.match(pt):
-        raise SystemExit(f"pt 值不合法（应为字母数字下划线中划线）：{pt!r}，可用 --pt 覆盖")
+    explicit_pt = str(getattr(args, "pt", "") or "")
+    if explicit_pt.strip():
+        # --pt 是显式指定的"专家开关"：测试写入、新旧对比、补数都可能用特殊分区
+        # （test_20260921、cmp_*、backfill_*），不能一律按业务日卡死。
+        # 这里只要求值本身是合法分区名；特殊分区不会被调度/DWD 自动读到，
+        # 那是使用者自己的责任（报错与文档里都会提醒）
+        if not _PT_ANY_RE.match(explicit_pt):
+            raise SystemExit(f"--pt 值不合法（分区名只允许字母数字下划线中划线）：{explicit_pt!r}")
+        pt = explicit_pt
+    else:
+        pt = str(target.get("pt") or bizdate.strftime("%Y%m%d"))
+        if not _PT_RE.match(pt):
+            # 默认路径只认 yyyyMMdd：分区值写错形态（2026-09-20、2026-W36-1）退出码照样是 0，
+            # 但调度与 DWD 都按 pt=20260920 读，数据"写进去了没人读"——等于静默丢一批数
+            raise SystemExit(
+                f"target.pt 必须是 8 位业务日 yyyyMMdd（与调度/DWD 的读取口径一致），"
+                f"实际 {pt!r}；测试/补数需要特殊分区时用 --pt 显式指定"
+                f"（注意：特殊分区不会被调度与 DWD 自动读到）"
+            )
     return project, table, column, pt
 
 

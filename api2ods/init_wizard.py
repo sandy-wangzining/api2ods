@@ -260,6 +260,11 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
                 entry = _ask(ask, "   只取文件名包含什么字的条目（如 amount；全部则留空）")
                 if entry:
                     parse["entry_contains"] = entry
+                else:
+                    # 留空 = 用户按提示选了"全部解析"。不写这个开关的话，ZIP 里出现
+                    # 第二个文件时解析会直接报错（"请用 entry_contains 指定…"），
+                    # 生成一份跑不通的配置
+                    parse["allow_multi_entry"] = True
                 parse["entry_field"] = "__file"
 
         # ---------------------------------------------------------- ⑦ 目标表与凭证
@@ -296,6 +301,11 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         target_path = Path(out_path) if out_path else root / "jobs" / f"{job_name}.json"
         if not target_path.is_absolute():
             target_path = root / target_path
+        if target_path.is_dir():
+            # --init-out 指到目录（如 --init-out jobs）：Windows 上抛的是 PermissionError
+            # 而不是 IsADirectoryError，露给用户是裸 traceback；给一句人话 + 建议文件名
+            raise SystemExit(f"--init-out 指向的是目录，需要给文件名：{target_path}"
+                             f"（例如 {target_path / (job_name + '.json')}）")
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if os.name != "nt":
