@@ -149,7 +149,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `auth` | none | 见下表（`bearer` 最常用） |
 | `records_path` | 空 | 记录数组路径（如 `data.list`）；留空=整个返回就是数组 |
 | `response_type` | json | `json` / `bytes`（文件流，配 `parse`，不支持分页） |
-| `json_encoding` | 空 | JSON 接口不是 UTF-8（如 GBK）时显式指定编码；不写则按 UTF-8 → 响应头声明的 charset 严格解码，解不出直接报错（不静默变乱码写库） |
+| `json_encoding` | 空 | JSON 接口不是 UTF-8（如 GBK）时显式指定编码；不写则按 UTF-8 → 响应头声明的 charset 严格解码，解不出直接报错（不静默变乱码写库）。若显式编码与 UTF-8 都能解出但键名不同，会直接报配置错；键名一致、只有值不同（GBK 字节恰好也是合法 UTF-8）时按显式编码处理并告警 |
 | `records_missing` | error | `empty`：路径取不到时按空数据（零数据日接口） |
 | `add_fields` | {} | 每条记录追加固定字段（多账号打来源标记） |
 | `fail_if` | [] | 业务错误判定，如 `[{"path":"code","not_equals":"0","retry":true}]`（`response_type=bytes` 时自动跳过） |
@@ -225,6 +225,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `strict_encoding` | `true` 时按 `encoding` 解码失败直接报错；默认 `false`（解出乱码会打警告，仍按替换字符解析）——源方文件编码可能变过时建议打开 |
 | `allow_multi_entry` | 见 `unzip`：ZIP 多文件时是否允许全部解析 |
 | `entry_field` | 给每条记录加一列“来源文件名”（仅 `unzip: true` 时生效；没开 `unzip` 会告警） |
+| `allow_single_record` | 仅 `format: jsonl` 用：整个响应恰好只有一条 JSON 记录时，它和接口 200 返回的 `{"code":500,...}` 错误体无法区分，默认按错误体拦下（多记录 JSONL、最后一行不带换行都正常解析）。低流量源确实“整个响应就是一条 JSON 记录”时才设 `true` |
 
 ### target（目标表）
 
@@ -236,6 +237,8 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `comment` / `stored_as` / `lifecycle_days` | - | 建表注释 / 存储格式 / 生命周期 |
 | `allow_empty` | false | 本次 0 行时是否允许写空分区 |
 | `profile` | default | 使用 `profiles.<名>` |
+
+`project` / `table` / `column` / `stored_as` 会直接拼进建表 DDL 与校验 SQL，只允许**字母/数字/下划线且不以数字开头**（与 MaxCompute 标识符规则一致）。带空格、连字符、分号的名字会拿到一条明确的配置错，而不是建表失败或注入风险。
 
 ## 怎么接一个新源（照着抄）
 
@@ -304,7 +307,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | 现象 | 处理 |
 |---|---|
 | `解析失败：找不到 records_path` | 路径写错；`--check` 会打印返回的顶层字段；接口“空对象=无数据”时加 `records_missing: "empty"` |
-| JSON 接口中文变乱码 / 报“解不出来” | 源不是 UTF-8（如 GBK）：给 `request` 加 `json_encoding: "gbk"`（不配时工具不静默替换，直接报错） |
+| JSON 接口中文变乱码 / 报“解不出来” | 源不是 UTF-8（如 GBK）：给 `request` 加 `json_encoding: "gbk"`（不配时工具不静默替换，直接报错）。若日志提示显式编码与 utf-8-sig 不一致，先核对接口真实编码；键名不同会直接报错，只有值不同则按显式编码继续并留告警 |
 | `HTTP 401/403/400` | 密钥/参数问题（不重试）；检查 auth 与 params |
 | `期望文件流，但接口返回了 JSON` | 文件接口的权限/参数错误（如未开通下载权限）；按提示里的 JSON 内容排查 |
 | `接口返回业务错误：code=...` | 命中 `fail_if`；限流类错误给 `"retry": true` 先重试几次 |

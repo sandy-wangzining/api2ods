@@ -94,8 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--job", default="", help="作业配置文件（jobs/*.json）")
-    parser.add_argument("--init", action="store_true",
-                        help="交互式生成作业配置（生成后自己填密钥，再 --check）")
+    parser.add_argument("--init", action="store_true", help="交互式生成作业配置（生成后自己填密钥，再 --check）")
     parser.add_argument("--init-out", default="", help="--init 的输出路径（默认 jobs/<作业名>.json）")
     parser.add_argument("--config", default="", help=f"可选的共享凭证文件（默认 {DEFAULT_CONFIG_PATH}，没有就不读）")
     parser.add_argument("--check", action="store_true", help="只体检：配置 + API 连通 + 目标表结构")
@@ -104,19 +103,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dates", default="", help="逗号分隔的日期列表（补零散几天），指定后忽略 --bizdate/--days")
     parser.add_argument("--start-date", default="", help="补数起始日期（含），与 --end-date 成对使用")
     parser.add_argument("--end-date", default="", help="补数结束日期（含），与 --start-date 成对使用")
-    parser.add_argument("--pt", default="",
-                        help="覆盖分区值；不指定时 target.pt 必须是 8 位业务日 yyyyMMdd，"
-                             "显式指定时可写特殊分区（如测试用 test_20260921——注意调度与 DWD 只自动读 yyyyMMdd 分区）")
+    parser.add_argument(
+        "--pt",
+        default="",
+        help="覆盖分区值；不指定时 target.pt 必须是 8 位业务日 yyyyMMdd，"
+        "显式指定时可写特殊分区（如测试用 test_20260921——注意调度与 DWD 只自动读 yyyyMMdd 分区）",
+    )
     parser.add_argument("--workers", type=int, default=1, help="并按天/按区间并发拉取，默认 1；回补历史可用 2~4")
     parser.add_argument("--dry-run", action="store_true", help="只拉取统计，不写数仓")
     parser.add_argument("--allow-empty", action="store_true", help="本次 0 行时也清空并写空分区（默认拒绝）")
-    parser.add_argument("--keep-spool", action="store_true",
-                        help="失败时保留本次落盘的临时 JSONL（排查/手工重传用；默认失败也清理）")
+    parser.add_argument(
+        "--keep-spool", action="store_true", help="失败时保留本次落盘的临时 JSONL（排查/手工重传用；默认失败也清理）"
+    )
     parser.add_argument("--endpoint", default="", help="MaxCompute endpoint（覆盖作业里的配置）")
     parser.add_argument("--mc-profile", default="", help="作业 maxcompute/profiles 里的 profile 名（默认 default）")
     parser.add_argument("--cli-profile", default="", help="aliyun CLI profile 名（本机调试凭证兜底，默认 current）")
-    parser.add_argument("--sql-timeout", type=int, default=SQL_TIMEOUT_SECONDS,
-                        help=f"单条 MaxCompute SQL 最长等待秒数，默认 {SQL_TIMEOUT_SECONDS}；0 表示不限制")
+    parser.add_argument(
+        "--sql-timeout",
+        type=int,
+        default=SQL_TIMEOUT_SECONDS,
+        help=f"单条 MaxCompute SQL 最长等待秒数，默认 {SQL_TIMEOUT_SECONDS}；0 表示不限制",
+    )
     parser.add_argument("--log-file", default="", help="日志同时写一份到该文件（追加，UTF-8）")
     parser.add_argument("--version", action="version", version=f"api2ods {VERSION}")
     return parser
@@ -165,6 +172,7 @@ def _detach_log_sink(handle) -> None:
     if handle is None:
         return
     from .utils import remove_log_sink
+
     remove_log_sink(handle)
 
 
@@ -205,14 +213,23 @@ def _job_summary(job: dict) -> list[str]:
     window = job.get("window") or {}
     pagination = job.get("pagination") or {}
     parse = job.get("parse") or {}
-    endpoint = (f"{str(request.get('method') or 'GET').upper()} "
-                f"{str(request.get('base_url') or '').rstrip('/')}{request.get('path') or ''}")
-    window_text = (f"{window.get('mode', 'per_day')} × {window.get('days', 1)} 天，"
-                   f"date_tz={window.get('date_tz') or 'Asia/Shanghai'}") if window else "无（单次请求）"
-    response_text = (f"{request.get('response_type') or 'json'}"
-                     + (f" / records_path={request.get('records_path')}"
-                        if (request.get("response_type") or "json") == "json"
-                        else f" / parse={parse.get('format')}{'+zip' if parse.get('unzip') else ''}"))
+    endpoint = (
+        f"{str(request.get('method') or 'GET').upper()} "
+        f"{str(request.get('base_url') or '').rstrip('/')}{request.get('path') or ''}"
+    )
+    window_text = (
+        (
+            f"{window.get('mode', 'per_day')} × {window.get('days', 1)} 天，"
+            f"date_tz={window.get('date_tz') or 'Asia/Shanghai'}"
+        )
+        if window
+        else "无（单次请求）"
+    )
+    response_text = f"{request.get('response_type') or 'json'}" + (
+        f" / records_path={request.get('records_path')}"
+        if (request.get("response_type") or "json") == "json"
+        else f" / parse={parse.get('format')}{'+zip' if parse.get('unzip') else ''}"
+    )
     return [
         f"  作业      : {job.get('job') or '(未命名)'}"
         + (f" —— {job['description']}" if job.get("description") else ""),
@@ -253,9 +270,14 @@ def run_check(job: dict, config: dict, config_path: Path, args, bizdate, job_pat
     log("== MaxCompute 目标表 ==")
     try:
         profile = get_mc_profile_meta(config, job, args)
-        o = connect_odps(config, _cred_source_label(config_path, job_path),
-                         profile, project, endpoint=str(args.endpoint or ""),
-                         cli_profile=args.cli_profile)
+        o = connect_odps(
+            config,
+            _cred_source_label(config_path, job_path),
+            profile,
+            project,
+            endpoint=str(args.endpoint or ""),
+            cli_profile=args.cli_profile,
+        )
         if not o.exist_table(table_name):
             log(f"  ⭕ 表不存在（运行同步时自动创建）：{project}.{table_name}")
         else:
@@ -291,19 +313,21 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         log(f"❌ {_redact_job(job, exc)}")
         return 1
     unit_count = fetcher.unit_count(days)
-    log(f"{job.get('job') or '作业'} 启动：{days[0]} ~ {days[-1]}（{len(days)} 天，{unit_count} 次请求计划），"
-        f"目标 {project}.{table_name} pt={pt}")
+    log(
+        f"{job.get('job') or '作业'} 启动：{days[0]} ~ {days[-1]}（{len(days)} 天，{unit_count} 次请求计划），"
+        f"目标 {project}.{table_name} pt={pt}"
+    )
     if len(days) > 30:
         log("提示：回补天数较多，耗时较长（受接口限速影响）；可 Ctrl+C 中断后重跑（先删再填，重复跑幂等）。")
 
     started = time.time()
-    spool = SpoolWriter()          # 记录边拉边落盘（大数据量不占内存）
-    keep_spool = False             # 失败且 --keep-spool 时保留临时文件排障
+    spool = SpoolWriter()  # 记录边拉边落盘（大数据量不占内存）
+    keep_spool = False  # 失败且 --keep-spool 时保留临时文件排障
     try:
         stats, failures = fetcher.fetch_all(
-            days, workers=max(1, args.workers),
-            window_retries=_as_count(pagination.get("window_retries"), 2,
-                                     "pagination.window_retries"),
+            days,
+            workers=max(1, args.workers),
+            window_retries=_as_count(pagination.get("window_retries"), 2, "pagination.window_retries"),
             on_records=spool.write_records,
         )
 
@@ -317,19 +341,25 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
                 log(f"  - {label}: {_redact_job(job, err)}")
             return 1
 
-        log(f"拉取完成：{spool.count:,} 条记录，约 {spool.bytes / 1024 / 1024:.2f} MB，"
-            f"耗时 {(time.time() - started) / 60:.1f} 分钟")
+        log(
+            f"拉取完成：{spool.count:,} 条记录，约 {spool.bytes / 1024 / 1024:.2f} MB，"
+            f"耗时 {(time.time() - started) / 60:.1f} 分钟"
+        )
 
         if args.dry_run:
             log(f"--dry-run：不写库。将写入 {project}.{table_name} pt={pt}（{spool.count:,} 行）")
             return 0
 
         # ② 0 行保护：默认不写空分区（避免接口异常时把已有数据清掉）
-        allow_empty = bool(args.allow_empty) or as_bool(target_cfg.get("allow_empty"), default=False)
+        allow_empty = bool(args.allow_empty) or as_bool(
+            target_cfg.get("allow_empty"), default=False, field="target.allow_empty"
+        )
         if not spool.count and not allow_empty:
             keep_spool = args.keep_spool
-            log(f"❌ 本次拉取 0 行，为避免清空 pt={pt} 分区，未写库。"
-                f"确认要写空分区时加 --allow-empty（或配置 target.allow_empty=true）")
+            log(
+                f"❌ 本次拉取 0 行，为避免清空 pt={pt} 分区，未写库。"
+                f"确认要写空分区时加 --allow-empty（或配置 target.allow_empty=true）"
+            )
             return 1
 
         # ③ 写库：自动建表 → 先删再填 → Tunnel 写入 → 行数与 count(*) 双重校验
@@ -340,17 +370,25 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
                 # 布尔要单独挡：JSON 里写 true 时 int(True) == 1，新表会拿到 lifecycle 1，
                 # 建表当天数据就被生命周期回收；浮点静默截断、负数原样写进 DDL 同理
                 if isinstance(raw_lifecycle, bool) or not isinstance(raw_lifecycle, (int, float)):
-                    raise SystemExit(f"target.lifecycle_days 必须是正整数（天），"
-                                     f"实际 {raw_lifecycle!r}")
+                    raise SystemExit(f"target.lifecycle_days 必须是正整数（天），实际 {raw_lifecycle!r}")
                 if float(raw_lifecycle) != int(raw_lifecycle) or int(raw_lifecycle) <= 0:
-                    raise SystemExit(f"target.lifecycle_days 必须是正整数（天），"
-                                     f"实际 {raw_lifecycle!r}")
+                    raise SystemExit(f"target.lifecycle_days 必须是正整数（天），实际 {raw_lifecycle!r}")
                 lifecycle_days = int(raw_lifecycle)
             profile = get_mc_profile_meta(config, job, args)
-            o = connect_odps(config, _cred_source_label(config_path, job_path), profile, project,
-                             endpoint=str(args.endpoint or ""), cli_profile=args.cli_profile)
+            o = connect_odps(
+                config,
+                _cred_source_label(config_path, job_path),
+                profile,
+                project,
+                endpoint=str(args.endpoint or ""),
+                cli_profile=args.cli_profile,
+            )
             table = ensure_target_table(
-                o, project, table_name, column, str(target_cfg.get("comment") or ""),
+                o,
+                project,
+                table_name,
+                column,
+                str(target_cfg.get("comment") or ""),
                 stored_as=str(target_cfg.get("stored_as") or ""),
                 lifecycle_days=lifecycle_days,
                 timeout=args.sql_timeout,
@@ -359,7 +397,9 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
 
             started_write = time.time()
             write_partition(
-                table, table_name, pt,
+                table,
+                table_name,
+                pt,
                 lambda: spool.iter_batches(WRITE_BATCH_SIZE, MAX_BATCH_BYTES),
                 total=spool.count,
             )
@@ -413,9 +453,10 @@ def main(argv: list[str] | None = None) -> int:
     log_handle = _open_log_file(args.log_file)
     if log_handle is not None:
         from .utils import add_log_sink
+
         add_log_sink(log_handle)
 
-    if args.init:                                    # 交互式建配置：不需要 --job
+    if args.init:  # 交互式建配置：不需要 --job
         from .init_wizard import run_init
 
         def _wizard_ask(prompt: str = "") -> str:
@@ -446,8 +487,7 @@ def main(argv: list[str] | None = None) -> int:
             config = load_json_file(config_path, "凭证/密钥文件")
         else:
             config_path = DEFAULT_CONFIG_PATH
-            config = (load_json_file(config_path, "凭证/密钥文件")
-                      if config_path.is_file() else {})
+            config = load_json_file(config_path, "凭证/密钥文件") if config_path.is_file() else {}
 
         job_path = Path(args.job)
         job_raw = load_json_file(job_path, "作业配置文件")
@@ -465,13 +505,12 @@ def main(argv: list[str] | None = None) -> int:
             bizdate = parse_day_arg(args.bizdate)
         else:
             from_env = env_bizdate(strict=not args.check)
-            bizdate = (from_env if from_env is not None
-                       else datetime.now(tz).date() - timedelta(days=1))
+            bizdate = from_env if from_env is not None else datetime.now(tz).date() - timedelta(days=1)
 
-        job = render_job(job_raw, config, bizdate)   # 替换 ${secrets.x}/${bizdate} 等占位符
-        job = normalize_job(job)                     # 补齐默认值（翻页方式/参数名等），让配置尽量短
+        job = render_job(job_raw, config, bizdate)  # 替换 ${secrets.x}/${bizdate} 等占位符
+        job = normalize_job(job)  # 补齐默认值（翻页方式/参数名等），让配置尽量短
         validate_job(job)
-        for warning in collect_warnings(job):        # 未知字段告警（拼写错误提示）
+        for warning in collect_warnings(job):  # 未知字段告警（拼写错误提示）
             log(f"⚠️ {warning}")
 
         if args.check:
@@ -501,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
             return code
 
         try:
-            with RunLock(_lock_path(job_path.resolve())):   # 同机同一作业互斥；不同作业可并行
+            with RunLock(_lock_path(job_path.resolve())):  # 同机同一作业互斥；不同作业可并行
                 rc = run_sync(job, config, config_path, args, bizdate, job_path.resolve())
             if rc == 130:
                 # 拉取/写库阶段的 Ctrl+C 走的是 run_sync 的 return 130（它要先清临时文件、

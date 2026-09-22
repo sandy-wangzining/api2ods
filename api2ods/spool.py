@@ -64,8 +64,8 @@ class SpoolWriter:
         self.path = Path(path)
         self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
         self._lock = threading.Lock()
-        self.count = 0          # 已写入记录数
-        self.bytes = 0          # 已写入字节数（近似值，含换行）
+        self.count = 0  # 已写入记录数
+        self.bytes = 0  # 已写入字节数（近似值，含换行）
 
     def write_records(self, records: list) -> int:
         """把一批记录序列化后写入文件（返回本批条数）。"""
@@ -82,7 +82,7 @@ class SpoolWriter:
         """重新从头逐行读出（可多次调用：写库失败重试时会重新读一遍）。"""
         self._handle.flush()
         with open(self.path, "r", encoding="utf-8", newline="") as handle:
-            for line in handle:      # 逐行读：对超长行（大 JSON）也安全
+            for line in handle:  # 逐行读：对超长行（大 JSON）也安全
                 line = line.rstrip("\n")
                 if line:
                     yield line

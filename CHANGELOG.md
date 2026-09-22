@@ -2,6 +2,81 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.7] - 2026-09-23
+
+### 修复（第九轮复审：16 条，每条都有回归用例）
+
+**会静默写坏 / 丢数据**
+
+- **`parse.format=jsonl` 无条件豁免"整包 JSON 错误体"检测**：接口 HTTP 200 返回
+  `{"code":500,...}`（带不带行尾换行都一样）时会被当成"一条正常记录"写进 ODS（下游
+  取不到任何字段）。现在只要整个响应能解析为一个 JSON 对象/数组就按错误体拦下，ZIP
+  内每个条目也各查一遍；多记录 JSONL（包括最后一行不带换行）照常解析。确实"整个响应
+  就是一条 JSON 记录、和错误体无法区分"的低流量源，用新配置项
+  `parse.allow_single_record: true` 显式放行
+- **`as_bool` 把未知字符串一律当真**：`"flase"`/`"ture"`/`"否"` 这类笔误静默走开分支
+  （`target.allow_empty: "flase"` 会在 0 行时清空已有分区）。现在只认
+  `true/1/yes/on` 与 `false/0/no/off`，其它非空字符串直接报带字段名的配置错；`None`/
+  纯空白仍按"没填"用默认值
+- **`request.json_encoding` 的冲突检测会误杀合法 GBK**：GBK 双字节序列偶尔也恰好是合法
+  UTF-8（例如 `'一'.encode("gbk")` 能被 `utf-8-sig` 解成 `'һ'`），原冲突检查会拒绝这类
+  正常响应。现在先比较两边解出的 JSON 键名：键名不同才按配置错快速失败；键名一致、只有
+  值不同时按显式 `json_encoding` 处理并告警留痕，避免误杀合法 GBK。UTF-16/UTF-32 这类含
+  `\x00` 的定宽编码仍排除在冲突检查之外
+
+**配置错没能提前拦下（白跑 / 白等）**
+
+- **`request.body_type` 笔误被当 JSON**：原来"非 form 即 JSON"，`"from"`/`"FROM"` 静默
+  按 JSON body 发出，接口行为可能完全不同；现在只认 `json`/`form`，其它报配置错
+- **鉴权必填字段漏检**：`basic` 缺 `username`/`password`、`token` 缺 `value`/`token`、
+  `query` 缺 `params`、`sha256_concat` 缺 `secret_key`，原来要到发请求时才拼出空凭证
+  （接口回 401，用户看不出漏了哪个字段）；现在在配置阶段逐项报出
+- **配置文件不是 UTF-8**：GBK/UTF-16 记事本另存的文件原来抛裸 `UnicodeDecodeError`；
+  现在给一句"不是 UTF-8 编码，请另存为 UTF-8"的提示，读取失败（`OSError`）也一并兜住
+- **数值配置不在配置阶段校验**：`page_size`/`max_pages`/`retry_times`/`retry_delay`/
+  `window.days`/`pad_hours`/`pagination.delay_seconds`/`window_retries` 等原来或拖到运行时
+  才炸、或被 `or 默认值` 悄悄吞掉（`page_size: 0` 被换成 100）；现在在 `validate_job`
+  统一校验正数/非负/整数/有限，报错带字段名。`parse` 的布尔开关
+  （`unzip`/`strict_encoding`/`allow_multi_entry`/`allow_single_record`）同样提前校验：
+  多记录 JSONL 配成 `"flase"` 原来不会走到那条分支、静默当没开，现在在配置阶段就报错
+- **`target.lifecycle_days` 校验太晚**：原来要"拉完所有数据、准备写库"时才校验，配置写错
+  先白跑一整轮 API；现在提前到配置阶段（运行期那道检查保留作兜底）
+- **`--init` 向导能生成非法 `window.days`**：向导对"最近几天"填 0/负数照单全收，生成的
+  配置随后被自己的 `validate_job` 拒绝；现在提示并重问，超过三次才用正整数默认值兜底
+- **直接调用 `validate_job` 时非对象块抛裸异常**：库调用方不先走 `normalize_job` 时，
+  `request`/`target`/`window`/`pagination`/`parse` 写成字符串会得到 `AttributeError`；现在
+  统一报"必须是对象（键值对）"的配置错
+
+**跨平台一致性**
+
+- **`window.format` 的 locale/平台相关指令**：`%a`/`%A`/`%b`/`%B`/`%c`/`%x`/`%X`/`%r`/
+  `%p`/`%Z` 的输出由 C 库 locale 与平台时区库决定（中文/法语 Windows 上 `%b` 给「9月」
+  「sept.」，`%Z` 给平台时区缩写），同一份配置在开发机与调度机上算出不同参数值，接口按值
+  匹配时会静默查不到数据。现在这些指令与 `%s`/`%P` 一样由自己实现，固定成 C locale 的
+  英文写法（`%c=%a %b %e %H:%M:%S %Y`、`%x=%m/%d/%y`、`%r=%I:%M:%S %p`，`%Z` 取
+  `tzinfo.tzname()`）
+
+**错误归位 / 写库安全**
+
+- **ZIP 加密或不支持的压缩方式被判成"可重试"**：重试多少次都是同一份包、同一个结果，
+  原来白等十几分钟退避；现在归为 `ConfigError`（不可重试）快速失败，并提示"在源侧换一种
+  导出方式"（条目损坏 `BadZipFile` 仍按可重试）
+- **`count_partition` 用 `hasattr(row, "__getitem__")` 判断取值方式**：元组也有
+  `__getitem__`，于是对元组行走 `row["cnt"]` 直接 `TypeError`；改成先按列名、失败再按位置取
+- **目标标识符裸拼进 DDL / SQL**：`target.project`/`table`/`column`/`stored_as` 带空格、
+  连字符是建表失败，带分号是 SQL 注入点；现在在 `config` 与 `mc` 两处按
+  `[A-Za-z_][A-Za-z0-9_]*`（字母/下划线开头）白名单校验，报一句明确的配置错
+- **"先删再填"重试全失败时不说明后果**：`write_partition` 原样抛"重试 N 次仍失败"，
+  调度侧看不出分区已被清空或只写入一半、旧数据不会自动恢复；现在错误信息写明后果与补救
+  动作（请重跑本作业、重跑会从头覆盖不会叠加）。`delete_partition` 自身抛错时也保守地
+  认为"分区可能已被删掉"，不会因为异常发生在一行赋值之前而吞掉缺数提示。`except Exception`
+  不含 `KeyboardInterrupt`/`SystemExit`，Ctrl+C 的退出行为不受影响
+
+### 测试
+
+- 用例 497 → 527（上述每处修复都有回归用例）；`tests` 说明更新为"没装 `requests` 时，
+  少数借用真实 `requests` 异常类型的用例会 `skip`"
+
 ## [2.1.6] - 2026-09-22
 
 ### 修复（第八轮复审：对 2.1.5 逐条复测又查出的 8 处，每条都有回归用例）

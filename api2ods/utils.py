@@ -37,7 +37,7 @@ class ConfigError(SystemExit):
 
 
 _lock = threading.Lock()
-PROGRESS_EVERY = 1000      # 进度日志节流：每 N 条记录打一次
+PROGRESS_EVERY = 1000  # 进度日志节流：每 N 条记录打一次
 _sinks: list = []
 _console_patched = False
 
@@ -126,7 +126,7 @@ def log(message: str) -> None:
         try:
             print(line, flush=True)
         except UnicodeEncodeError:
-            encoding = (getattr(sys.stdout, "encoding", None) or "utf-8")
+            encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
             safe = line.encode(encoding, "replace").decode(encoding, "replace")
             print(safe, flush=True)
         for handle in _sinks:
@@ -165,15 +165,13 @@ class RunLock:
         except OSError as exc:
             # 父目录被删/路径过长（Windows MAX_PATH）时给一句人话，
             # 而不是让 FileNotFoundError 以裸 traceback 的形式糊在用户脸上
-            raise SystemExit(f"无法创建运行锁文件 {self.path}（{exc}）；"
-                             f"请检查该路径所在目录是否存在/可写，或用 --job 指定别处的作业")
+            raise SystemExit(
+                f"无法创建运行锁文件 {self.path}（{exc}）；请检查该路径所在目录是否存在/可写，或用 --job 指定别处的作业"
+            )
         if not _try_lock(self.fh):
             self.fh.close()
             self.fh = None
-            raise SystemExit(
-                f"已有任务在运行（锁文件 {self.path}），本次退出；"
-                f"确认没有任务在跑时可删除该文件后重试。"
-            )
+            raise SystemExit(f"已有任务在运行（锁文件 {self.path}），本次退出；确认没有任务在跑时可删除该文件后重试。")
         try:
             # 拿到锁之后才截断+写自己的 pid：拿不到锁时绝不能动内容，
             # 否则每一次被拦下的启动都会把持锁进程的标记清掉
@@ -181,7 +179,7 @@ class RunLock:
             self.fh.truncate()
             self.fh.write(str(os.getpid()))
             self.fh.flush()
-        except OSError:          # 写进程号只是标记，失败不影响加锁
+        except OSError:  # 写进程号只是标记，失败不影响加锁
             pass
         return self
 
@@ -209,7 +207,7 @@ def _try_lock(fh) -> bool:
             return True
         except OSError:
             return False
-    return True          # 两种锁都没有：不阻塞（退回"无锁"行为）
+    return True  # 两种锁都没有：不阻塞（退回"无锁"行为）
 
 
 def _unlock(fh) -> None:
@@ -227,15 +225,25 @@ def _unlock(fh) -> None:
             pass
 
 
-def as_bool(value, default: bool) -> bool:
+# 布尔字符串的白名单：只认这些，其它字符串（如 "flase" 这种笔误）一律报配置错。
+# 不能"未知一律当真"：`target.allow_empty: "flase"` 会被当成开，0 行时把已有分区
+# 清空；`parse.allow_multi_entry: "flase"` 会把本不该合并的多文件串成一份。
+_BOOL_TRUE = ("true", "1", "yes", "on")
+_BOOL_FALSE = ("false", "0", "no", "off")
+
+
+def as_bool(value, default: bool, field: str = "") -> bool:
     """配置里的布尔值：JSON 写 true/false、字符串 "true"/"false"、0/1 都认。
 
-    JSON 里写 "false"（带引号）是很常见的笔误，直接按真值判断会当成开，静默走错分支
-    ——对 allow_empty 这类开关来说，走错的代价是"把已有分区清空"。
+    - 未填（None）/纯空白串 → 返回 default（"没填"就是走默认值）；
+    - 认识的写法 → 对应真假；
+    - 其它字符串（"flase" / "ture" / "否" 之类无法识别的）→ 报配置错。
 
-    纯空白串按"没填"处理（返回 default）：原来 strip 后落进 falsy 列表返回 False，
-    `verify: " "` 会静默关掉 TLS 校验、`pagination.strict: " "` 会静默放宽丢数检查。
+    为什么不能"未知一律当真"：`target.allow_empty: "flase"` 会被当成开，本次 0 行时
+    把已有分区清空；`parse.allow_multi_entry: "flase"` 会把本不该合并的多文件串成一份。
+    宁失败勿写错——把笔误变成一次清晰的报错，而不是一次静默的错误分支。
     """
+    where = f"{field} " if field else ""
     if value is None:
         return default
     if isinstance(value, bool):
@@ -244,8 +252,36 @@ def as_bool(value, default: bool) -> bool:
         text = value.strip().lower()
         if text == "":
             return default
-        return text not in ("false", "0", "no", "off")
+        if text in _BOOL_TRUE:
+            return True
+        if text in _BOOL_FALSE:
+            return False
+        raise ConfigError(
+            f"{where}布尔值无法识别：{value!r}；请写 JSON 的 true/false，"
+            f'或字符串 "true"/"false"（也认 0/1、yes/no、on/off）'
+        )
     return bool(value)
+
+
+# MaxCompute 常规标识符：字母/下划线开头 + 字母/数字/下划线
+_IDENT_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def require_identifier(value, where: str) -> str:
+    """校验一个会直接拼进 DDL / SQL 的标识符（project / table / column / stored_as）。
+
+    这些值不是请求参数，而是**拼进语句的标识符**：带空格、连字符、分号的名字要么建表失败，
+    要么成为 SQL 注入点（`ods_x; drop table ...`）。配置虽然是本机文件，但名字写错时给一句
+    人话，远好过让 MaxCompute 抛一句看不出所以然的语法错。合法名只允许字母/数字/下划线，
+    且不以数字开头（与 MaxCompute 的常规标识符规则一致）。
+
+    返回 str，方便调用方直接拿去拼语句；不合法抛 ConfigError（SystemExit 子类，
+    不可重试、快速失败）。
+    """
+    text = str(value)
+    if not _IDENT_RE.match(text):
+        raise ConfigError(f"{where} 不是合法的 MaxCompute 标识符：{text!r}；只允许字母/数字/下划线且不能以数字开头")
+    return text
 
 
 def check_header_values(headers: dict) -> None:
@@ -260,16 +296,12 @@ def check_header_values(headers: dict) -> None:
         text = str(value)
         if text != text.strip() or "\r" in text or "\n" in text:
             raise ConfigError(
-                f"请求头 {name} 的值首尾有空白或含换行（配置或密钥里多半抄多了空格/换行）；"
-                f"值不回显以免泄漏密钥"
+                f"请求头 {name} 的值首尾有空白或含换行（配置或密钥里多半抄多了空格/换行）；值不回显以免泄漏密钥"
             )
         try:
             text.encode("latin-1")
         except UnicodeEncodeError:
-            raise ConfigError(
-                f"请求头 {name} 的值含非 latin-1 字符（中文等），HTTP 头发不出去；"
-                f"值不回显以免泄漏密钥"
-            )
+            raise ConfigError(f"请求头 {name} 的值含非 latin-1 字符（中文等），HTTP 头发不出去；值不回显以免泄漏密钥")
 
 
 # =============================================================================
@@ -279,10 +311,25 @@ def check_header_values(headers: dict) -> None:
 # 密钥字段名按「词」判断：先按下划线/中划线/驼峰切开再看每个词，这样
 # accessToken / client_secret / X-Api-Key 都能认出来，而 task=? 不会因为含 "sk" 被误伤
 _SENSITIVE_WORDS = {
-    "sign", "signature", "sig", "token", "secret", "password", "passwd", "authorization",
-    "auth", "apikey", "key", "accesskey", "sk", "ak",
+    "sign",
+    "signature",
+    "sig",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "authorization",
+    "auth",
+    "apikey",
+    "key",
+    "accesskey",
+    "sk",
+    "ak",
     # 常见简写与 scheme 名：?pwd= / ?pw= / ?pass= / bearer: <token>
-    "pwd", "pw", "pass", "bearer",
+    "pwd",
+    "pw",
+    "pass",
+    "bearer",
 }
 _WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 # 参数名做左边界限制（不用 \b：下划线在正则里算词字符，client_secret 会被漏掉）
@@ -292,8 +339,7 @@ _QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})=([^&\s\"']
 # 值用「回引号」收尾而不是 [^"']*：repr 对「值里含单引号」的串会改用双引号包裹
 # （{'password': "ab'SECRET"}），按"遇到任意引号就停"会在第一个单引号处截断，
 # 引号之后的部分原样漏进日志
-_JSON_RE = re.compile(
-    r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!(?P=q))[\s\S])*)(?P=q)""")
+_JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!(?P=q))[\s\S])*)(?P=q)""")
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
 # URL 里的 userinfo（https://user:pass@host）：代理/接口地址常把账号密码写在地址里，
@@ -302,7 +348,7 @@ _URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@")
 # 请求头行：'X-Api-Key: xxx' / 'X-Api-Key=xxx'（requests 抛错时带的 headers 是这种形态）。
 # 上一条 Authorization 规则只认 Basic/Bearer 两种值，其余自定义头名要靠这里兜。
 # 值要吃到行尾：只吃第一个词的话，"Authorization: Token abc…" 会变成 "*** abc…"
-#（凭证明文留下）；整行遮掉最安全，行边界由 (?m) 的 ^/$ 兜住
+# （凭证明文留下）；整行遮掉最安全，行边界由 (?m) 的 ^/$ 兜住
 _HEADER_RE = re.compile(r"(?im)^(\s*([A-Za-z0-9_.\-]{1,64})\s*[:=]\s*)(.+)$")
 
 
@@ -317,9 +363,22 @@ def _is_sensitive_key(name) -> bool:
     lowered = original.lower()
     # 不用分隔符的写法：accesstoken / secretkey / accesskeyid
     # （"key" 不单独做子串规则，否则 monkey / keywords 这类普通参数会被误伤）
-    return any(word in lowered for word in
-               ("token", "secret", "password", "passwd", "signature",
-                "apikey", "accesskey", "secretkey", "privatekey", "signkey", "keyid"))
+    return any(
+        word in lowered
+        for word in (
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "signature",
+            "apikey",
+            "accesskey",
+            "secretkey",
+            "privatekey",
+            "signkey",
+            "keyid",
+        )
+    )
 
 
 def redact(text: str) -> str:
@@ -412,14 +471,32 @@ _SECRET_MIN_LEN = 4
 # auth 配置里承载凭证的字段名（auth.py 各类型的取值字段：token 的 value、bearer 的
 # token、basic 的 password、sha256_concat 的 secret_key、aliyun_rpc 的 access_key_*）。
 # 结构性字段（type/header/prefix/sign_field…）不在此列。
-_AUTH_SECRET_KEYS = frozenset({
-    "password", "value", "token", "secret_key", "secret",
-    "access_key_id", "access_key_secret", "client_secret", "private_key",
-})
-_SECRET_HEADER_KEYS = frozenset({
-    "authorization", "proxy-authorization", "cookie", "set-cookie",
-    "x-api-key", "api-key", "apikey", "x-auth-token", "x-access-token",
-})
+_AUTH_SECRET_KEYS = frozenset(
+    {
+        "password",
+        "value",
+        "token",
+        "secret_key",
+        "secret",
+        "access_key_id",
+        "access_key_secret",
+        "client_secret",
+        "private_key",
+    }
+)
+_SECRET_HEADER_KEYS = frozenset(
+    {
+        "authorization",
+        "proxy-authorization",
+        "cookie",
+        "set-cookie",
+        "x-api-key",
+        "api-key",
+        "apikey",
+        "x-auth-token",
+        "x-access-token",
+    }
+)
 _AUTH_SCHEMES = frozenset({"basic", "bearer", "token", "digest"})
 # 结构性字段后缀：值为配置项名/位置（sign_field="sign"、sign_in="body"），
 # 不是凭证；不排除的话 "sign"、"body" 会被当密钥值把报错文本里这些常见词遮掉
@@ -505,7 +582,7 @@ def redact_secrets(values, text: str) -> str:
     """
     if not text:
         return text
-    text = str(text)   # 与 redact 同样的宽容度：调用方直接传异常对象/数字也不会炸
+    text = str(text)  # 与 redact 同样的宽容度：调用方直接传异常对象/数字也不会炸
     for value in sorted(set(values or ()), key=len, reverse=True):
         # 短值（< _SECRET_MIN_LEN）连值级替换也要挡：否则 "SEC" 会把别的密钥切成
         # "***RET-…"——既没遮住，还把报错信息搅乱。值从 collect_secret_values 来时
@@ -519,8 +596,10 @@ def redact_secrets(values, text: str) -> str:
 # 通用重试
 # =============================================================================
 
-def retry_call(fn, attempts: int = 5, base_delay: float = 15, desc: str = "",
-               fatal=(FatalApiError,), max_delay: float = 300):
+
+def retry_call(
+    fn, attempts: int = 5, base_delay: float = 15, desc: str = "", fatal=(FatalApiError,), max_delay: float = 300
+):
     """执行 fn，瞬时错误指数退避重试；FatalApiError 与调用方声明的不重试异常直接抛出。
 
     重试日志与最终异常都会做脱敏，避免把 URL 里的签名/token 打进日志。

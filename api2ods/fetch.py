@@ -30,9 +30,21 @@ from .utils import ConfigError, FatalApiError, as_bool, check_header_values, col
 # 体检用 page_size=1 被拒时的判据：宁缺毋滥，命中不了的接口最多少回退一次。
 # 不收录光秃秃的 "limit"：报错说"时段超限/调用次数 limit"的接口会被误判成拒绝页大小，
 # 白白多发一次请求（要表达页大小限制的接口会带上 page_size/每页 这类更具体的词）
-_SIZE_ERROR_HINTS = ("page size", "page_size", "pagesize", "per page", "perpage",
-                     "每页", "页大小", "页长", "size must", "size should",
-                     "limit must", "limit should", "limit range")
+_SIZE_ERROR_HINTS = (
+    "page size",
+    "page_size",
+    "pagesize",
+    "per page",
+    "perpage",
+    "每页",
+    "页大小",
+    "页长",
+    "size must",
+    "size should",
+    "limit must",
+    "limit should",
+    "limit range",
+)
 
 
 def _looks_like_size_error(message: str) -> bool:
@@ -135,9 +147,9 @@ def _unfinished_reason(current: int, total_pages, count: int, total_items) -> st
 class FetchUnit:
     """一次逻辑请求：某天（per_day 模式）或某个区间（range 模式）。"""
 
-    label: str              # 日志里显示的名字，如 "2026-09-18"
-    day: date               # 该单元的基准日（决定窗口参数 / 用于日志）
-    params: dict | None     # 窗口参数（startTime/endTime 等）；单次请求模式为 None
+    label: str  # 日志里显示的名字，如 "2026-09-18"
+    day: date  # 该单元的基准日（决定窗口参数 / 用于日志）
+    params: dict | None  # 窗口参数（startTime/endTime 等）；单次请求模式为 None
 
 
 class Fetcher:
@@ -172,7 +184,7 @@ class Fetcher:
         self.fail_if = request_cfg.get("fail_if") or []
         self.retry_times = int(_as_number(request_cfg.get("retry_times"), 5, "request.retry_times"))
         self.retry_delay = _as_number(request_cfg.get("retry_delay"), 15.0, "request.retry_delay")
-        self.verify = as_bool(request_cfg.get("verify"), default=True)
+        self.verify = as_bool(request_cfg.get("verify"), default=True, field="request.verify")
         self.proxies = request_cfg.get("proxies") or None
         self.records_path = str(request_cfg.get("records_path") or "")
         # records_missing=empty：接口用"空对象"表示无数据（如阿里云 Items: {}）时不报错
@@ -208,8 +220,7 @@ class Fetcher:
         if not window or mode == "range":
             label = f"{days[0]}~{days[-1]}" if window else "单次请求"
             return [FetchUnit(label=label, day=days[0], params=param_sets[0])]
-        return [FetchUnit(label=str(day), day=day, params=params)
-                for day, params in zip(days, param_sets)]
+        return [FetchUnit(label=str(day), day=day, params=params) for day, params in zip(days, param_sets)]
 
     def unit_count(self, days: list[date]) -> int:
         """这个窗口会拆成几个请求单元（只用于日志/提示，不真的发请求）。"""
@@ -232,8 +243,9 @@ class Fetcher:
         page_type = str(self.pagination.get("type") or "none").lower()
         size_override = 1 if page_type == "page" else None
         try:
-            records = self.fetch_unit(unit, page_size_override=size_override, max_pages_override=1,
-                                      stop_after_first_page=True)
+            records = self.fetch_unit(
+                unit, page_size_override=size_override, max_pages_override=1, stop_after_first_page=True
+            )
         except FatalApiError as exc:
             # 有些接口要求页大小不低于 10/20，体检压到 1 会被判 400：
             # 这不是"接口不通"，按配置里的页大小再试一次，别把能用的源拒之门外
@@ -266,6 +278,7 @@ class Fetcher:
         params_in=headers 时：先让鉴权把签名写进 params/headers，再把所有参数搬到请求头、
         清空 URL 参数（有些接口要求所有参数都走 Header）。
         """
+
         def build():
             """每次尝试都重新算一遍参数和签名，返回 (params, headers) 给 http 层。"""
             # 每次尝试都重新鉴权：阿里云 RPC 的 SignatureNonce 一次性有效，
@@ -282,16 +295,29 @@ class Fetcher:
             return attempt_params, headers
 
         return request_with_retry(
-            self.method, self.url, build, self.body_type, self.timeout,
-            expect_json=expect_json, fail_if=self.fail_if,
-            retry_times=self.retry_times, retry_delay=self.retry_delay,
-            verify=self.verify, proxies=self.proxies, desc=desc,
-            json_encoding=self.json_encoding, redactor=self.redact,
+            self.method,
+            self.url,
+            build,
+            self.body_type,
+            self.timeout,
+            expect_json=expect_json,
+            fail_if=self.fail_if,
+            retry_times=self.retry_times,
+            retry_delay=self.retry_delay,
+            verify=self.verify,
+            proxies=self.proxies,
+            desc=desc,
+            json_encoding=self.json_encoding,
+            redactor=self.redact,
         )
 
-    def fetch_unit(self, unit: FetchUnit, page_size_override: int | None = None,
-                   max_pages_override: int | None = None,
-                   stop_after_first_page: bool = False) -> list[dict]:
+    def fetch_unit(
+        self,
+        unit: FetchUnit,
+        page_size_override: int | None = None,
+        max_pages_override: int | None = None,
+        stop_after_first_page: bool = False,
+    ) -> list[dict]:
         """执行一个请求单元，返回该单元的记录列表。
 
         三个 override 参数仅供 --check 限量使用（正式同步不传），确保体检只发一次请求。
@@ -304,16 +330,22 @@ class Fetcher:
         page_type = str(self.pagination.get("type") or "none").lower()
         if page_type == "none":
             payload = self._do_request(params, unit.label, expect_json=self.response_type != "bytes")
-            records = parse_payload(payload, self.request_cfg, self.parse_cfg, unit.label,
-                                    missing_ok=self.records_missing == "empty")
+            records = parse_payload(
+                payload, self.request_cfg, self.parse_cfg, unit.label, missing_ok=self.records_missing == "empty"
+            )
             return self._decorate(records)
-        return self._decorate(self._fetch_pages(unit, params, page_size_override, max_pages_override,
-                                                stop_after_first_page))
+        return self._decorate(
+            self._fetch_pages(unit, params, page_size_override, max_pages_override, stop_after_first_page)
+        )
 
-    def _fetch_pages(self, unit: FetchUnit, base_params: dict,
-                     page_size_override: int | None = None,
-                     max_pages_override: int | None = None,
-                     stop_after_first_page: bool = False) -> list[dict]:
+    def _fetch_pages(
+        self,
+        unit: FetchUnit,
+        base_params: dict,
+        page_size_override: int | None = None,
+        max_pages_override: int | None = None,
+        stop_after_first_page: bool = False,
+    ) -> list[dict]:
         """页码 / 游标分页循环。
 
         终止条件（按优先级）：
@@ -329,21 +361,38 @@ class Fetcher:
         # 没写才用默认名 "size"
         size_param_value = page_cfg.get("size_param", "size")
         size_param = None if size_param_value is None else str(size_param_value)
-        page_size = (page_size_override or page_cfg.get("page_size") or 100)
-        param_as_string = as_bool(page_cfg.get("param_as_string"), default=False)  # 有些接口要求字符串
+        # 不能写成 `page_size_override or page_cfg.get("page_size") or 100`：
+        # 配了 page_size=0（想表达"别带 size"却漏了 size_param:null）会被静默换成 100，
+        # 页大小翻 100 倍、条数校验还拿这一页自比。这里显式区分"没填"和"填了 0/负数"
+        raw_page_size = page_size_override if page_size_override is not None else page_cfg.get("page_size")
+        if raw_page_size is None or raw_page_size == "":
+            raw_page_size = 100
+        param_as_string = as_bool(
+            page_cfg.get("param_as_string"), default=False, field="pagination.param_as_string"
+        )  # 有些接口要求字符串
         total_pages_path = str(page_cfg.get("total_pages_path") or "")
         total_items_path = str(page_cfg.get("total_items_path") or "")
         cursor_param = str(page_cfg.get("cursor_param") or "cursor")
         cursor_path = str(page_cfg.get("cursor_path") or "")
         cursor_start = page_cfg.get("cursor_start")
         delay = _as_number(page_cfg.get("delay_seconds"), 0.0, "pagination.delay_seconds")
-        max_pages = int(_as_number(max_pages_override or page_cfg.get("max_pages"), 2000,
-                                   "pagination.max_pages"))
+        if delay < 0:
+            raise ConfigError(f"pagination.delay_seconds 不能是负数，实际 {delay:g}")
+        raw_max_pages = max_pages_override if max_pages_override is not None else page_cfg.get("max_pages")
+        if raw_max_pages is None or raw_max_pages == "":
+            raw_max_pages = 2000
+        max_pages = int(_as_number(raw_max_pages, 2000, "pagination.max_pages"))
+        if max_pages <= 0:
+            # max_pages=0/-1 时 range(1, max_pages+1) 为空，会直接落到 for-else 报
+            # "超过 max_pages=0 页"这种误导文案。这里给一句明确的配置错
+            raise ConfigError(f"pagination.max_pages 必须是正整数，实际 {max_pages}")
         # 默认严格：空页但总数没够 = 接口有问题，宁可整窗失败。确实遇到 TotalCount 不准的
         # 接口（数据翻页期间仍在增长）才关掉，关掉后仍会打警告日志留痕
-        strict = as_bool(page_cfg.get("strict"), default=True)
+        strict = as_bool(page_cfg.get("strict"), default=True, field="pagination.strict")
 
-        effective_page_size = int(_as_number(page_size, 100, "pagination.page_size"))
+        effective_page_size = int(_as_number(raw_page_size, 100, "pagination.page_size"))
+        if effective_page_size <= 0:
+            raise ConfigError(f"pagination.page_size 必须是正整数，实际 {effective_page_size}")
         records: list[dict] = []
         current = 1
         cursor = cursor_start
@@ -364,8 +413,7 @@ class Fetcher:
                 if cursor is not None:
                     params[cursor_param] = cursor
             if size_param:
-                params[size_param] = (str(effective_page_size) if param_as_string
-                                      else effective_page_size)
+                params[size_param] = str(effective_page_size) if param_as_string else effective_page_size
 
             # ② 发请求 + 取记录数组
             payload = self._do_request(params, f"{unit.label} 第{page_index}页", expect_json=True)
@@ -376,7 +424,7 @@ class Fetcher:
                 if first_page and self.records_missing == "empty":
                     log(f"  {unit.label}：records_path 未命中，按空结果处理（records_missing=empty）")
                     return []
-                extract_json_records(payload, self.request_cfg, unit.label)   # 抛带诊断信息的错误
+                extract_json_records(payload, self.request_cfg, unit.label)  # 抛带诊断信息的错误
             first_page = False
             # 分页路径同样要校验元素类型：records_path 指向的数组里混进数字/字符串，
             # 只在单页路径拦得住的话，分页接口会把它原样写进 json 列
@@ -391,8 +439,7 @@ class Fetcher:
                 # 直接收尾、成功写 0 行。按"接口抖动"处理会整窗重试到失败，把正常的
                 # 零数据日变成天天报警。限第一页（还没拉到任何记录）才这么判：中途翻出
                 # 空页却报 0 条，与前几页的记录自相矛盾，那种情况照旧按未翻完处理
-                if (not page_records and not records
-                        and (_is_zero_count(raw_pages) or _is_zero_count(raw_items))):
+                if not page_records and not records and (_is_zero_count(raw_pages) or _is_zero_count(raw_items)):
                     break
                 # 很多接口只在第一页回 totalPages / TotalCount，后续页不带。读到就记下来，
                 # 翻到空页时用最后一次读到的值判断——否则"数据已拉全、末页之后又空翻一页"
@@ -463,9 +510,13 @@ class Fetcher:
 
     # ------------------------------------------------------------------ 全部
 
-    def fetch_all(self, days: list[date], workers: int = 1, window_retries: int = 2,
-                  on_records: Callable[[list], None] | None = None
-                  ) -> tuple[list[tuple[str, int]], list[tuple[str, str]]]:
+    def fetch_all(
+        self,
+        days: list[date],
+        workers: int = 1,
+        window_retries: int = 2,
+        on_records: Callable[[list], None] | None = None,
+    ) -> tuple[list[tuple[str, int]], list[tuple[str, str]]]:
         """按计划拉取全部单元。
 
         - on_records：每拉完一个单元立刻回调（调用方用来写 Spool，避免全量数据占内存）；
@@ -498,8 +549,7 @@ class Fetcher:
                     last_err = exc
                     if attempt == attempts:
                         break
-                    log(f"  [{unit.label}] 第 {attempt}/{attempts - 1} 次失败："
-                        f"{self.redact(exc)}；{delay}s 后整窗重试")
+                    log(f"  [{unit.label}] 第 {attempt}/{attempts - 1} 次失败：{self.redact(exc)}；{delay}s 后整窗重试")
                     time.sleep(delay)
                     delay *= 2
             # 走得到这里的只有可重试的异常（FatalApiError / ConfigError 在循环里就抛了），

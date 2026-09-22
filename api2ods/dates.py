@@ -20,14 +20,65 @@ _OFFSET_RE = re.compile(r"^([+-])(\d{1,2})(?::?(\d{2}))?$")
 # %R（= %H:%M）/%r（12 小时制）/ %s（epoch 秒）也是常见的"带时刻"写法，
 # 漏掉它们会把这类 format 误判成"只到日期"：跳过时区换算、end 取闭区间，
 # 窗口直接塌成零长度（start == end）而没有任何告警
-_TIME_TOKENS = ("%H", "%I", "%M", "%S", "%f", "%p", "%P", "%X", "%T", "%R", "%r", "%s",
-                "%c", "%z", "%Z")
+_TIME_TOKENS = ("%H", "%I", "%M", "%S", "%f", "%p", "%P", "%X", "%T", "%R", "%r", "%s", "%c", "%z", "%Z")
 _UNIX_FORMATS = ("unix", "unix_s", "unix_ms", "unix_millis")
 # strftime 指令白名单 = Windows 与 glibc 都认的交集（外加我们自己实现的 %s / %P）。
 # 实测 MSVC 不认的：k l N P q s v 与所有修饰符（%-d/%_d/%0d/%^B）；glibc 则是不认的
 # 原样输出。取交集才能保证"同一份配置在 Linux 与 Windows 上行为一致"，
 # 而不是一边崩、一边把 "%Q" 当参数值发给接口
 _STRFTIME_CODES = set("aAbBcCdDeFgGhHIjmMnprRStTuUVWwWxXyYzZ%") | {"s", "P"}
+# 下面这些指令的输出由 C 库的 locale / 平台时区库决定，同一份配置在不同机器上可能不一样：
+# 中文/法语 Windows 上 %b 给「9月」「sept.」，英文 Linux 给 "Sep"；%c/%x/%X 是整体 locale
+# 格式；%Z 取平台时区缩写（"CST"/"China Standard Time"）。同一个作业在开发机与调度机
+# 拼出的参数值不同，接口按值匹配（如按日期字符串查账）时会静默查不到数据。
+# 与 %s / %P 同样处理：由 format_time 自己实现，固定成 C locale 的英文写法。
+_LOCALE_DEPENDENT_CODES = ("a", "A", "b", "B", "p", "c", "x", "X", "r", "Z")
+_WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_WEEKDAY_FULL = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+_MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+_MONTH_FULL = (
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+
+
+def _locale_free_values(value: datetime) -> dict:
+    """%a/%A/%b/%B/%p/%c/%x/%X/%r/%Z 的确定性取值（C locale + tzinfo 自带的时区名）。
+
+    %c/%x/%r 按 C locale 的定义展开（%c = "%a %b %e %H:%M:%S %Y"、%x = "%m/%d/%y"、
+    %r = "%I:%M:%S %p"）；%Z 用 tzinfo.tzname()，比平台 strftime 的缩写稳定。
+    """
+    hour12 = value.hour % 12 or 12
+    ampm = "AM" if value.hour < 12 else "PM"
+    weekday_abbr = _WEEKDAY_ABBR[value.weekday()]
+    month_abbr = _MONTH_ABBR[value.month - 1]
+    return {
+        "a": weekday_abbr,
+        "A": _WEEKDAY_FULL[value.weekday()],
+        "b": month_abbr,
+        "B": _MONTH_FULL[value.month - 1],
+        "p": ampm,
+        "c": (
+            f"{weekday_abbr} {month_abbr} {value.day:2d} "
+            f"{value.hour:02d}:{value.minute:02d}:{value.second:02d} {value.year:04d}"
+        ),
+        "x": f"{value.month:02d}/{value.day:02d}/{value.year % 100:02d}",
+        "X": f"{value.hour:02d}:{value.minute:02d}:{value.second:02d}",
+        "r": f"{hour12:02d}:{value.minute:02d}:{value.second:02d} {ampm}",
+        "Z": value.tzname() or "",
+    }
+
+
 _DIRECTIVE_RE = re.compile(r"%(.)", re.S)
 _MODIFIERS = "-_0^#"
 # 日期参数白名单：只认紧凑与 ISO 两种写法（见 parse_day_arg 的说明）
@@ -79,8 +130,7 @@ def load_zone(name: str) -> ZoneInfo:
         return ZoneInfo(str(name))
     except Exception:
         raise SystemExit(
-            f"无法识别时区：{name}（如 America/New_York / Asia/Shanghai / UTC；"
-            f"Windows 本机需 pip install tzdata）"
+            f"无法识别时区：{name}（如 America/New_York / Asia/Shanghai / UTC；Windows 本机需 pip install tzdata）"
         )
 
 
@@ -132,8 +182,10 @@ def env_bizdate(strict: bool = True) -> date | None:
         return parse_day_arg(text)
     except SystemExit as exc:
         if not strict:
-            log(f"  警告：环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}；"
-                f"只读体检（--check）不写库，按默认业务日继续")
+            log(
+                f"  警告：环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}；"
+                f"只读体检（--check）不写库，按默认业务日继续"
+            )
             return None
         raise SystemExit(
             f"环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}"
@@ -155,8 +207,8 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
     tz = date_tz_of(job)
 
     if getattr(args, "days", None) is not None and (
-            getattr(args, "dates", "") or getattr(args, "start_date", "")
-            or getattr(args, "end_date", "")):
+        getattr(args, "dates", "") or getattr(args, "start_date", "") or getattr(args, "end_date", "")
+    ):
         # 补数模式下拉取范围由 --dates / --start-date+--end-date 决定，--days 不参与；
         # 静默忽略会让"--start-date X --end-date Y --days 1"看起来像只拉一天
         log_once("  提示：补数模式（--dates / --start-date+--end-date）下 --days 不生效")
@@ -184,8 +236,7 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
             base = bizdate
         else:
             from_env = env_bizdate(strict=not getattr(args, "check", False))
-            base = (from_env if from_env is not None
-                    else datetime.now(tz).date() - timedelta(days=1))
+            base = from_env if from_env is not None else datetime.now(tz).date() - timedelta(days=1)
         from_cli = getattr(args, "days", None) is not None
         try:
             if from_cli:
@@ -211,18 +262,15 @@ def check_format_string(fmt: str, field: str = "window.format") -> None:
 
     field 只用于报错文案：同一个白名单也要校验 window.extra_params 的值。
     """
+
     def _check(match: re.Match) -> str:
         char = match.group(1)
         if char in _MODIFIERS:
             raise ConfigError(
-                f"{field} 不支持带修饰符的指令 %{char}…：{fmt!r}；"
-                f"（如 %-d 去零填充只有 glibc 认，Windows 会直接报错）"
+                f"{field} 不支持带修饰符的指令 %{char}…：{fmt!r}；（如 %-d 去零填充只有 glibc 认，Windows 会直接报错）"
             )
         if char not in _STRFTIME_CODES:
-            raise ConfigError(
-                f"{field} 里有不支持的格式指令 %{char}：{fmt!r}；"
-                f"epoch 秒请写 unix 或 %s，毫秒写 unix_ms"
-            )
+            raise ConfigError(f"{field} 里有不支持的格式指令 %{char}：{fmt!r}；epoch 秒请写 unix 或 %s，毫秒写 unix_ms")
         return ""
 
     rest = _DIRECTIVE_RE.sub(_check, str(fmt))
@@ -247,16 +295,16 @@ def _protect_extension(fmt: str, code: str, sentinel: str) -> str:
             out.append(char)
             index += 1
             continue
-        if index + 1 >= length:          # 结尾孤立 %（check_format_string 已拦，兜底不崩）
+        if index + 1 >= length:  # 结尾孤立 %（check_format_string 已拦，兜底不崩）
             out.append(char)
             index += 1
             continue
         nxt = fmt[index + 1]
-        if nxt == "%":                   # %% → 字面量 %
+        if nxt == "%":  # %% → 字面量 %
             out.append("%%")
-        elif nxt == code:                # 未转义的目标指令 → 哨兵
+        elif nxt == code:  # 未转义的目标指令 → 哨兵
             out.append(sentinel)
-        else:                            # 其它指令原样保留（两字符）
+        else:  # 其它指令原样保留（两字符）
             out.append("%" + nxt)
         index += 2
     return "".join(out)
@@ -290,11 +338,18 @@ def format_time(value: datetime, fmt: str):
     p_sentinel = "\x01P\x01"
     protected = _protect_extension(fmt, "s", s_sentinel)
     protected = _protect_extension(protected, "P", p_sentinel)
+    # locale/平台相关指令同样先换成哨兵：交给 strftime 的话，中文/法语环境下 %b 会
+    # 拼出「9月」「sept.」，同一份配置在开发机与调度机上算出不同的参数值
+    locale_free = _locale_free_values(value)
+    substitutions = {s_sentinel: str(int(value.timestamp())), p_sentinel: "am" if value.hour < 12 else "pm"}
+    for code in _LOCALE_DEPENDENT_CODES:
+        sentinel = f"\x01{code}\x01"
+        substitutions[sentinel] = locale_free[code]
+        protected = _protect_extension(protected, code, sentinel)
     out = value.strftime(protected)
-    if s_sentinel in out:
-        out = out.replace(s_sentinel, str(int(value.timestamp())))
-    if p_sentinel in out:
-        out = out.replace(p_sentinel, "am" if value.hour < 12 else "pm")
+    for sentinel, text in substitutions.items():
+        if sentinel in out:
+            out = out.replace(sentinel, text)
     return out
 
 
@@ -310,8 +365,7 @@ def _moment(value: datetime, fmt: str, api_tz) -> str | int:
     return format_time(value, fmt)
 
 
-def _format_window(win: dict, start: datetime, end: datetime,
-                   day: date, last_day: date, tz: ZoneInfo) -> dict:
+def _format_window(win: dict, start: datetime, end: datetime, day: date, last_day: date, tz: ZoneInfo) -> dict:
     """按 api_tz + format 把起止时间转成请求参数字典。
 
     - start_param / end_param：窗口起止（end_param 可省略，如按天+月份查询的接口）；
@@ -330,8 +384,7 @@ def _format_window(win: dict, start: datetime, end: datetime,
             # 日期参数是**闭区间**（startDate/endDate 这种问"哪几天"的接口）：
             # end 取次日 00:00 的日期会多查一天，落进 pt=业务日 就是"9/18 的分区里
             # 混着 9/19 的数据"——和 pt 口径打架（数据不会少，但口径错了）
-            result[str(win["end_param"])] = format_time(
-                datetime.combine(last_day, dtime(0, 0), tzinfo=tz), fmt)
+            result[str(win["end_param"])] = format_time(datetime.combine(last_day, dtime(0, 0), tzinfo=tz), fmt)
         else:
             result[str(win["end_param"])] = _moment(end, fmt, api_tz)
     if win.get("extra_params"):
@@ -372,9 +425,11 @@ def window_param_sets(job: dict, days: list[date]) -> list[dict | None]:
     # 落进 pt=业务日 就是整表错一天。所以这里直接按天级边界算，忽略 pad。
     fmt = str(win.get("format") or DEFAULT_TIME_FORMAT)
     if pad_hours > 0 and is_date_only_format(fmt):
-        log_once(f"  警告：window.format（{fmt}）只到日期，已忽略 pad_hours={pad_hours:g}"
-                 f"（日期参数减 pad 会把日期整体顶到前一天）；"
-                 f"需要跨天余量请把 format 改成带时分的（如 %Y-%m-%d %H:%M:%S）")
+        log_once(
+            f"  警告：window.format（{fmt}）只到日期，已忽略 pad_hours={pad_hours:g}"
+            f"（日期参数减 pad 会把日期整体顶到前一天）；"
+            f"需要跨天余量请把 format 改成带时分的（如 %Y-%m-%d %H:%M:%S）"
+        )
         pad_hours = 0.0
     pad = timedelta(hours=pad_hours)
 
