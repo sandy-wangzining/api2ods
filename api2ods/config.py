@@ -509,16 +509,23 @@ def validate_job(job: dict) -> None:
                 "分页类型 page 必须给 pagination.total_pages_path 或 pagination.total_items_path"
                 "（否则无法判断何时翻完）"
             )
+        # 两个参数同名时：组装请求时 size 会覆盖 page，接口永远收到同一页的请求，
+        # 同一页被反复拉取、再按终点正常收尾——重复行写进 ODS，写后条数校验还自洽
+        if str(pagination.get("page_param") or "") == str(pagination.get("size_param") or ""):
+            raise SystemExit(
+                f"pagination.page_param 与 size_param 不能同名（都是 {pagination.get('page_param')!r}）："
+                f"页大小会覆盖页码参数，接口只会返回同一页，重复行会静默写进 ODS"
+            )
     if page_type == "cursor":
         if not pagination.get("cursor_path"):
             raise SystemExit("分页类型 cursor 必须给 pagination.cursor_path（从返回里取下一页游标的路径）")
-        # 终点字段只在 page 分页里参与判断：cursor 作业写了它等于没写，
-        # 用户以为"配了总数校验"，实际一路照着游标翻（配错游标字段就静默只拉一页）
-        stale = [name for name in ("total_pages_path", "total_items_path") if pagination.get(name)]
-        if stale:
+        if not pagination.get("total_items_path"):
+            # cursor 模式判断"没翻完"的唯一依据就是返回体里的总条数：游标字段改名、
+            # 或接口某页不回游标时，"取不到游标"会被当成"翻完了"，只拉第一页就收尾
+            # （静默少数据、写后条数校验还自洽）。强烈建议配上总数路径
             job.setdefault(_WARNINGS_KEY, []).append(
-                f"pagination.type=cursor 时 {'/'.join(stale)} 不生效（只用 cursor_path 判断何时翻完）；"
-                f"确认是笔误请删掉，想按总数兜底请改用 type=page"
+                "pagination.type=cursor 没配 total_items_path：游标字段写错或接口中途不回游标时，"
+                "会被当成「翻完了」只拉第一页（静默少数据）。建议补上 total_items_path（返回体里总条数的路径）"
             )
     if response_type == "bytes" and page_type != "none":
         raise SystemExit("response_type=bytes（文件类响应）不支持分页，请把 pagination.type 设为 none")

@@ -485,10 +485,26 @@ class Fetcher:
                     log(f"  警告：{message}；pagination.strict=false，按已拉到的 {len(records)} 条收尾")
                     break
             else:  # cursor
+                # 游标模式下也用 total_items_path 兜底：cursor_path 写错、或接口中途不返回游标时，
+                # "取不到游标"会被当成"翻完了"，只拉第一页就收尾——静默少数据、写后校验还自洽
+                # （page 模式有 _unfinished_reason 兜底，cursor 不能没有）
+                raw_items = get_path(payload, total_items_path, default=None) if total_items_path else None
+                marker_items = _positive_int(raw_items)
+                if marker_items is not None:
+                    last_total_items = max(last_total_items or 0, marker_items)
                 next_cursor = get_path(payload, cursor_path, default=None)
                 # 只认 None / 空串为"没有下一页"：0、false、[] 是合法游标值，
                 # 当成结束会提前收尾、静默少数据
                 if next_cursor is None or next_cursor == "":
+                    total_items = last_total_items
+                    if total_items is not None and len(records) < total_items:
+                        message = (
+                            f"{unit.label} 游标已结束，但仍有数据未拉完"
+                            f"（TotalCount={total_items}，已拉 {len(records)} 条）——cursor_path 是否写错？"
+                        )
+                        if strict:
+                            raise RuntimeError(message)
+                        log(f"  警告：{message}；pagination.strict=false，按已拉到的 {len(records)} 条收尾")
                     break
                 cursor = next_cursor
 
