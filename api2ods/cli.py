@@ -321,8 +321,13 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         log("提示：回补天数较多，耗时较长（受接口限速影响）；可 Ctrl+C 中断后重跑（先删再填，重复跑幂等）。")
 
     started = time.time()
-    spool = SpoolWriter()  # 记录边拉边落盘（大数据量不占内存）
-    keep_spool = False  # 失败且 --keep-spool 时保留临时文件排障
+    try:
+        spool = SpoolWriter()  # 记录边拉边落盘（大数据量不占内存）
+    except OSError as exc:
+        # 临时目录不可写/磁盘满：给一句人话，而不是裸 traceback（否则 --log-file 里一个字都没有）
+        log(f"❌ 无法创建落盘临时文件（检查系统临时目录是否可写/磁盘是否已满）：{exc}")
+        return 1
+    keep_spool = bool(args.keep_spool)  # --keep-spool 是用户明确要求：任何失败分支都要生效
     try:
         stats, failures = fetcher.fetch_all(
             days,

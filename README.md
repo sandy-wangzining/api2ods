@@ -139,7 +139,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `base_url` | - | 根地址（必填） |
+| `base_url` | - | 根地址（必填）；**不跟随重定向**——301/302/303 会把 POST 降级成不带 body 的 GET（窗口参数全丢），自定义鉴权头也可能被转发到别的地址；接口返回 3xx 会直接报错并打印 Location，请把地址改成最终地址 |
 | `path` | 空 | 路径；留空表示 base_url 就是完整地址 |
 | `method` | GET | GET / POST / PUT / PATCH / DELETE |
 | `body_type` | json | POST 请求体格式：`json` / `form` |
@@ -207,10 +207,10 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `type` | 自动推断 | `none` / `page` / `cursor`；不写时：有 `cursor_path`→cursor、有 `total_*` 或 `page_param`→page。**只配了 `size_param`/`page_size` 会告警**（没有翻页终点，只会请求一次） |
-| `page_param` / `size_param` / `page_size` / `param_as_string` | page / size / 100 / false | 页码/游标分页用；`size_param` 写 `null` 表示不带页大小参数（接口不认 `size` 时） |
-| `total_pages_path` / `total_items_path` | - | page 分页至少给一个（翻页终点）；两个都给时先满足者停。**只认正数**（`-1`/`0` 这类"未知"哨兵会被忽略），且终点值单调不减（某页只回本页条数也不会提前收尾） |
+| `page_param` / `size_param` / `page_size` / `param_as_string` | page / size / 100 / false | 页码/游标分页用；`size_param` 写 `null` 表示不带页大小参数（接口不认 `size` 时）。**`page_param` 不能与 `size_param` 同名**：同名时页大小会覆盖页码，接口只回同一页、重复行会静默入库 |
+| `total_pages_path` / `total_items_path` | - | page 分页至少给一个（翻页终点）；两个都给时先满足者停。**只认正数**（`-1`/`0` 这类"未知"哨兵会被忽略），且终点值单调不减（某页只回本页条数也不会提前收尾）。cursor 分页也可以用 `total_items_path` 做兜底：游标提前结束但条数没拉够时会报错（防"游标字段写错 → 只拉第一页"） |
 | `strict` | true | 严格模式：空页但 `TotalCount` 没拉够 → 判失败（防静默截断）。接口总数不准才设 `false`，此时按已拉到的收尾并打警告。终点字段只在第一页返回时会被记住并沿用（末页之后的空页不再误判为"无法确认翻完"） |
-| `cursor_param` / `cursor_path` / `cursor_start` | 游标分页；`cursor_start` 写 `""` 表示首页就带上空的游标参数（默认首页不带） |
+| `cursor_param` / `cursor_path` / `cursor_start` | 游标分页；`cursor_start` 写 `""` 表示首页就带上空的游标参数（默认首页不带）。**建议同时配 `total_items_path`**：没配时游标字段写错会被当成"翻完了"只拉第一页（会告警提示） |
 | `delay_seconds` / `max_pages` / `window_retries` | 翻页间隔 / 最大页数保护 / 单窗口失败重试次数 |
 
 ### parse（`response_type=bytes` 时的文件解析）

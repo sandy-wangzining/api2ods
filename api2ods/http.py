@@ -214,7 +214,11 @@ def request_once(
         kwargs["json"] = params
 
     try:
-        response = requests.request(method, url, **kwargs)
+        # allow_redirects=False：requests 默认跟随重定向，而 301/302/303 会把 POST 降级成
+        # **不带 body 的 GET**（窗口/分页参数全丢，接口若回 200 就是一份没有过滤条件的数据
+        # 被当成成功写进当天分区），且自定义鉴权头（X-Api-Key 这类，requests 只清
+        # Authorization）会被原样转发到重定向目标。这两种后果都比"直接失败"危险得多
+        response = requests.request(method, url, allow_redirects=False, **kwargs)
     except (
         requests.exceptions.MissingSchema,
         requests.exceptions.InvalidSchema,
@@ -231,6 +235,15 @@ def request_once(
             f"request.headers / 鉴权配置的值有没有首尾空白、换行或非 latin-1 字符"
         )
     status = response.status_code
+    if 300 <= status < 400:
+        # 不跟随重定向（见上面的说明）：把 Location 报出来让用户直接改成最终地址。
+        # 这里抛 ConfigError（确定性错误、不重试），别让它掉进"网络抖动"的退避里
+        location = redact(str(response.headers.get("Location") or ""))
+        raise ConfigError(
+            f"接口返回重定向 HTTP {status}（Location: {location}）：本工具不跟随重定向——"
+            f"301/302/303 会把 POST 降级成不带 body 的 GET（窗口参数全丢），"
+            f"自定义鉴权头也可能被转发到别的地址。请把 request.base_url 改成最终地址"
+        )
     if status == 429 or 500 <= status < 600:
         raise RetryLater(_retry_after_seconds(response), f"HTTP {status}")
     if 400 <= status < 500:

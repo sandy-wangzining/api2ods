@@ -5817,12 +5817,17 @@ class TestSeventhPassGuardrails(OfflineTestCase):
         for pagination in ({"page_size": 500}, {"size_param": "PageSize"}, {"size_param": "size", "page_size": 100}):
             self.assertTrue(self._warnings(pagination), f"{pagination} 应当告警（只会请求一次）")
 
-    def test_cursor_with_total_path_warns(self):
-        """type=cursor 时 total_* 不生效：明确告警，别让用户以为配了终点校验。"""
-        warnings = self._warnings(
-            {"type": "cursor", "cursor_param": "c", "cursor_path": "next", "total_items_path": "data.total"}
-        )
+    def test_cursor_without_total_path_warns(self):
+        """cursor 模式没配 total_items_path 要告警：游标字段写错/接口中途不回游标时，
+        "取不到游标"会被当成"翻完了"只拉第一页（静默少数据）。配了就真的会兜底校验。"""
+        warnings = self._warnings({"type": "cursor", "cursor_param": "c", "cursor_path": "next"})
         self.assertTrue(any("total_items_path" in w for w in warnings), warnings)
+        self.assertFalse(
+            self._warnings(
+                {"type": "cursor", "cursor_param": "c", "cursor_path": "next", "total_items_path": "data.total"}
+            ),
+            "配了 total_items_path 就不该再告警（它现在是 cursor 模式的兜底校验）",
+        )
 
     def test_pt_must_be_business_day(self):
         """默认路径（target.pt / 业务日）只认 yyyyMMdd：别的形态写进去调度与 DWD 都读不到
@@ -6669,6 +6674,108 @@ class TestNinthPassReview(OfflineTestCase):
         message = str(ctx.exception)
         self.assertIn("UTF-8", message)
         self.assertIn("job.json", message)
+
+
+class TestTenthPassReview(OfflineTestCase):
+    """第十轮复审修复的回归用例：脱敏回溯、cursor 兜底、分页参数同名、range 派生参数、重定向、URL 凭证。"""
+
+    def _fetcher(self, job: dict) -> fetch_mod.Fetcher:
+        return fetch_mod.Fetcher(job, Path("."))
+
+    def test_json_regex_backslash_run_is_fast(self):
+        """反斜杠串不能触发 _JSON_RE 的指数回溯（修复前 38 个反斜杠要 20 秒）。
+
+        触发方是不受控的第三方接口（400 错误体、或 200 但 records_path 不匹配），
+        而 http/parsers 拼错误信息都会先截断到 300 字符——里面能装 ~290 个反斜杠，
+        等于永不返回，且纯 Python 正则期间 Ctrl+C 也打断不了。
+        """
+        text = '{"key":"' + "\\" * 80 + "tail"
+        started = time.perf_counter()
+        out = utils.redact(text)
+        elapsed = time.perf_counter() - started
+        self.assertEqual(out, text)
+        self.assertLess(elapsed, 1.0, f"脱敏耗时 {elapsed:.1f}s，JSON 规则可能又出现回溯爆炸")
+
+    def test_cursor_stops_early_with_total_is_error(self):
+        """cursor 模式配了 total_items_path 时，游标提前结束但总数没拉够 → 报错。
+
+        游标字段写错 / 接口某页不回游标时，"取不到游标"会被当成"翻完了"，
+        只拉第一页就收尾（静默少数据，写后条数校验还自洽）。
+        """
+        job = minimal_job(
+            pagination={
+                "type": "cursor",
+                "cursor_param": "c",
+                "cursor_path": "data.next",
+                "total_items_path": "data.total",
+                "delay_seconds": 0,
+            }
+        )
+        payload = {"data": {"list": [{"id": 1}], "total": 9}}
+        with mock.patch.object(http_mod, "request_once", return_value=payload):
+            with self.assertRaises(RuntimeError) as ctx:
+                self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+        self.assertIn("游标已结束", str(ctx.exception))
+
+    def test_page_and_size_param_same_name_rejected(self):
+        """page_param 与 size_param 同名：页大小会覆盖页码，接口只回同一页（重复行静默入库）。"""
+        job = config_mod.normalize_job(
+            minimal_job(
+                pagination={
+                    "type": "page",
+                    "page_param": "p",
+                    "size_param": "p",
+                    "total_pages_path": "pages",
+                    "page_size": 10,
+                }
+            )
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            config_mod.validate_job(job)
+        self.assertIn("同名", str(ctx.exception))
+
+    def test_range_extra_params_boundary_rejected(self):
+        """range 模式下 extra_params 跨月：整段只发一次请求、派生参数只能取首日的值，
+        后半段数据会静默拉不到——配置阶段直接拦下。"""
+        window = {
+            "mode": "range",
+            "start_param": "startDate",
+            "end_param": "endDate",
+            "format": "%Y-%m-%d",
+            "extra_params": {"BillingCycle": "%Y-%m"},
+        }
+        with self.assertRaises(SystemExit) as ctx:
+            dates_mod.window_param_sets(minimal_job(window=window), [date(2026, 8, 28), date(2026, 9, 3)])
+        self.assertIn("extra_params", str(ctx.exception))
+        # 不跨界的区间、以及 per_day 模式都不受影响
+        dates_mod.window_param_sets(minimal_job(window=window), [date(2026, 8, 28), date(2026, 8, 31)])
+        dates_mod.window_param_sets(
+            minimal_job(window=dict(window, mode="per_day")), [date(2026, 8, 28), date(2026, 9, 3)]
+        )
+
+    def test_redirect_not_followed(self):
+        """3xx 必须失败：跟随重定向会把 POST 降级成无 body 的 GET（窗口参数全丢），
+        自定义鉴权头也会被转发到重定向目标。"""
+        fake_requests = mock.Mock()
+        fake_requests.request.return_value = FakeResponse(
+            status=302, headers={"Location": "https://elsewhere.example/x"}, text=""
+        )
+        with mock.patch.object(http_mod, "requests", fake_requests):
+            with self.assertRaises(utils.ConfigError) as ctx:
+                http_mod.request_once("POST", "http://x", {}, {}, "json", 5, True, True, None)
+        self.assertIn("重定向", str(ctx.exception))
+        self.assertFalse(
+            fake_requests.request.call_args.kwargs.get("allow_redirects", True),
+            "必须显式 allow_redirects=False，否则 requests 会跟随重定向",
+        )
+
+    def test_url_query_secret_collected(self):
+        """URL query 里的凭证（?appkey=xxx）要纳入值级脱敏：requests 的异常消息带完整 URL。"""
+        job = {"request": {"base_url": "https://x/api", "path": "/bill?appkey=LITERAL-APPKEY-1234&start=1"}}
+        values = utils.collect_secret_values(job)
+        self.assertIn("LITERAL-APPKEY-1234", values)
+        out = utils.redact_secrets(values, "Max retries exceeded with url: /bill?appkey=LITERAL-APPKEY-1234&start=1")
+        self.assertNotIn("LITERAL-APPKEY-1234", out)
 
 
 if __name__ == "__main__":

@@ -394,6 +394,31 @@ def _format_window(win: dict, start: datetime, end: datetime, day: date, last_da
     return result
 
 
+def _check_range_extra_params(win: dict, days: list[date], tz) -> None:
+    """range 模式下 extra_params 只按区间首日派生：跨月/跨年会静默少拉数据，直接报配置错。
+
+    per_day 每天各自派生、没有这个问题；range 整段只发一次请求，像 BillingCycle=%Y-%m
+    这样的派生参数只能取首日的值。接口一旦拿它当过滤条件，第一个周期之后的数据就静默
+    拉不到（请求有效、条数 > 0、写后校验还自洽），属于"宁可失败"要拦下的那类。
+    """
+    extra = win.get("extra_params") or {}
+    if not extra or days[0] == days[-1]:
+        return
+    api_tz = load_api_zone(win.get("api_tz"))
+    base_first = datetime.combine(days[0], dtime(0, 0), tzinfo=tz)
+    base_last = datetime.combine(days[-1], dtime(0, 0), tzinfo=tz)
+    for name, extra_fmt in dict(extra).items():
+        first_value = _moment(base_first, str(extra_fmt), api_tz)
+        last_value = _moment(base_last, str(extra_fmt), api_tz)
+        if first_value != last_value:
+            raise ConfigError(
+                f"window.extra_params 的 {name}（{extra_fmt}）在区间 {days[0]} ~ {days[-1]} 上会变"
+                f"（{first_value} → {last_value}）：range 模式整段只发一次请求、派生参数只能取首日的值，"
+                f"后半段数据会静默拉不到。请改用 window.mode=per_day（每天一个请求），"
+                f"或把区间收窄到该参数不跨界的范围"
+            )
+
+
 def window_param_sets(job: dict, days: list[date]) -> list[dict | None]:
     """日期列表 → 每次请求要附加的窗口参数列表（顺序与 days 对应）。
 
@@ -436,6 +461,7 @@ def window_param_sets(job: dict, days: list[date]) -> list[dict | None]:
     if mode == "range":
         start = datetime.combine(days[0], dtime(0, 0), tzinfo=tz) - pad
         end = datetime.combine(days[-1] + timedelta(days=1), dtime(0, 0), tzinfo=tz) + pad
+        _check_range_extra_params(win, days, tz)
         return [_format_window(win, start, end, days[0], days[-1], tz)]
 
     result = []
