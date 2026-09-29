@@ -1,0 +1,73 @@
+{
+  "job": "xmp_facebook",
+  "description": "XMP（Mobvista）Facebook 投放数据：最近 window.days 天（北京日）按 天×Campaign×产品 原样打进 pt=${bizdate} 分区（先删再填）",
+  "//note": "另外两个渠道同款配置：request.params.module 换成 google / tiktok，job/table 换名即可（三渠道三个作业、三张 ODS 表）",
+
+  "//secrets": "密钥直接写这里；作业文件在 .gitignore，别提交/外发",
+  "secrets": {
+    "xmp_client_id": "<XMP Open API Client ID>",
+    "xmp_client_secret": "<XMP Open API Client Secret>"
+  },
+  "maxcompute": {
+    "project": "<项目名>",
+    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "access_key_id": "<阿里云 AccessKeyId>",
+    "access_key_secret": "<阿里云 AccessKeySecret>"
+  },
+
+  "request": {
+    "base_url": "https://xmp-open.mobvista.com",
+    "path": "/v2/media/account/report",
+    "method": "POST",
+    "body_type": "json",
+    "timeout_seconds": 60,
+    "headers": { "Content-Type": "application/json", "Accept-Language": "en-US" },
+    "params": {
+      "dimension": ["date", "campaign_name", "product_name"],
+      "module": "facebook",
+      "metrics": ["cost", "impression", "click", "mobile_app_install"],
+      "currency": "USD"
+    },
+    "auth": {
+      "type": "custom",
+      "module": "signers.py",
+      "func": "xmp_sign",
+      "client_id": "${secrets.xmp_client_id}",
+      "secret": "${secrets.xmp_client_secret}"
+    },
+    "records_path": "data.list",
+    "fail_if": [
+      { "path": "code", "not_equals": 0, "message_path": "msg", "retry": true }
+    ],
+    "retry_times": 5,
+    "retry_delay": 30
+  },
+
+  "window": {
+    "mode": "range",
+    "days": 7,
+    "date_tz": "Asia/Shanghai",
+    "start_param": "start_date",
+    "end_param": "end_date",
+    "format": "%Y-%m-%d"
+  },
+
+  "pagination": {
+    "type": "page",
+    "page_param": "page",
+    "size_param": "page_size",
+    "page_size": 1000,
+    "stop_when_short": true,
+    "delay_seconds": 7,
+    "max_pages": 200
+  },
+
+  "target": {
+    "project": "<项目名>",
+    "table": "ods_xmp_facebook_json_di",
+    "pt": "${bizdate}",
+    "column": "json",
+    "comment": "XMP Facebook 投放明细（天×Campaign×产品×账户，接口原始 JSON）",
+    "allow_empty": false
+  }
+}
