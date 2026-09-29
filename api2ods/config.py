@@ -63,6 +63,7 @@ PAGINATION_KEYS = {
     "param_as_string",
     "total_pages_path",
     "total_items_path",
+    "stop_when_short",
     "strict",
     "cursor_param",
     "cursor_path",
@@ -257,7 +258,8 @@ def normalize_job(job: dict) -> dict:
 
     规则（都只在字段缺失时生效，用户写了就以用户的为准）：
     - pagination：
-        · type 缺失时自动推断：有 cursor_path → cursor；有 total_pages_path/total_items_path/page_param → page；否则 none
+        · type 缺失时自动推断：有 cursor_path → cursor；有 total_pages_path/total_items_path/
+          stop_when_short/page_param → page；否则 none
         · page 类型补默认 page_param=page、size_param=size、page_size=100；cursor 类型补默认 cursor_param=cursor
         · 只写了 size_param/page_size（没写 page_param/终点路径/游标路径）时：不加页码参数、
           只请求一次，等于 none——由 validate_job 给出告警提醒
@@ -275,7 +277,10 @@ def normalize_job(job: dict) -> dict:
             if pagination.get("cursor_path"):
                 page_type = "cursor"
             elif (
-                pagination.get("total_pages_path") or pagination.get("total_items_path") or pagination.get("page_param")
+                pagination.get("total_pages_path")
+                or pagination.get("total_items_path")
+                or pagination.get("stop_when_short")
+                or pagination.get("page_param")
             ):
                 page_type = "page"
             else:
@@ -503,12 +508,33 @@ def validate_job(job: dict) -> None:
             "本次只会请求一次（等于 type=none）；确实要分页请补 page_param + "
             "total_pages_path/total_items_path，或补 cursor_path 用游标分页"
         )
+    stop_when_short = False
+    if "stop_when_short" in pagination:
+        # 布尔开关提前校验：写成 "ture"/"flase" 这类笔误要在配置阶段报错，
+        # 而不是让 fetch 里当成没开、静默回到"只拉一页"的老行为
+        stop_when_short = as_bool(
+            pagination.get("stop_when_short"), default=False, field="pagination.stop_when_short"
+        )
     if page_type == "page":
-        if not (pagination.get("total_pages_path") or pagination.get("total_items_path")):
+        has_total = bool(pagination.get("total_pages_path") or pagination.get("total_items_path"))
+        if stop_when_short and has_total:
+            # 一个说"按接口总数判断翻完"、一个说"按短页判断"：矛盾配置必须拦下，
+            # 否则两条终止逻辑同时挂上，行为随页码推进方式变化、排障时无从判断
             raise SystemExit(
-                "分页类型 page 必须给 pagination.total_pages_path 或 pagination.total_items_path"
-                "（否则无法判断何时翻完）"
+                "pagination.stop_when_short 与 total_pages_path/total_items_path 互斥"
+                "（前者按“本页条数 < page_size”判断翻完，后者按接口给的总数判断，只能二选一）"
             )
+        if not has_total and not stop_when_short:
+            raise SystemExit(
+                "分页类型 page 必须给 pagination.total_pages_path/total_items_path（按接口总数判断翻完），"
+                "或 pagination.stop_when_short=true（接口不返回总数时按“本页条数 < page_size”判断翻完）"
+            )
+    elif stop_when_short:
+        # 只有页码分页有"请求页大小"这个判据；游标/单页配了它等于没写，
+        # 用户以为"配了按短页翻完"，实际一路照游标翻（配错游标字段就静默只拉一页）
+        raise SystemExit(
+            f"pagination.stop_when_short 只在分页类型 page 下生效（当前 type={page_type}）"
+        )
     if page_type == "cursor":
         if not pagination.get("cursor_path"):
             raise SystemExit("分页类型 cursor 必须给 pagination.cursor_path（从返回里取下一页游标的路径）")

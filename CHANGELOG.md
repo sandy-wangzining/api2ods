@@ -2,6 +2,28 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.2.0] - 2026-09-29
+
+### 新增
+
+- **page 分页支持 `pagination.stop_when_short`（接口不返回总数时按短页判断翻完）**：
+  部分接口（如 XMP Open API / Mobvista，`data.list` 返回当前页、没有总页数/总条数）
+  没法用 `total_pages_path`/`total_items_path` 判断终点。开启
+  `"stop_when_short": true` 后：**本页条数 < 请求的 page_size 即判末页**——
+  含首屏空页（该窗口确实无数据，0 行成功收尾）和整页之后的空页（确实没有下一页），
+  不走"空页但无法确认翻完"的严格判罚。
+    - 与 `total_pages_path`/`total_items_path` **互斥**：同时配置在 `validate_job`
+      阶段直接报错（两条终止逻辑同时挂上会让行为不可预期）
+    - 只对 `page` 分页生效：`cursor`/`none` 配了它在配置阶段报错（写了等于没写，
+      容易让用户误以为配好了终点）；布尔值写错（`"flase"`）也在配置阶段拦下
+    - `pagination.type` 自动推断：只写 `stop_when_short`（没写 `page_param`/终点路径）
+      也能推断为 `page`
+    - 假设接口除末页外会按请求的 `page_size` 返回（服务端静默压小页大小的接口
+      不适用；这类接口请用游标分页或 `total_*`）
+- `signers.example.py` 增加 `xmp_sign` 示例（`md5(secret + unix_timestamp)` 签名、
+  `timestamp`/`sign`/`client_id` 每次请求动态重算）；README 的"支持的真实接口形态"
+  表新增 XMP 一行
+
 ## [2.1.7] - 2026-09-23
 
 ### 修复（第九轮复审：16 条，每条都有回归用例）

@@ -351,6 +351,8 @@ class Fetcher:
         终止条件（按优先级）：
         - page：翻到 total_pages_path 指示的末页，或「已累计条数」达到 total_items_path 指示的总数；
           接口回报的条数没拉完却返回空页 → 视为接口抖动，报错触发整窗重试；
+        - page + stop_when_short：接口不返回总数时，本页条数 < 请求的 page_size 即判末页
+          （短页 = 最后一页，含空页；不走"空页但无法确认翻完"的严格判罚）；
         - cursor：返回里取不到下一页游标为止；
         - 任何模式：超过 max_pages 页主动中止（防死循环）。
         """
@@ -389,6 +391,13 @@ class Fetcher:
         # 默认严格：空页但总数没够 = 接口有问题，宁可整窗失败。确实遇到 TotalCount 不准的
         # 接口（数据翻页期间仍在增长）才关掉，关掉后仍会打警告日志留痕
         strict = as_bool(page_cfg.get("strict"), default=True, field="pagination.strict")
+        # 接口不返回总数时的翻页终点：本页条数 < 请求的 page_size 即判末页（短页=最后一页）。
+        # 与 total_pages_path/total_items_path 互斥（validate_job 已拦），这里默认关闭
+        stop_when_short = False
+        if "stop_when_short" in page_cfg:
+            stop_when_short = as_bool(
+                page_cfg.get("stop_when_short"), default=False, field="pagination.stop_when_short"
+            )
 
         effective_page_size = int(_as_number(raw_page_size, 100, "pagination.page_size"))
         if effective_page_size <= 0:
@@ -433,6 +442,13 @@ class Fetcher:
 
             # ③ 判断是否翻完
             if page_type == "page":
+                if stop_when_short and len(page_records) < effective_page_size:
+                    # 短页即末页：接口不返回总数（没有 total_pages_path/total_items_path）时，
+                    # 用「本页条数 < 请求的 page_size」判断翻完。本页为空（0 条 < page_size）
+                    # 同样按己翻完收尾：首屏空页 = 该窗口确实没数据，整页之后的空页 = 确实
+                    # 没有下一页——这正是 stop_when_short 相对 total_* 的语义差异，
+                    # 不走下面那套"空页但无法确认翻完"的 strict 判罚（当页取不到总数可对）
+                    break
                 raw_pages = get_path(payload, total_pages_path, default=None) if total_pages_path else None
                 raw_items = get_path(payload, total_items_path, default=None) if total_items_path else None
                 # 零数据日：接口回"空数组 + 总数 0"，这是在说"这个窗口确实没有数据"，

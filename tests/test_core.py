@@ -184,6 +184,47 @@ class TestValidateJob(OfflineTestCase):
         with self.assertRaises(SystemExit):
             config_mod.validate_job(job)
 
+    def test_page_stop_when_short_ok(self):
+        """接口不返回总数时（如 XMP Open API）用 stop_when_short 按短页翻完，校验放行。"""
+        job = minimal_job()
+        job["pagination"] = {
+            "type": "page",
+            "page_param": "page",
+            "size_param": "page_size",
+            "stop_when_short": True,
+        }
+        config_mod.validate_job(job)
+
+    def test_page_stop_when_short_conflicts_with_total_paths(self):
+        job = minimal_job()
+        job["pagination"] = {
+            "type": "page",
+            "stop_when_short": True,
+            "total_items_path": "data.totalCount",
+        }
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
+    def test_page_stop_when_short_bad_bool_rejected(self):
+        job = minimal_job()
+        job["pagination"] = {"type": "page", "stop_when_short": "flase"}
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
+    def test_cursor_stop_when_short_rejected(self):
+        job = minimal_job()
+        job["pagination"] = {"type": "cursor", "cursor_path": "data.next", "stop_when_short": True}
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
+    def test_stop_when_short_infers_page_type(self):
+        """只写 stop_when_short（没写 page_param/终点路径）时也应推断成 page。"""
+        job = minimal_job()
+        job["pagination"] = {"stop_when_short": True}
+        got = config_mod.normalize_job(job)
+        self.assertEqual(got["pagination"]["type"], "page")
+        self.assertEqual(got["pagination"]["page_param"], "page")
+
     def test_cursor_needs_path(self):
         job = minimal_job()
         job["pagination"] = {"type": "cursor"}
@@ -1227,6 +1268,83 @@ class TestFetcher(OfflineTestCase):
             records = self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
         self.assertEqual([r["id"] for r in records], [1, 2, 3])
         self.assertEqual(calls[0]["current"], "1")
+
+    def test_page_stop_when_short_stops_at_short_page(self):
+        """接口不返回总数（如 XMP）：本页条数 < page_size 即判末页，多页照常翻满。"""
+        job = minimal_job(
+            pagination={
+                "type": "page",
+                "page_param": "page",
+                "size_param": "page_size",
+                "page_size": 2,
+                "stop_when_short": True,
+                "delay_seconds": 0,
+            }
+        )
+        calls = []
+
+        def fake(*args, **kwargs):
+            page = args[2].get("page")
+            calls.append(page)
+            pages = {1: [{"id": 1}, {"id": 2}], 2: [{"id": 3}, {"id": 4}], 3: [{"id": 5}]}
+            return {"data": {"list": pages.get(page, []), "page": page}}
+
+        with mock.patch.object(http_mod, "request_once", side_effect=fake):
+            records = self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+        self.assertEqual([r["id"] for r in records], [1, 2, 3, 4, 5])
+        self.assertEqual(calls, [1, 2, 3])
+
+    def test_page_stop_when_short_exact_multiple_ends_on_empty_page(self):
+        """条数恰好是 page_size 整数倍：末页之后会多一页空页，按短页规则收尾而不是报错。
+
+        默认严格模式没有总数时会把空页视为"无法确认翻完"报错；stop_when_short
+        下空页（0 条 < page_size）就是"没有下一页"，应正常收尾。
+        """
+        job = minimal_job(
+            pagination={
+                "type": "page",
+                "page_param": "page",
+                "size_param": "page_size",
+                "page_size": 2,
+                "stop_when_short": True,
+                "delay_seconds": 0,
+            }
+        )
+        calls = []
+
+        def fake(*args, **kwargs):
+            page = args[2].get("page")
+            calls.append(page)
+            pages = {1: [{"id": 1}, {"id": 2}], 2: [{"id": 3}, {"id": 4}]}
+            return {"data": {"list": pages.get(page, [])}}
+
+        with mock.patch.object(http_mod, "request_once", side_effect=fake):
+            records = self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+        self.assertEqual(len(records), 4)
+        self.assertEqual(calls, [1, 2, 3])
+
+    def test_page_stop_when_short_empty_first_page_is_empty_day(self):
+        """首屏空页 = 该窗口确实没数据：0 条成功收尾，不发第二页、不触发严格报错。"""
+        job = minimal_job(
+            pagination={
+                "type": "page",
+                "page_param": "page",
+                "size_param": "page_size",
+                "page_size": 2,
+                "stop_when_short": True,
+                "delay_seconds": 0,
+            }
+        )
+        calls = []
+
+        def fake(*args, **kwargs):
+            calls.append(args[2].get("page"))
+            return {"data": {"list": []}}
+
+        with mock.patch.object(http_mod, "request_once", side_effect=fake):
+            records = self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+        self.assertEqual(records, [])
+        self.assertEqual(calls, [1])
 
     def test_boolean_total_items_path_does_not_end_pagination_early(self):
         """终点字段指到布尔字段（data.ok: true）时不能当成"总共 1 条"提前收尾。

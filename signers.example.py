@@ -20,3 +20,25 @@ def onerway_sign(ctx: dict) -> dict:
     keys = sorted(k for k in params if k != "sign" and params[k] not in (None, ""))
     text = "".join(str(params[k]) for k in keys) + secret
     return {"params": {"sign": hashlib.sha256(text.encode("utf-8")).hexdigest()}}
+
+
+def xmp_sign(ctx: dict) -> dict:
+    """XMP（Mobvista）Open API 签名：sign = md5(secret + unix 秒时间戳)。
+
+    时间戳每个请求都要现算（复用它会被判 400），所以必须走 custom 逐请求生成，
+    不能写成静态 params。作业配置引用：
+
+        "auth": {"type": "custom", "module": "signers.py", "func": "xmp_sign",
+                 "client_id": "${secrets.xmp_client_id}",
+                 "secret": "${secrets.xmp_client_secret}"}
+    """
+    import time
+
+    request_cfg = ctx["request"]
+    client_id = str(request_cfg.get("client_id") or "")
+    secret = str(request_cfg.get("secret") or "")
+    if not client_id or not secret:
+        raise SystemExit("auth.client_id / auth.secret 未配置（XMP Open API 的 Client ID/Secret）")
+    timestamp = int(time.time())
+    sign = hashlib.md5(f"{secret}{timestamp}".encode()).hexdigest()
+    return {"params": {"client_id": client_id, "timestamp": timestamp, "sign": sign}}
