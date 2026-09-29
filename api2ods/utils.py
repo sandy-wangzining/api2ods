@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote, urlparse
 
 try:
     import fcntl  # Linux / macOS：进程级运行锁
@@ -330,6 +330,10 @@ _SENSITIVE_WORDS = {
     "pw",
     "pass",
     "bearer",
+    # 连写形态：?appkey= / ?appsecret=（无下划线时词切分切不出 "key"，
+    # 切不出就漏遮——CLink 这类接口的凭证就叫 appkey）
+    "appkey",
+    "appsecret",
 }
 _WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
 # 参数名做左边界限制（不用 \b：下划线在正则里算词字符，client_secret 会被漏掉）
@@ -339,7 +343,11 @@ _QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})=([^&\s\"']
 # 值用「回引号」收尾而不是 [^"']*：repr 对「值里含单引号」的串会改用双引号包裹
 # （{'password': "ab'SECRET"}），按"遇到任意引号就停"会在第一个单引号处截断，
 # 引号之后的部分原样漏进日志
-_JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!(?P=q))[\s\S])*)(?P=q)""")
+# 值体里 (?!\\.) 让两个分支互斥：否则 "\x" 既能走 \\.、也能走 [\s\S]，一串反斜杠会让
+# 回溯指数爆炸（实测 38 个反斜杠要 20 秒；而 http/parsers 拼错误信息时会先截断到 300 字符，
+# 里面能装 ~290 个反斜杠 ≈ 永不返回）。触发方是不受控的第三方接口（回一个 400、或 200 但
+# records_path 不匹配），且纯 Python 正则期间 Ctrl+C 也打断不了——必须在正则层面消掉歧义。
+_JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!\\.)(?!(?P=q))[\s\S])*)(?P=q)""")
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
 # URL 里的 userinfo（https://user:pass@host）：代理/接口地址常把账号密码写在地址里，
@@ -454,7 +462,9 @@ def redact(text: str) -> str:
     out = _BEARER_RE.sub(_bearer, out)
     out = _BASIC_RE.sub(_bearer, out)
     out = _URL_AUTH_RE.sub(_url_auth, out)
-    out = _JSON_RE.sub(_json, out)
+    # JSON 片段规则至少要出现引号才可能匹配：没引号的长文本直接跳过，省一遍全量扫描
+    if '"' in out or "'" in out:
+        out = _JSON_RE.sub(_json, out)
     out = _QUERY_RE.sub(_query, out)
     # 头行规则放最后：它最宽松（只要求行首是 name: value），前面几条先处理过更精确的形态
     return _HEADER_RE.sub(_header, out)
@@ -564,6 +574,16 @@ def collect_secret_values(job: dict) -> list[str]:
                 name = str(key).lower()
                 if name in _SECRET_HEADER_KEYS or _is_sensitive_key(name):
                     values += [part for value in _leaf_strings(val) for part in _with_scheme_bare(value)]
+        # URL 里的凭证：--init 会把带 query 的地址原样存进 path，而 requests 的连接类异常
+        # 消息带着完整 URL（实测 "Max retries exceeded with url: /open/api/v2/bill?appkey=..."），
+        # 参数名不在密钥词表里就漏遮了——把 URL query 里命中密钥词的参数值也纳入值级脱敏
+        for key in ("base_url", "path"):
+            query = urlparse(str(request_cfg.get(key) or "")).query
+            if not query:
+                continue
+            for name, value in parse_qsl(query, keep_blank_values=False):
+                if value and _is_sensitive_key(name):
+                    values.append(value)
     maxcompute = job.get("maxcompute")
     if isinstance(maxcompute, dict):
         for key, val in maxcompute.items():

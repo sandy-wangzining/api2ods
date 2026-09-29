@@ -288,7 +288,12 @@ def write_partition(
             ) from exc
         raise
     if total is not None and written != total:
-        raise RuntimeError(f"{table_name} 写入行数异常：计划 {total:,}，实际 {written:,}")
+        # 写入过程本身没报错、但条数与计划不符：分区已经被「先删再填」覆盖过，
+        # 实际内容与预期不一致，必须让调度知道要重跑（与上面重试耗尽那条同一口径）
+        raise RuntimeError(
+            f"{table_name} pt={partition_value} 写入行数异常：计划 {total:,}，实际 {written:,}；"
+            f"分区已被覆盖写清空重填，内容可能与预期不一致，请重跑本作业把该分区补回"
+        )
     return written
 
 
