@@ -328,7 +328,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 481 个离线用例：不访问网络、不连数仓
+python -m unittest discover -s tests -v    # 541 个离线用例：不访问网络、不连数仓
 pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
 ```
 

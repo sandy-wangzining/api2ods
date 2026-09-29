@@ -203,7 +203,7 @@ def _lock_path(job_path: Path) -> Path:
 
 def _redact_job(job: dict, text) -> str:
     """作业上下文下的脱敏：先按配置里的密钥值遮（形态规则盖不住的自由文本回显），
-    再走形态输助。错误只在真出错时走这里，每次重收密钥值的开销可忽略。"""
+    再走形态兜底。错误只在真出错时走这里，每次重收密钥值的开销可忽略。"""
     return redact_secrets(collect_secret_values(job), str(text))
 
 

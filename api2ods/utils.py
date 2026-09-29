@@ -461,7 +461,13 @@ def redact(text: str) -> str:
     out = str(text)
     out = _BEARER_RE.sub(_bearer, out)
     out = _BASIC_RE.sub(_bearer, out)
-    out = _URL_AUTH_RE.sub(_url_auth, out)
+    # URL userinfo 规则必须同时出现 "://" 与 "@" 才可能匹配，先做一次 O(n) 预判：
+    # 它的 [a-z0-9+.\-]* 没有长度上限，在长文本（整段十六进制转储、超长 token）上会在每个
+    # 起始位置贪婪回扫，实测 20KB 就要 10 秒、40KB 要 50 秒，且 C 层正则期间 Ctrl+C 也打断不了。
+    # 其余规则都有 {1,64} 之类的长度上限（实测线性），只有这一条需要预判。
+    # （与 sftp2ods 的同款修复保持一致，见其 utils.redact）
+    if "://" in out and "@" in out:
+        out = _URL_AUTH_RE.sub(_url_auth, out)
     # JSON 片段规则至少要出现引号才可能匹配：没引号的长文本直接跳过，省一遍全量扫描
     if '"' in out or "'" in out:
         out = _JSON_RE.sub(_json, out)
