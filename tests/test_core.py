@@ -5994,6 +5994,19 @@ class TestSeventhPassRedaction(OfflineTestCase):
         self.assertNotIn("SUPERSECRET", utils.redact("https://ak:SUPERSECRET@api.example.com/v1/x"))
         self.assertNotIn("SUPERSECRET", utils.redact("http://user:SUPERSECRET@proxy.example.com:8080"))
 
+    def test_long_text_without_url_auth_skips_costly_scan(self):
+        """URL userinfo 规则没有长度上限，长文本上会 O(n²) 贪婪回扫（40KB hex dump 实测 50 秒）。
+
+        预判（同时含 "://" 与 "@" 才执行该规则）后，不含这两种字符的长文本应近线性。
+        用 200KB 文本做冒烟：无预判时这会卡几十秒，预判后应在几秒内完成（断言只保下限）。
+        """
+        long_text = "abcdef0123456789" * 12000  # ~192KB，无 :// 无 @
+        started = time.time()
+        result = utils.redact(long_text)
+        elapsed = time.time() - started
+        self.assertEqual(result, long_text)
+        self.assertLess(elapsed, 5.0, f"长文本脱敏耗时 {elapsed:.1f}s，疑似退化了（预判失效？）")
+
     def test_quote_inside_value_redacted(self):
         """值里含引号时 repr 会换一种引号包裹：按"遇到任意引号就停"会漏掉引号之后的内容。"""
         self.assertNotIn("SUPERSECRET", utils.redact("""{'password': "ab'SUPERSECRET"}"""))
