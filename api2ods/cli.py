@@ -210,12 +210,12 @@ def _redact_job(job: dict, text) -> str:
     return redact_secrets(collect_secret_values(job), str(text))
 
 
-def _notifier(job: dict, config: dict, args):
-    """构造飞书通知函数：notify 块从 --config 与作业配置合并（作业优先），--no-notify 关闭。
+def _notifier(job: dict, args):
+    """构造飞书通知函数：读合并后的 job.notify（见 main 的 resolve_notify），--no-notify 关闭。
 
     告警发送失败不影响退出码（notify 模块只记日志）；未配 webhook 时静默跳过。
     """
-    cfg = resolve_notify(job, config)
+    cfg = job.get("notify") or {}
     webhook = str(cfg.get("webhook") or "")
     enabled = as_bool(cfg.get("enabled"), default=True, field="notify.enabled") and not args.no_notify
     return lambda title, lines, footer="": notify(webhook, title, lines, footer, enabled=enabled)
@@ -319,7 +319,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     days = resolve_days(args, job, bizdate)
     pagination = job.get("pagination") or {}
     job_name = job.get("job") or job_path.stem
-    notifier = _notifier(job, config, args)
+    notifier = _notifier(job, args)
     footer = f"作业 {job_name} · 目标 {project}.{table_name} · pt={pt}"
 
     # 构造 Fetcher 会读 signers.py（自定义签名）：文件缺失/写错时抛 SystemExit，
@@ -562,6 +562,11 @@ def main(argv: list[str] | None = None) -> int:
         validate_job(job)
         for warning in collect_warnings(job):  # 未知字段告警（拼写错误提示）
             log(f"⚠️ {warning}")
+
+        # notify 合并进 job（作业优先、--config 兜底）：共享 --config 文件里的 webhook
+        # 也要被 collect_secret_values 的值级脱敏收集（它按 job 收集），否则 webhook 裸
+        # hook id 出现在自由文本报错时会漏遮。合并发生在校验之后，空 dict 无副作用
+        job["notify"] = resolve_notify(job, config)
 
         if args.check:
             try:

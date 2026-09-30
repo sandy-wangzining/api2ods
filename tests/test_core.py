@@ -5668,6 +5668,29 @@ class TestMainBranches(OfflineTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(sync.call_args.args[1], {"profiles": {"default": {"project": "from_config"}}})
 
+    def test_config_notify_merged_into_job_for_value_redaction(self):
+        """共享 --config 文件的 notify.webhook 合并进 job：值级脱敏按 job 收集，
+        不合并的话 config 里的 webhook（裸 hook id）在自由文本报错时会漏遮。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            job_file = self._write_job(tmp)
+            config_file = Path(tmp) / "creds.json"
+            config_file.write_text(
+                json.dumps({"notify": {"webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/shared-hook-id"}}),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(cli_mod, "run_sync", return_value=0) as sync,
+                mock.patch.object(cli_mod, "_open_log_file", lambda p: None),
+                mock.patch.object(cli_mod, "_lock_path", lambda p: Path(tmp) / "t.lock"),
+            ):
+                rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260918", "--config", str(config_file)])
+            self.assertEqual(rc, 0)
+            merged = sync.call_args.args[0].get("notify") or {}
+            self.assertIn("shared-hook-id", str(merged.get("webhook") or ""))
+            # 值级脱敏能遮住 config 里的 webhook（模拟 notify 模块对完整 URL 脱敏）
+            secret_values = utils.collect_secret_values(sync.call_args.args[0])
+            self.assertIn("shared-hook-id", secret_values)
+
     def test_bizdate_comes_from_env_when_flag_absent(self):
         """调度里不给 --bizdate 时按环境变量 bizdate 走（DataWorks 的标准用法）。"""
         with tempfile.TemporaryDirectory() as tmp:
