@@ -9,6 +9,7 @@ jobs/*.json
 # 运行时产物
 .run.lock
 .run-locks/
+.field-state/
 __pycache__/
 *.pyc
 *.log

@@ -2,6 +2,17 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.3.1] - 2026-09-30
+
+### 修复
+
+- **`.gitignore` 补上 `.field-state/`**：跑过一次真实任务后，字段快照目录会出现在
+  `git status` 的未跟踪列表里（运行时产物不该进仓库）。
+- **共享 `--config` 文件里的 `notify.webhook` 纳入值级脱敏**：`resolve_notify` 的合并
+  结果现在写回 `job["notify"]`（校验之后），`collect_secret_values` 按 job 收集，
+  于是 config 级 webhook 的裸 hook id 出现在自由文本报错时也能被遮掉（形态级规则
+  只认带 `/hook/` 前缀的 URL）。`_notifier` 相应简化，直接读合并后的 `job.notify`。
+
 ## [2.3.0] - 2026-09-30
 
 ### 功能
