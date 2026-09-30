@@ -39,6 +39,7 @@ from api2ods import cli as cli_mod  # noqa: E402
 from api2ods import config as config_mod  # noqa: E402
 from api2ods import dates as dates_mod  # noqa: E402
 from api2ods import fetch as fetch_mod  # noqa: E402
+from api2ods import fieldwatch as fieldwatch_mod  # noqa: E402
 from api2ods import http as http_mod  # noqa: E402
 from api2ods import (  # noqa: E402
     init_wizard,  # noqa: E402
@@ -46,6 +47,7 @@ from api2ods import (  # noqa: E402
     utils,
 )
 from api2ods import mc as mc_mod  # noqa: E402
+from api2ods import notify as notify_mod  # noqa: E402
 from api2ods import spool as spool_mod  # noqa: E402
 from api2ods.cli import record_to_json  # noqa: E402
 
@@ -88,6 +90,7 @@ def make_args(**overrides):
         cli_profile="",
         sql_timeout=600,
         log_file="",
+        no_notify=False,
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -230,6 +233,39 @@ class TestValidateJob(OfflineTestCase):
         job["pagination"] = {"type": "cursor"}
         with self.assertRaises(SystemExit):
             config_mod.validate_job(job)
+
+    def test_notify_bad_webhook_type(self):
+        job = minimal_job()
+        job["notify"] = {"webhook": 123}
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
+    def test_notify_bad_enabled(self):
+        job = minimal_job()
+        job["notify"] = {"enabled": "flase"}
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
+    def test_notify_unknown_key_warns(self):
+        job = minimal_job()
+        job["notify"] = {"webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/abc1234", "wehbook": "typo"}
+        warnings = config_mod.collect_warnings(job)
+        self.assertTrue(any("notify.wehbook" in item for item in warnings))
+
+    def test_notify_block_must_be_dict(self):
+        job = minimal_job()
+        job["notify"] = [1, 2]
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
+    def test_resolve_notify_merges_with_job_priority(self):
+        merged = config_mod.resolve_notify(
+            {"notify": {"webhook": "job-hook", "enabled": False}},
+            {"notify": {"webhook": "shared-hook", "enabled": True}},
+        )
+        self.assertEqual(merged, {"webhook": "job-hook", "enabled": False})
+        self.assertEqual(config_mod.resolve_notify({}, {"notify": {"webhook": "shared"}}), {"webhook": "shared"})
+        self.assertEqual(config_mod.resolve_notify({}, {}), {})
 
     def test_window_defaults_param_names(self):
         job = minimal_job()
@@ -4005,8 +4041,12 @@ class SyncFlowTestCase(OfflineTestCase):
         # 走和 main 一样的顺序：先替换 ${bizdate} 之类占位符，再补默认值
         self.job = config_mod.normalize_job(config_mod.render_job(minimal_job(), {}, date(2026, 9, 20)))
         config_mod.validate_job(self.job)
-        self.job_path = Path(tempfile.gettempdir()) / "demo.json"
-        self.config_path = Path(tempfile.gettempdir()) / "config.json"
+        # 每用例一个独立目录：字段快照（.field-state/）会落在 job_path 旁边，
+        # 用系统 temp 共享路径会让快照串到别的用例（还要人工清理）
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.job_path = Path(self._tmp.name) / "demo.json"
+        self.config_path = Path(self._tmp.name) / "config.json"
 
         # fetch_all 默认成功但不产生记录，各用例按需覆盖
         patcher = mock.patch.object(self.cli.Fetcher, "fetch_all", side_effect=lambda *a, **kw: ({}, []))
@@ -6907,6 +6947,141 @@ class TestTenthPassReview(OfflineTestCase):
         self.assertIn("LITERAL-APPKEY-1234", values)
         out = utils.redact_secrets(values, "Max retries exceeded with url: /bill?appkey=LITERAL-APPKEY-1234&start=1")
         self.assertNotIn("LITERAL-APPKEY-1234", out)
+
+
+@unittest.skipUnless(_REQUESTS_AVAILABLE, "没装 requests")
+class TestNotifyModule(OfflineTestCase):
+    """api2ods.notify：发卡片、禁用/缺 webhook 跳过、失败不抛且不透出 hook id。"""
+
+    def test_skip_when_disabled_or_missing_webhook(self):
+        self.assertFalse(notify_mod.notify("", "t", ["x"]))
+        self.assertFalse(notify_mod.notify("https://x/hook/abc", "t", ["x"], enabled=False))
+
+    def test_success_payload(self):
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"code": 0}
+        with mock.patch.object(notify_mod.requests, "post", return_value=resp) as post:
+            ok = notify_mod.notify("https://open.feishu.cn/open-apis/bot/v2/hook/abc1234", "标题", ["行1"], footer="脚注")
+        self.assertTrue(ok)
+        card = post.call_args.kwargs["json"]
+        self.assertEqual(card["msg_type"], "interactive")
+        self.assertIn("标题", card["card"]["header"]["title"]["content"])
+        self.assertIn("行1", card["card"]["elements"][0]["text"]["content"])
+
+    def test_failure_does_not_raise_and_redacts_hook_id(self):
+        messages: list[str] = []
+        hook = "https://open.feishu.cn/open-apis/bot/v2/hook/deadbeef00cafe"
+        with mock.patch.object(notify_mod.requests, "post", side_effect=RuntimeError(f"Max retries: {hook}")), \
+                mock.patch.object(notify_mod, "log", side_effect=lambda msg: messages.append(str(msg))):
+            self.assertFalse(notify_mod.notify(hook, "t", ["x"]))
+        joined = "\n".join(messages)
+        self.assertIn("飞书通知发送失败", joined)
+        self.assertNotIn("deadbeef00cafe", joined)
+
+
+class TestFieldWatch(OfflineTestCase):
+    """字段快照：观察并集、读写往返、同名不同作业互不串。"""
+
+    def test_observer_union(self):
+        observer = fieldwatch_mod.FieldObserver()
+        observer.update([{"a": 1}, {"b": 2, "a": 3}])
+        observer.update([{"c": 4}])
+        self.assertEqual(observer.fields, {"a", "b", "c"})
+
+    def test_snapshot_roundtrip_and_corrupt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp) / "demo.json"
+            self.assertIsNone(fieldwatch_mod.load_snapshot(job))
+            fieldwatch_mod.save_snapshot(job, ["b", "a"], "demo")
+            self.assertEqual(fieldwatch_mod.load_snapshot(job), {"a", "b"})
+            fieldwatch_mod.snapshot_path(job).write_text("{broken", encoding="utf-8")
+            self.assertIsNone(fieldwatch_mod.load_snapshot(job))
+
+    def test_same_named_jobs_do_not_share_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "a" / "task.json"
+            second = Path(tmp) / "b" / "task.json"
+            first.parent.mkdir()
+            second.parent.mkdir()
+            fieldwatch_mod.save_snapshot(first, ["x"], "task")
+            self.assertEqual(fieldwatch_mod.load_snapshot(first), {"x"})
+            self.assertIsNone(fieldwatch_mod.load_snapshot(second))
+
+
+class TestNotifyRedaction(OfflineTestCase):
+    """webhook 是凭证：裸 hook id 纳入值级脱敏，/hook/<id> 形态也要遮。"""
+
+    def test_webhook_hook_id_collected(self):
+        job = {"notify": {"webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/0123abcd-0000-4ef0"}}
+        self.assertIn("0123abcd-0000-4ef0", utils.collect_secret_values(job))
+
+    def test_redact_masks_hook_id_shape(self):
+        text = "Max retries exceeded with url: /open-apis/bot/v2/hook/deadbeefcafe (Caused by ...)"
+        self.assertNotIn("deadbeefcafe", utils.redact(text))
+
+
+class TestRunSyncFieldDrift(SyncFlowTestCase):
+    """run_sync：新增字段不阻塞、发提醒一次、快照只在写库成功后更新。"""
+
+    def _sync(self, records, **overrides):
+        self.counted.return_value = len(records)
+        with mock.patch.object(self.cli, "notify") as notifier:
+            code = self.run_sync(records=records, **overrides)
+        return code, notifier
+
+    def test_new_fields_notify_and_snapshot_update(self):
+        base = {"record_id": "r1", "amount": "$1"}
+        code, notifier = self._sync([base])
+        self.assertEqual(code, 0)
+        notifier.assert_not_called()  # 首次运行没有基线，不提醒
+
+        code, notifier = self._sync([{**base, "coupon": "x"}])
+        self.assertEqual(code, 0)
+        notifier.assert_called_once()
+        title, lines = notifier.call_args.args[1], notifier.call_args.args[2]
+        self.assertIn("新增字段", title)
+        self.assertIn("coupon", "\n".join(lines))
+
+        code, notifier = self._sync([{**base, "coupon": "x"}])  # 快照已更新，不再提醒
+        self.assertEqual(code, 0)
+        notifier.assert_not_called()
+
+    def test_dry_run_notifies_but_keeps_snapshot(self):
+        base = {"record_id": "r1"}
+        self._sync([base])
+        code, notifier = self._sync([{**base, "extra": "1"}], dry_run=True)
+        self.assertEqual(code, 0)
+        notifier.assert_called_once()
+        # dry-run 不落盘快照：下次正式跑仍会提醒（人工确认前不消音）
+        code, notifier = self._sync([{**base, "extra": "1"}])
+        self.assertEqual(code, 0)
+        notifier.assert_called_once()
+
+    def test_no_notify_flag_suppresses_but_still_calls_disabled(self):
+        base = {"record_id": "r1"}
+        self._sync([base])
+        code, notifier = self._sync([{**base, "extra": "1"}], no_notify=True)
+        self.assertEqual(code, 0)
+        notifier.assert_called_once()
+        self.assertFalse(notifier.call_args.kwargs["enabled"])
+
+    def test_fetch_failure_skips_notify_and_snapshot(self):
+        base = {"record_id": "r1"}
+        self._sync([base])
+
+        def failing(days, workers=1, window_retries=2, on_records=None):
+            on_records([{**base, "extra": "1"}])
+            return {}, [("2026-09-20", "接口超时")]
+
+        before = fieldwatch_mod.load_snapshot(self.job_path)
+        with mock.patch.object(self.cli.Fetcher, "fetch_all", side_effect=failing), \
+                mock.patch.object(self.cli, "notify") as notifier:
+            code = self.cli.run_sync(
+                self.job, {}, self.config_path, make_args(), date(2026, 9, 20), self.job_path
+            )
+        self.assertEqual(code, 1)
+        notifier.assert_not_called()
+        self.assertEqual(fieldwatch_mod.load_snapshot(self.job_path), before)
 
 
 if __name__ == "__main__":

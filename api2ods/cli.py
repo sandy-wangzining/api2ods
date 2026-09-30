@@ -20,7 +20,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import VERSION
+from . import VERSION, fieldwatch
 from .config import (
     build_context_doc,
     check_block_types,
@@ -29,6 +29,7 @@ from .config import (
     load_json_file,
     normalize_job,
     render_job,
+    resolve_notify,
     resolve_target,
     validate_job,
 )
@@ -45,6 +46,7 @@ from .mc import (
     verify_target_schema,
     write_partition,
 )
+from .notify import notify
 from .spool import SpoolWriter, dump_record
 from .utils import (
     FatalApiError,
@@ -125,6 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"单条 MaxCompute SQL 最长等待秒数，默认 {SQL_TIMEOUT_SECONDS}；0 表示不限制",
     )
     parser.add_argument("--log-file", default="", help="日志同时写一份到该文件（追加，UTF-8）")
+    parser.add_argument("--no-notify", action="store_true", help="不发任何飞书通知（如新增字段提醒）")
     parser.add_argument("--version", action="version", version=f"api2ods {VERSION}")
     return parser
 
@@ -205,6 +208,17 @@ def _redact_job(job: dict, text) -> str:
     """作业上下文下的脱敏：先按配置里的密钥值遮（形态规则盖不住的自由文本回显），
     再走形态兜底。错误只在真出错时走这里，每次重收密钥值的开销可忽略。"""
     return redact_secrets(collect_secret_values(job), str(text))
+
+
+def _notifier(job: dict, config: dict, args):
+    """构造飞书通知函数：notify 块从 --config 与作业配置合并（作业优先），--no-notify 关闭。
+
+    告警发送失败不影响退出码（notify 模块只记日志）；未配 webhook 时静默跳过。
+    """
+    cfg = resolve_notify(job, config)
+    webhook = str(cfg.get("webhook") or "")
+    enabled = as_bool(cfg.get("enabled"), default=True, field="notify.enabled") and not args.no_notify
+    return lambda title, lines, footer="": notify(webhook, title, lines, footer, enabled=enabled)
 
 
 def _job_summary(job: dict) -> list[str]:
@@ -304,6 +318,9 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     target_cfg = job.get("target") or {}
     days = resolve_days(args, job, bizdate)
     pagination = job.get("pagination") or {}
+    job_name = job.get("job") or job_path.stem
+    notifier = _notifier(job, config, args)
+    footer = f"作业 {job_name} · 目标 {project}.{table_name} · pt={pt}"
 
     # 构造 Fetcher 会读 signers.py（自定义签名）：文件缺失/写错时抛 SystemExit，
     # 不要让它变成裸 traceback（--check 走的是同一条路，所以那边一直是干净的）
@@ -328,12 +345,18 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         log(f"❌ 无法创建落盘临时文件（检查系统临时目录是否可写/磁盘是否已满）：{exc}")
         return 1
     keep_spool = bool(args.keep_spool)  # --keep-spool 是用户明确要求：任何失败分支都要生效
+    observer = fieldwatch.FieldObserver()  # 字段漂移检测：逐批并集，内存只跟字段数有关
+
+    def _on_records(records):
+        observer.update(records)
+        spool.write_records(records)
+
     try:
         stats, failures = fetcher.fetch_all(
             days,
             workers=max(1, args.workers),
             window_retries=_as_count(pagination.get("window_retries"), 2, "pagination.window_retries"),
-            on_records=spool.write_records,
+            on_records=_on_records,
         )
 
         # ① 拉取阶段：任一单元失败 → 放弃写库（旧分区保持原样，重跑即可）
@@ -350,6 +373,25 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             f"拉取完成：{spool.count:,} 条记录，约 {spool.bytes / 1024 / 1024:.2f} MB，"
             f"耗时 {(time.time() - started) / 60:.1f} 分钟"
         )
+
+        # 字段漂移检测：与上次成功运行的快照对比，出现新字段只提醒、不阻塞（json 列原样落库）。
+        # 失败单元已提前 return（此时并集可能不完整）；--dry-run 也提醒，但不落盘快照。
+        snapshot = fieldwatch.load_snapshot(job_path)
+        new_fields = sorted(observer.fields - snapshot) if snapshot is not None else []
+        if new_fields:
+            shown = "、".join(f"`{name}`" for name in new_fields)
+            log(f"⚠️ 接口记录出现 {len(new_fields)} 个新增字段：{shown}（已照常入库，如需使用请更新 DWD 提取口径）")
+            notifier(
+                f"{job_name}：接口出现新增字段",
+                [
+                    f"**新增字段**：{shown}（共 {len(new_fields)} 个）",
+                    f"**本次窗口**：{days[0]} ~ {days[-1]}",
+                    "数据已照常写入 ODS（json 原样保留、新字段自动包含，无需改表）。请人工确认：",
+                    "① 需要的话更新 DWD 的 `get_json_object` 提取逻辑；",
+                    "② 若字段来自接口异常/拼写变化，核对上游或调整作业配置。",
+                ],
+                footer,
+            )
 
         if args.dry_run:
             log(f"--dry-run：不写库。将写入 {project}.{table_name} pt={pt}（{spool.count:,} 行）")
@@ -423,6 +465,9 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             keep_spool = args.keep_spool
             log(f"❌ 写库失败：{_redact_job(job, exc)}")
             return 1
+
+        # 写库成功后才更新字段快照（与"台账只在写成功后记账"一致；失败/中断不更新，下次重报）
+        fieldwatch.save_snapshot(job_path, observer.fields, job_name)
 
         log(f"校验通过：pt={pt} 共 {actual:,} 行")
         log(f"全部完成（总耗时 {(time.time() - started) / 60:.1f} 分钟）。")

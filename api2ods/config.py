@@ -32,6 +32,7 @@ JOB_KEYS = {
     "pagination",
     "parse",
     "target",
+    "notify",
 }
 REQUEST_KEYS = {
     "base_url",
@@ -86,6 +87,7 @@ PARSE_KEYS = {
     "allow_single_record",
 }
 TARGET_KEYS = {"project", "table", "column", "pt", "comment", "allow_empty", "profile", "stored_as", "lifecycle_days"}
+NOTIFY_KEYS = {"webhook", "enabled"}
 
 _PLACEHOLDER_RE = re.compile(r"\$\{([^}]+)\}")
 # 校验阶段产生的告警（如 pagination 推断）挂在 job 上，由 collect_warnings 取走并清空。
@@ -230,11 +232,11 @@ def render_job(job_raw: dict, config: dict, bizdate: date) -> dict:
     job = {key: value for key, value in job_raw.items() if key != "secrets"}
     rendered = deep_substitute(job, context)
     rendered["secrets"] = _as_secrets(job_raw.get("secrets"), "作业配置的 secrets")
-    # --config 文件自己的 maxcompute/profiles 也参与替换：共享凭证常写成
+    # --config 文件自己的 maxcompute/profiles/notify 也参与替换：共享凭证常写成
     # {"maxcompute": {"access_key_id": "${secrets.ak}"}}（secrets 就在同一份文件里），
     # 只渲染作业文件会让它原样带着 ${...} 去连 MaxCompute（鉴权失败还看不出原因）。
     # 原地更新：config 是调用方的运行时字典，取值方随后直接读它；替换本身幂等
-    for block in ("maxcompute", "profiles"):
+    for block in ("maxcompute", "profiles", "notify"):
         if isinstance(config.get(block), dict):
             config[block] = deep_substitute(config[block], context)
     return rendered
@@ -247,7 +249,7 @@ def check_block_types(job: dict) -> None:
     `normalize_job` 会 `dict(job["pagination"])`——两者拿到字符串都是
     `'str' object has no attribute 'get'` / "dictionary update sequence" 这种裸 traceback。
     """
-    for block in ("window", "pagination", "parse", "target", "request"):
+    for block in ("window", "pagination", "parse", "target", "request", "notify"):
         value = job.get(block)
         if value is not None and not isinstance(value, dict):
             raise ConfigError(f"作业配置的 {block} 必须是对象（键值对），实际 {type(value).__name__}：{_show(value)}")
@@ -329,6 +331,8 @@ def collect_warnings(job: dict) -> list[str]:
     _check_unknown_keys(job.get("pagination") or {}, PAGINATION_KEYS, "pagination", warnings)
     _check_unknown_keys(job.get("parse") or {}, PARSE_KEYS, "parse", warnings)
     _check_unknown_keys(job.get("target") or {}, TARGET_KEYS, "target", warnings)
+    if isinstance(job.get("notify"), dict):
+        _check_unknown_keys(job["notify"], NOTIFY_KEYS, "notify", warnings)
     return warnings
 
 
@@ -381,6 +385,12 @@ def validate_job(job: dict) -> None:
             raise SystemExit(
                 f"作业配置的 profiles.{key} 必须是对象（键值对），实际 {type(value).__name__}：{_show(value)}"
             )
+    notify_cfg = job.get("notify") or {}
+    webhook = notify_cfg.get("webhook")
+    if webhook is not None and not isinstance(webhook, str):
+        raise SystemExit(f"notify.webhook 必须是字符串（飞书群机器人地址），实际 {type(webhook).__name__}：{_show(webhook)}")
+    if "enabled" in notify_cfg:
+        as_bool(notify_cfg.get("enabled"), default=True, field="notify.enabled")
     if request.get("add_fields") is not None and not isinstance(request["add_fields"], dict):
         raise SystemExit('request.add_fields 必须是对象（如 {"source_account": "账号A"}）')
     # 这两处写错类型会在发请求时才崩：headers 写成数组是 AttributeError，
@@ -632,6 +642,18 @@ def _backfill_without_bizdate(args) -> bool:
     dates = str(getattr(args, "dates", "") or "").strip()
     window = str(getattr(args, "start_date", "") or "").strip() or str(getattr(args, "end_date", "") or "").strip()
     return (dates or window) and not explicit_pt and not anchored
+
+
+def resolve_notify(job: dict, config: dict) -> dict:
+    """合并通知配置：--config 文件的 notify 作默认，作业级 notify 覆盖同键。
+
+    返回 {"webhook": ..., "enabled": ...}（可能为空 = 不发通知）；由 CLI 构造告警函数。
+    """
+    merged: dict = {}
+    for source in (config.get("notify"), job.get("notify")):
+        if isinstance(source, dict):
+            merged.update(source)
+    return merged
 
 
 def resolve_target(job: dict, config: dict, args, bizdate: date) -> tuple[str, str, str, str]:

@@ -358,6 +358,10 @@ _URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@")
 # 值要吃到行尾：只吃第一个词的话，"Authorization: Token abc…" 会变成 "*** abc…"
 # （凭证明文留下）；整行遮掉最安全，行边界由 (?m) 的 ^/$ 兜住
 _HEADER_RE = re.compile(r"(?im)^(\s*([A-Za-z0-9_.\-]{1,64})\s*[:=]\s*)(.+)$")
+# 飞书 webhook 形态：open.feishu.cn/open-apis/bot/v2/hook/<id>；scheme 部分可选——
+# requests 的异常消息里只带 URL 的路径（"Max retries exceeded with url: /open-apis/..."），
+# 这时靠这个规则兜底，别让 hook id 明文进日志
+_WEBHOOK_RE = re.compile(r"(?i)((?:https?://[^\s\"']*?)?/hook/)[A-Za-z0-9\-_]{4,}")
 
 
 def _is_sensitive_key(name) -> bool:
@@ -410,6 +414,10 @@ def redact(text: str) -> str:
     def _url_auth(match: re.Match) -> str:
         """URL 里的 userinfo：只留账号，密码换掉（scheme://user:***@host）。"""
         return f"{match.group(1)}:***@"
+
+    def _webhook(match: re.Match) -> str:
+        """飞书 webhook：保留 /hook/ 路径，hook id（凭证）换掉。"""
+        return f"{match.group(1)}***"
 
     def _json(match: re.Match) -> str:
         """JSON/配置片段里的 "key": "value"：只吃字符串值，保留引号结构。"""
@@ -468,6 +476,7 @@ def redact(text: str) -> str:
     # （与 sftp2ods 的同款修复保持一致，见其 utils.redact）
     if "://" in out and "@" in out:
         out = _URL_AUTH_RE.sub(_url_auth, out)
+    out = _WEBHOOK_RE.sub(_webhook, out)
     # JSON 片段规则至少要出现引号才可能匹配：没引号的长文本直接跳过，省一遍全量扫描
     if '"' in out or "'" in out:
         out = _JSON_RE.sub(_json, out)
@@ -549,13 +558,28 @@ def _with_scheme_bare(value: str) -> list[str]:
     return [value]
 
 
+# 飞书 webhook 里的 hook id（/hook/<id>）：报错/日志里常只出现后半截
+_WEBHOOK_ID_RE = re.compile(r"/hook/([A-Za-z0-9\-_]{4,})")
+
+
+def _webhook_values(value) -> list[str]:
+    """webhook 除整条 URL 外，再收集裸 hook id（形态脱敏认 URL，裸 id 要靠值级遮）。"""
+    result: list[str] = []
+    for part in _leaf_strings(value):
+        result.append(part)
+        match = _WEBHOOK_ID_RE.search(part)
+        if match:
+            result.append(match.group(1))
+    return result
+
+
 def collect_secret_values(job: dict) -> list[str]:
     """收集作业配置里"可能被接口回显"的密钥字面量，按值脱敏的输入。
 
     形态识别（redact）盖不住接口把凭证写进**自由文本**的报错（如
     `Invalid token: sk-xxx`），但这类回显的内容必然是请求里用过的凭证，而凭证就
     躺在这几处配置里：job.secrets、request.auth 的凭证字段、request.headers 的
-    密钥头、maxcompute 的 access key。收集出来按值替换即可。
+    密钥头、maxcompute 的 access key、notify.webhook（hook id 即凭证）。
     返回值已去重并按从长到短排序：短值先替会把长密钥切成半截、留下可辨认的碎片。
     """
     if not isinstance(job, dict):
@@ -595,6 +619,9 @@ def collect_secret_values(job: dict) -> list[str]:
         for key, val in maxcompute.items():
             if _is_sensitive_key(str(key)):
                 values += _leaf_strings(val)
+    notify_cfg = job.get("notify")
+    if isinstance(notify_cfg, dict):
+        values += _webhook_values(notify_cfg.get("webhook"))
     cleaned = (value.strip() for value in values)
     return sorted({value for value in cleaned if len(value) >= _SECRET_MIN_LEN}, key=len, reverse=True)
 
