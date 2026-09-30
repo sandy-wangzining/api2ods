@@ -156,5 +156,11 @@
     "//lifecycle_days": "可选：表生命周期天数；不写表示不设置",
     "allow_empty": false,
     "//allow_empty": "true 时本次 0 行也会清空并写空分区（默认 false，防误清空）"
+  },
+
+  "notify": {
+    "//": "可选：字段漂移等提醒的飞书群机器人（也可放共享 --config 文件的 notify 块，作业级覆盖）",
+    "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/<id>",
+    "enabled": true
   }
 }
