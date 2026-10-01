@@ -388,7 +388,9 @@ def validate_job(job: dict) -> None:
     notify_cfg = job.get("notify") or {}
     webhook = notify_cfg.get("webhook")
     if webhook is not None and not isinstance(webhook, str):
-        raise SystemExit(f"notify.webhook 必须是字符串（飞书群机器人地址），实际 {type(webhook).__name__}：{_show(webhook)}")
+        raise SystemExit(
+            f"notify.webhook 必须是字符串（飞书群机器人地址），实际 {type(webhook).__name__}：{_show(webhook)}"
+        )
     if "enabled" in notify_cfg:
         as_bool(notify_cfg.get("enabled"), default=True, field="notify.enabled")
     if request.get("add_fields") is not None and not isinstance(request["add_fields"], dict):
@@ -522,9 +524,7 @@ def validate_job(job: dict) -> None:
     if "stop_when_short" in pagination:
         # 布尔开关提前校验：写成 "ture"/"flase" 这类笔误要在配置阶段报错，
         # 而不是让 fetch 里当成没开、静默回到"只拉一页"的老行为
-        stop_when_short = as_bool(
-            pagination.get("stop_when_short"), default=False, field="pagination.stop_when_short"
-        )
+        stop_when_short = as_bool(pagination.get("stop_when_short"), default=False, field="pagination.stop_when_short")
     if page_type == "page":
         has_total = bool(pagination.get("total_pages_path") or pagination.get("total_items_path"))
         if stop_when_short and has_total:
@@ -549,9 +549,7 @@ def validate_job(job: dict) -> None:
     elif stop_when_short:
         # 只有页码分页有"请求页大小"这个判据；游标/单页配了它等于没写，
         # 用户以为"配了按短页翻完"，实际一路照游标翻（配错游标字段就静默只拉一页）
-        raise SystemExit(
-            f"pagination.stop_when_short 只在分页类型 page 下生效（当前 type={page_type}）"
-        )
+        raise SystemExit(f"pagination.stop_when_short 只在分页类型 page 下生效（当前 type={page_type}）")
     if page_type == "cursor":
         if not pagination.get("cursor_path"):
             raise SystemExit("分页类型 cursor 必须给 pagination.cursor_path（从返回里取下一页游标的路径）")

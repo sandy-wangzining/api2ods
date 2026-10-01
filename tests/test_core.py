@@ -18,6 +18,7 @@ import hmac
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -68,6 +69,13 @@ class OfflineTestCase(unittest.TestCase):
         patcher = mock.patch.object(time, "sleep", lambda *_args, **_kwargs: None)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # 运行锁默认落在仓库根的 .run-locks/：单测用的临时作业路径每次哈希都不同，
+        # 锁文件会无限累积（生产行为不变，这里只把锁根目录重定向到临时目录并在收尾清理）
+        lock_root = tempfile.mkdtemp(prefix="api2ods-test-locks-")
+        self.addCleanup(shutil.rmtree, lock_root, ignore_errors=True)
+        lock_patcher = mock.patch.object(cli_mod, "ROOT", Path(lock_root))
+        lock_patcher.start()
+        self.addCleanup(lock_patcher.stop)
 
 
 def make_args(**overrides):
@@ -2386,7 +2394,11 @@ class TestInitWizard(OfflineTestCase):
         ask = self._answers(mapping, ["1", "1", "1", "0"])
         with tempfile.TemporaryDirectory() as tmp:
             code = init_wizard.run_init(
-                out_path=str(Path(tmp) / "demo_api.json"), ask=ask, echo=lambda *a: None, workdir=Path(tmp)
+                out_path=str(Path(tmp) / "demo_api.json"),
+                ask=ask,
+                ask_secret=ask,
+                echo=lambda *a: None,
+                workdir=Path(tmp),
             )
             self.assertEqual(code, 0)
             job = json.loads((Path(tmp) / "demo_api.json").read_text(encoding="utf-8"))
@@ -2408,7 +2420,7 @@ class TestInitWizard(OfflineTestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             code = init_wizard.run_init(
-                out_path=str(Path(tmp) / "x.json"), ask=ask, echo=lambda *a: None, workdir=Path(tmp)
+                out_path=str(Path(tmp) / "x.json"), ask=ask, ask_secret=ask, echo=lambda *a: None, workdir=Path(tmp)
             )
         self.assertEqual(code, 1)
         self.assertFalse((Path(tmp) / "x.json").exists())
@@ -2420,7 +2432,11 @@ class TestInitWizard(OfflineTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / name
             code = init_wizard.run_init(
-                out_path=str(path), ask=ask, echo=lambda *a: out.append(" ".join(str(x) for x in a)), workdir=Path(tmp)
+                out_path=str(path),
+                ask=ask,
+                ask_secret=ask,
+                echo=lambda *a: out.append(" ".join(str(x) for x in a)),
+                workdir=Path(tmp),
             )
             content = path.read_text(encoding="utf-8") if path.exists() else None
         return code, content, "\n".join(out)
@@ -2635,7 +2651,7 @@ class TestInitWizard(OfflineTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(RuntimeError) as ctx:
                 init_wizard.run_init(
-                    out_path=str(Path(tmp) / "w.json"), ask=ask, echo=lambda *a: None, workdir=Path(tmp)
+                    out_path=str(Path(tmp) / "w.json"), ask=ask, ask_secret=ask, echo=lambda *a: None, workdir=Path(tmp)
                 )
         self.assertIn("向导内部 bug", str(ctx.exception))
 
@@ -2648,7 +2664,11 @@ class TestInitWizard(OfflineTestCase):
         out = []
         with tempfile.TemporaryDirectory() as tmp:
             code = init_wizard.run_init(
-                out_path=str(Path(tmp) / "w.json"), ask=ask, echo=lambda *a: out.append(str(a[0])), workdir=Path(tmp)
+                out_path=str(Path(tmp) / "w.json"),
+                ask=ask,
+                ask_secret=ask,
+                echo=lambda *a: out.append(str(a[0])),
+                workdir=Path(tmp),
             )
         self.assertEqual(code, 1)
         self.assertIn("需要在终端里交互运行", "\n".join(out))
@@ -2662,7 +2682,9 @@ class TestInitWizard(OfflineTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "w.json"
             with mock.patch.object(init_wizard, "os", fake_os):
-                code = init_wizard.run_init(out_path=str(path), ask=ask, echo=lambda *a: None, workdir=Path(tmp))
+                code = init_wizard.run_init(
+                    out_path=str(path), ask=ask, ask_secret=ask, echo=lambda *a: None, workdir=Path(tmp)
+                )
         self.assertEqual(code, 0)
         fake_os.chmod.assert_called_once_with(path, 0o600)
 
@@ -2671,7 +2693,9 @@ class TestInitWizard(OfflineTestCase):
         mapping = {"API 完整地址": "https://a.example.com/x", "AccessKeyId": "A", "AccessKeySecret": "S"}
         ask = self._answers(mapping, ["0", "0", "0", "0"])
         with tempfile.TemporaryDirectory() as tmp:
-            code = init_wizard.run_init(out_path="out/w.json", ask=ask, echo=lambda *a: None, workdir=Path(tmp))
+            code = init_wizard.run_init(
+                out_path="out/w.json", ask=ask, ask_secret=ask, echo=lambda *a: None, workdir=Path(tmp)
+            )
             self.assertEqual(code, 0)
             self.assertTrue((Path(tmp) / "out" / "w.json").is_file())
 
@@ -2715,7 +2739,11 @@ class TestInitWizard(OfflineTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "w.json"
             code = init_wizard.run_init(
-                out_path=str(path), ask=ask, echo=lambda *a: out.append(" ".join(str(x) for x in a)), workdir=Path(tmp)
+                out_path=str(path),
+                ask=ask,
+                ask_secret=ask,
+                echo=lambda *a: out.append(" ".join(str(x) for x in a)),
+                workdir=Path(tmp),
             )
             job = json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
         self.assertEqual(code, 0)
@@ -2730,6 +2758,49 @@ class TestInitWizard(OfflineTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(content)["job"], "my_api")
         self.assertIn("已替换为下划线", output)
+
+    def test_secret_prompts_go_through_unhidden_entry(self):
+        """token / 密码 / AccessKeySecret 等密钥类问答走 ask_secret（默认 getpass，不回显）；
+        普通问答仍走 ask。原来一律走 input()，密钥明文回显在终端。"""
+        plain, secret = [], []
+        choices = iter(["1", "0", "0", "0"])  # 鉴权=Bearer、翻页=无、窗口=无、返回=JSON
+
+        def ask(prompt=""):
+            plain.append(prompt)
+            if "请选择编号" in prompt:
+                return next(choices, "")
+            if "API 完整地址" in prompt:
+                return "https://api.example.com/v1/items"
+            if "AccessKeyId" in prompt:
+                return "AKID"
+            return ""
+
+        def ask_secret(prompt=""):
+            secret.append(prompt)
+            return "hidden-value"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "w.json"
+            code = init_wizard.run_init(
+                out_path=str(path), ask=ask, ask_secret=ask_secret, echo=lambda *a: None, workdir=Path(tmp)
+            )
+            job = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(code, 0)
+        # 密钥类问题确实走了不回显入口
+        self.assertTrue(any("Token 的值" in p for p in secret))
+        self.assertTrue(any("AccessKeySecret" in p for p in secret))
+        # 普通问题没有落到密钥入口
+        self.assertFalse(any("AccessKeySecret" in p for p in plain))
+        self.assertFalse(any("Token 的值" in p for p in plain))
+        self.assertEqual(job["request"]["auth"]["token"], "hidden-value")
+        self.assertEqual(job["maxcompute"]["access_key_secret"], "hidden-value")
+        self.assertEqual(job["maxcompute"]["access_key_id"], "AKID")
+
+    def test_default_secret_entry_uses_getpass(self):
+        """不注入 ask_secret 时，默认的密钥入口是 getpass（不回显）。"""
+        with mock.patch.object(init_wizard.getpass, "getpass", return_value="hidden") as gp:
+            self.assertEqual(init_wizard._default_ask_secret("密码："), "hidden")
+        gp.assert_called_once_with("密码：")
 
 
 # =============================================================================
@@ -3230,6 +3301,14 @@ class TestRunLock(OfflineTestCase):
         second = _lock_path(Path("jobs/aliyun.json"))
         self.assertNotEqual(first, second)
         self.assertTrue(first.name.startswith("onerway-") and first.suffix == ".lock")
+
+    def test_lock_path_is_redirected_to_temp_in_tests(self):
+        """单测把运行锁根目录重定向到临时目录：跑测试不会在仓库 .run-locks/ 里
+        无限累积锁文件（临时作业路径每次哈希都不同）。生产行为不变。"""
+        repo_root = Path(cli_mod.__file__).resolve().parents[1]
+        self.assertNotEqual(cli_mod.ROOT, repo_root)
+        self.assertTrue(cli_mod.ROOT.is_relative_to(Path(tempfile.gettempdir())))
+        self.assertTrue(cli_mod._lock_path(Path("jobs/demo.json")).is_relative_to(cli_mod.ROOT))
 
     def test_same_stem_in_different_dirs_gets_different_locks(self):
         """jobs/a/api.json 与 jobs/b/api.json 是两份不同作业，共用一个锁会互相阻塞。"""
@@ -3881,7 +3960,12 @@ class TestFourthPassReview(OfflineTestCase):
         output: list[str] = []
         path = Path(tempfile.mkdtemp()) / "wizard.json"
         try:
-            code = init_wizard.run_init(out_path=str(path), ask=lambda prompt="": next(answers, ""), echo=output.append)
+            code = init_wizard.run_init(
+                out_path=str(path),
+                ask=lambda prompt="": next(answers, ""),
+                ask_secret=lambda prompt="": next(answers, ""),
+                echo=output.append,
+            )
             self.assertEqual(code, 0)
             self.assertTrue(any("不是有效选项" in line for line in output))
         finally:
@@ -3944,7 +4028,12 @@ class TestThirdPassReview(OfflineTestCase):
         output: list[str] = []
         path = Path(tempfile.mkdtemp()) / "wizard.json"
         try:
-            code = init_wizard.run_init(out_path=str(path), ask=lambda prompt="": next(answers, ""), echo=output.append)
+            code = init_wizard.run_init(
+                out_path=str(path),
+                ask=lambda prompt="": next(answers, ""),
+                ask_secret=lambda prompt="": next(answers, ""),
+                echo=output.append,
+            )
             self.assertEqual(code, 0)
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["window"]["days"], 30)
             self.assertTrue(any("不是整数" in line for line in output))
@@ -3979,7 +4068,12 @@ class TestThirdPassReview(OfflineTestCase):
         output: list[str] = []
         path = Path(tempfile.mkdtemp()) / "wizard.json"
         try:
-            code = init_wizard.run_init(out_path=str(path), ask=lambda prompt="": next(answers, ""), echo=output.append)
+            code = init_wizard.run_init(
+                out_path=str(path),
+                ask=lambda prompt="": next(answers, ""),
+                ask_secret=lambda prompt="": next(answers, ""),
+                echo=output.append,
+            )
             self.assertEqual(code, 0)
             job = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(job["window"]["days"], 7)
@@ -4344,6 +4438,26 @@ class TestMainEntry(OfflineTestCase):
 
     def test_missing_job_returns_2(self):
         self.assertEqual(self._main([]), 2)
+
+    def test_sql_timeout_negative_is_arg_error(self):
+        """负数 --sql-timeout：在 argparse 阶段就报错（退出码 2），一个请求都不发起。"""
+        import api2ods.cli as cli_mod
+
+        with self.assertRaises(SystemExit) as ctx:
+            cli_mod.build_parser().parse_args(["--sql-timeout", "-5"])
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_sql_timeout_zero_and_positive_ok(self):
+        import api2ods.cli as cli_mod
+
+        self.assertEqual(cli_mod.build_parser().parse_args(["--sql-timeout", "0"]).sql_timeout, 0)
+        self.assertEqual(cli_mod.build_parser().parse_args(["--sql-timeout", "30"]).sql_timeout, 30)
+
+    def test_sql_timeout_default(self):
+        import api2ods.cli as cli_mod
+        from api2ods.mc import SQL_TIMEOUT_SECONDS
+
+        self.assertEqual(cli_mod.build_parser().parse_args([]).sql_timeout, SQL_TIMEOUT_SECONDS)
 
     def test_bad_bizdate_format_reports_day(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -5741,7 +5855,7 @@ class TestMainBranches(OfflineTestCase):
         """--init 的提问也走日志（--log-file 里能看到整套问答），但回答不落盘（可能是密钥）。"""
         captured = {}
 
-        def fake_run_init(out, ask=None, echo=None):
+        def fake_run_init(out, ask=None, echo=None, ask_secret=None):
             # 在 main 内部（仍在 with 块里）调一次真实的提问回调：验证问题进日志、回答不落盘
             captured.update(out=out, answer=ask("① 作业名"))
             return 0
@@ -5773,6 +5887,41 @@ class TestMainBranches(OfflineTestCase):
         self.assertIn("① 作业名", logged)  # 问题进日志：没有日志时像卡死
         self.assertNotIn("demo", logged)  # 回答不进日志：答案里可能是密钥
         self.assertNotIn(handle, utils._sinks)  # 句柄已摘掉，同一进程重复调用不串
+
+    def test_init_secret_prompt_goes_through_getpass(self):
+        """--init 的密钥提问走 getpass（不回显）：回答不落日志，问题仍留痕。"""
+        captured = {}
+
+        def fake_run_init(out, ask=None, echo=None, ask_secret=None):
+            captured["answer"] = ask_secret("   Token 的值（输入不回显）")
+            return 0
+
+        class Recorder:
+            def __init__(self):
+                self.lines = []
+
+            def write(self, text):
+                self.lines.append(text)
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        handle = Recorder()
+        with (
+            mock.patch.object(cli_mod, "_open_log_file", lambda p: handle),
+            mock.patch.object(init_wizard, "run_init", side_effect=fake_run_init),
+            mock.patch("getpass.getpass", return_value="hidden-token") as gp,
+        ):
+            rc = cli_mod.main(["--init", "--init-out", "jobs/demo.json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(captured["answer"], "hidden-token")
+        gp.assert_called_once_with("")  # 空 prompt：问题已经由 log() 打过，getpass 不再重复回显
+        logged = "".join(handle.lines)
+        self.assertIn("Token 的值", logged)  # 问题进日志
+        self.assertNotIn("hidden-token", logged)  # 密钥不进日志
 
     def test_ctrl_c_before_sync_exits_130(self):
         """准备阶段（还没进 run_sync）被 Ctrl+C：走同一个硬退出出口，退出码 130。"""
@@ -5818,6 +5967,7 @@ class TestMainBranches(OfflineTestCase):
             code = init_wizard.run_init(
                 out_path=str(path),
                 ask=lambda prompt="": next(answers, ""),
+                ask_secret=lambda prompt="": next(answers, ""),
                 echo=lambda *a: output.append(" ".join(str(x) for x in a)),
                 workdir=Path(tmp),
             )
@@ -6209,7 +6359,7 @@ class TestSeventhPassInitAndLock(OfflineTestCase):
         ask = TestInitWizard._answers(mapping, ["1", "1", "1", "0"])
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit) as ctx:
-                init_wizard.run_init(out_path=tmp, ask=ask, echo=lambda *a: None, workdir=Path(tmp))
+                init_wizard.run_init(out_path=tmp, ask=ask, ask_secret=ask, echo=lambda *a: None, workdir=Path(tmp))
         self.assertIn("--init-out", str(ctx.exception))
 
     def test_lock_path_unwritable_is_friendly(self):
@@ -6431,6 +6581,25 @@ class TestEighthPassReview(OfflineTestCase):
         # 短值（<4）不参与值级替换：否则 "SEC" 会把别的密钥切成 "***RET-…"，
         # 既没遮住又搅乱报错信息；收集入口也会先滤掉
         self.assertEqual(utils.redact_secrets(["SEC"], "dup SECRET-abc123"), "dup SECRET-abc123")
+
+    def test_redact_secrets_masks_url_encoded_forms(self):
+        """凭证以 URL 编码形态落进自由文本时也要遮：明文 / quote / quote_plus 三种形态一起替。
+
+        接口/工具把凭证写进没有键名的自由文本时，形态规则挡不住；只替明文会漏，
+        编码后的凭证（token 里的空格/斜杠被转义）会原样进日志。
+        """
+        secret = "SECRET value/with+plus"
+        encoded = urllib.parse.quote(secret, safe="")
+        encoded_plus = urllib.parse.quote_plus(secret)
+        # 三种形态确实互不相同，用例才有意义
+        self.assertNotIn(secret, (encoded, encoded_plus))
+        self.assertNotEqual(encoded, encoded_plus)
+        text = f"plain={secret} quote={encoded} plus={encoded_plus}"
+        out = utils.redact_secrets([secret], text)
+        self.assertNotIn(secret, out)
+        self.assertNotIn(encoded, out)
+        self.assertNotIn(encoded_plus, out)
+        self.assertEqual(out.count("***"), 3)
 
     def test_cli_job_redaction_masks_free_text_secret(self):
         """CLI 出口（run_check / run_sync / 外层 SystemExit）用作业上下文脱敏。"""
@@ -6984,7 +7153,9 @@ class TestNotifyModule(OfflineTestCase):
         resp = mock.Mock(status_code=200)
         resp.json.return_value = {"code": 0}
         with mock.patch.object(notify_mod.requests, "post", return_value=resp) as post:
-            ok = notify_mod.notify("https://open.feishu.cn/open-apis/bot/v2/hook/abc1234", "标题", ["行1"], footer="脚注")
+            ok = notify_mod.notify(
+                "https://open.feishu.cn/open-apis/bot/v2/hook/abc1234", "标题", ["行1"], footer="脚注"
+            )
         self.assertTrue(ok)
         card = post.call_args.kwargs["json"]
         self.assertEqual(card["msg_type"], "interactive")
@@ -6994,8 +7165,10 @@ class TestNotifyModule(OfflineTestCase):
     def test_failure_does_not_raise_and_redacts_hook_id(self):
         messages: list[str] = []
         hook = "https://open.feishu.cn/open-apis/bot/v2/hook/deadbeef00cafe"
-        with mock.patch.object(notify_mod.requests, "post", side_effect=RuntimeError(f"Max retries: {hook}")), \
-                mock.patch.object(notify_mod, "log", side_effect=lambda msg: messages.append(str(msg))):
+        with (
+            mock.patch.object(notify_mod.requests, "post", side_effect=RuntimeError(f"Max retries: {hook}")),
+            mock.patch.object(notify_mod, "log", side_effect=lambda msg: messages.append(str(msg))),
+        ):
             self.assertFalse(notify_mod.notify(hook, "t", ["x"]))
         joined = "\n".join(messages)
         self.assertIn("飞书通知发送失败", joined)
@@ -7097,11 +7270,11 @@ class TestRunSyncFieldDrift(SyncFlowTestCase):
             return {}, [("2026-09-20", "接口超时")]
 
         before = fieldwatch_mod.load_snapshot(self.job_path)
-        with mock.patch.object(self.cli.Fetcher, "fetch_all", side_effect=failing), \
-                mock.patch.object(self.cli, "notify") as notifier:
-            code = self.cli.run_sync(
-                self.job, {}, self.config_path, make_args(), date(2026, 9, 20), self.job_path
-            )
+        with (
+            mock.patch.object(self.cli.Fetcher, "fetch_all", side_effect=failing),
+            mock.patch.object(self.cli, "notify") as notifier,
+        ):
+            code = self.cli.run_sync(self.job, {}, self.config_path, make_args(), date(2026, 9, 20), self.job_path)
         self.assertEqual(code, 1)
         notifier.assert_not_called()
         self.assertEqual(fieldwatch_mod.load_snapshot(self.job_path), before)
