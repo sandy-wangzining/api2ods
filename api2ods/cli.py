@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import hashlib
 import os
 import sys
@@ -69,6 +70,22 @@ def record_to_json(record) -> str:
     return dump_record(record)
 
 
+def _sql_timeout_arg(value: str) -> int:
+    """--sql-timeout 参数校验：非负整数。
+
+    负数在 run_sql_with_timeout 里会被当成"0=不限制"，与用户直觉相反（想调小却等成无限）；
+    与 sftp2ods 的口径一致——负数属于命令行参数问题，在 argparse 阶段就报错（退出码 2，
+    一个请求都不发起），而不是把未定义的值原样交给 pyodps。
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"必须是整数（0 表示不限制），实际 {value!r}") from None
+    if number < 0:
+        raise argparse.ArgumentTypeError(f"不能为负（0 表示不限制），实际 {number}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     """命令行参数定义（help 文案就是用户文档的第一入口，改参数时同步改 README）。"""
     parser = argparse.ArgumentParser(
@@ -122,7 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cli-profile", default="", help="aliyun CLI profile 名（本机调试凭证兜底，默认 current）")
     parser.add_argument(
         "--sql-timeout",
-        type=int,
+        type=_sql_timeout_arg,
         default=SQL_TIMEOUT_SECONDS,
         help=f"单条 MaxCompute SQL 最长等待秒数，默认 {SQL_TIMEOUT_SECONDS}；0 表示不限制",
     )
@@ -517,10 +534,22 @@ def main(argv: list[str] | None = None) -> int:
             log(prompt)
             return input()
 
+        def _wizard_ask_secret(prompt: str = "") -> str:
+            """密钥类提问：问题同样走 log（留痕），回答走 getpass 不回显。
+
+            不回显是为了密钥不进终端 scrollback，也不被 `script` / 录屏抄走——原来走
+            input() 时密钥明文回显在终端上。无 tty 等读不到隐藏输入的场景退回 input()。
+            """
+            log(prompt)
+            try:
+                return getpass.getpass("")
+            except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
+                return input()
+
         try:
             # echo 也走 log()：带时间戳、写完即 flush（原来用 print，提示语会被输入缓冲
             # 压住、看着像卡死），且切不到 UTF-8 的控制台会降级成可替换字符而不是崩掉
-            return run_init(args.init_out, ask=_wizard_ask, echo=log)
+            return run_init(args.init_out, ask=_wizard_ask, echo=log, ask_secret=_wizard_ask_secret)
         finally:
             _detach_log_sink(log_handle)
 

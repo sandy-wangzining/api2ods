@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import re
@@ -45,6 +46,18 @@ def _ask(ask, prompt: str, default: str = "") -> str:
     hint = f"（默认 {default}）" if default else ""
     answer = str(ask(f"{prompt}{hint}：") or "").strip()
     return answer or default
+
+
+def _default_ask_secret(prompt: str = "") -> str:
+    """密钥类输入：走 getpass 不回显（终端 scrollback / 录屏 / `script` 录制都拿不到明文）。
+
+    环境不支持隐藏输入（无 tty 等）时退回普通 input——不能因为读不到密钥就让向导不可用；
+    与 feishu2ods.host_key 同口径。
+    """
+    try:
+        return getpass.getpass(prompt)
+    except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
+        return input(prompt)
 
 
 def _ask_choice(ask, prompt: str, choices: tuple, default: str = "0", echo=print) -> str:
@@ -85,12 +98,14 @@ def _split_url(raw: str) -> tuple[str, str] | None:
     return base, path
 
 
-def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = None) -> int:
+def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = None, ask_secret=None) -> int:
     """交互式生成作业配置，返回退出码（0 成功 / 1 取消）。
 
     默认输出到「当前目录/jobs/<作业名>.json」——无论是在源码目录还是 pip 安装后运行都合理。
+    ask_secret(prompt) -> str：密钥类输入默认用 getpass（不回显）；单元测试可注入假实现（离线跑）。
     """
     root = Path(workdir) if workdir else Path.cwd()
+    ask_secret = ask_secret or _default_ask_secret
     try:
         echo("=== api2ods 配置向导（直接回车用默认值；随时 Ctrl+C 取消）===")
         echo("")
@@ -138,26 +153,26 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         if auth_choice == "0":
             auth = {"type": "none"}
         elif auth_choice == "1":
-            token = _ask(ask, "   Token 的值（直接粘贴）")
+            token = _ask(ask_secret, "   Token 的值（输入不回显）")
             auth = {"type": "bearer", "token": token}
         elif auth_choice == "2":
             header = _ask(ask, "   请求头名字", "X-Api-Key")
-            value = _ask(ask, "   Token/Key 的值")
+            value = _ask(ask_secret, "   Token/Key 的值（输入不回显）")
             auth = {"type": "token", "header": header, "value": value}
         elif auth_choice == "3":
             name = _ask(ask, "   URL 参数名", "token")
-            value = _ask(ask, "   Token 的值")
+            value = _ask(ask_secret, "   Token 的值（输入不回显）")
             auth = {"type": "query", "params": {name: value}}
         elif auth_choice == "4":
             username = _ask(ask, "   用户名")
-            password = _ask(ask, "   密码")
+            password = _ask(ask_secret, "   密码（输入不回显）")
             auth = {"type": "basic", "username": username, "password": password}
         elif auth_choice == "5":
             ak = _ask(ask, "   AccessKeyId")
-            sk = _ask(ask, "   AccessKeySecret")
+            sk = _ask(ask_secret, "   AccessKeySecret（输入不回显）")
             auth = {"type": "aliyun_rpc", "access_key_id": ak, "access_key_secret": sk}
         elif auth_choice == "6":
-            secret = _ask(ask, "   商户密钥（Secret key）")
+            secret = _ask(ask_secret, "   商户密钥（Secret key，输入不回显）")
             sign_field = _ask(ask, "   签名字段名", "sign")
             auth = {"type": "sha256_concat", "secret_key": secret, "sign_field": sign_field, "sign_in": "body"}
         else:
@@ -282,7 +297,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         project = _ask(ask, "⑨ 项目名", "my_project")
         table = _ask(ask, "   表名（建议 <层级>_<业务域>_<过程>_json_di）", f"ods_{job_name}_json_di")
         ak = _ask(ask, "   阿里云 AccessKeyId")
-        sk = _ask(ask, "   阿里云 AccessKeySecret")
+        sk = _ask(ask_secret, "   阿里云 AccessKeySecret（输入不回显）")
         endpoint = _ask(ask, "   endpoint", DEFAULT_ENDPOINT)
 
         # ---------------------------------------------------------- ⑧ 组装并写出
