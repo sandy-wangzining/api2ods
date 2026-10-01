@@ -19,10 +19,11 @@ python3 -m venv venv
 ```bash
 python -m unittest discover -s tests -v   # 全部用例：不访问网络、不连数仓
 ruff check .                              # 代码检查（配置在 pyproject.toml，当前 0 告警）
+ruff format .                             # 统一格式（ruff 锁 ==0.16.9；CI 跑 ruff format --check，提交前先格式化）
 ```
 
 - 测试**必须离线可跑**：不许依赖真实 API、真实 MaxCompute、本机特定的文件（CI 会在
-  ubuntu / windows / macos × Python 3.9 / 3.12 六种组合上跑同一套用例）。
+  ubuntu / windows / macos × Python 3.9 ~ 3.14 上跑同一套用例）。
 - 需要外部资源时用 `unittest.mock` 打桩；需要作业文件时在 `tempfile.TemporaryDirectory()`
   里现写一份，**不要引用 `jobs/*.json`**（真实作业文件含密钥，不入库）。
 - 改动涉及数据完整性判定（分页终点、写前校验、行数核对）时，请补上"改之前会失败"的回归用例
@@ -53,13 +54,13 @@ ruff check .                              # 代码检查（配置在 pyproject.t
 - 中文注释与日志（目标用户是国内数仓同学），注释解释**为什么**，不复述代码在做什么。
 - 每个模块头部写清职责；对外函数写 docstring，说明参数含义与失败行为。
 - 行宽 120；`ruff` 配置只选"能发现真问题"的规则（`E4/E7/E9/F/W/I/UP`），
-  风格类规则故意没开——不用为了对齐风格改代码。
+  风格类规则故意没开——格式统一交给 `ruff format`（CI 有 `--check` 门禁），lint 不重复管风格。
 - 不引入新依赖：核心只用 `requests` + `pyodps`。确有必要的依赖请先在 Issue 里讨论。
 
 ## 提交 PR
 
 1. 从 `main` 切分支，一个 PR 做一件事；
-2. 本地跑通 `python -m unittest discover -s tests` 与 `ruff check .`；
+2. 本地跑通 `python -m unittest discover -s tests`、`ruff check .` 与 `ruff format --check .`；
 3. PR 描述里写清：**为什么改**（复现步骤 / 影响的作业）、**怎么验证的**；
 4. 涉及行为变化或修 bug 的，同步更新 `CHANGELOG.md`（修 bug 说明"原来会怎样、现在怎样"）；
 5. 涉及配置项/命令行参数的，同步更新 `README.md` 与 `jobs/_template_full.example.json`

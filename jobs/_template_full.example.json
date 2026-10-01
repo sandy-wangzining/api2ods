@@ -107,7 +107,7 @@
     "//param_as_string": "页码/页大小是否需要按字符串传（有些接口要求 true，如 Onerway）",
     "total_pages_path": "data.totalPages",
     "total_items_path": "data.totalCount",
-    "//total": "page 分页至少要给一个：总页数或总条数路径；两个都给时以先满足者为准",
+    "//total": "page 分页至少要给一个：总页数或总条数路径；两个都给时以已拉条数为准（页数说翻完、条数没拉够会继续翻）",
     "cursor_param": "cursor",
     "cursor_path": "data.nextCursor",
     "cursor_start": null,
@@ -137,7 +137,7 @@
     "entry_field": "__file",
     "//strict_encoding": "true 时解码失败直接报错；默认 false（解出乱码打警告，仍按替换字符解析，建议打开）",
     "//allow_multi_entry": "ZIP 里有多个文件且没写 entry_contains 时是否允许全部解析；默认 false（报错提醒）",
-    "//entry_field": "给每条记录加一列来源文件名（DWD 可区分）；只在 unzip=true 时生效，与 entry_field 同时要开着 unzip"
+    "//entry_field": "给每条记录加一列来源文件名（DWD 可区分）；只在 unzip=true 时生效（用 entry_field 就必须开着 unzip）"
   },
 
   "target": {

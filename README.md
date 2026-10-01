@@ -1,7 +1,7 @@
 # api2ods
 
 [![tests](https://github.com/sandy-wangzining/api2ods/actions/workflows/tests.yml/badge.svg)](https://github.com/sandy-wangzining/api2ods/actions/workflows/tests.yml)
-[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12-blue)](https://github.com/sandy-wangzining/api2ods/blob/main/pyproject.toml)
+[![Python](https://img.shields.io/badge/python-3.9%20%7C%203.10%20%7C%203.11%20%7C%203.12%20%7C%203.13%20%7C%203.14-blue)](https://github.com/sandy-wangzining/api2ods/blob/main/pyproject.toml)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/sandy-wangzining/api2ods/blob/main/LICENSE)
 
 **通用 REST API → MaxCompute ODS 同步工具**：把任意 HTTP 接口返回的 JSON / CSV / ZIP 记录
@@ -51,7 +51,7 @@ Windows / macOS / Linux 通用；Windows 会自动带上 `tzdata` 依赖（时�
 ## 三分钟上手
 
 ```bash
-# 1) 生成一份作业配置（交互式问答，密钥直接写进文件；也可复制 jobs/_template_simple.example.json 手工改）
+# 1) 生成一份作业配置（交互式问答，密钥直接写进文件、输入时不回显；也可复制 jobs/_template_simple.example.json 手工改）
 api2ods --init
 
 # 2) 体检：配置 + 真实请求一次 + 目标表结构（新接源第一步，报错会给线索）
@@ -72,7 +72,7 @@ api2ods --job jobs/my_api.json --bizdate ${bizdate} --no-notify                 
 api2ods --job jobs/my_api.json --bizdate 20260920 --start-date 2026-07-01 --end-date 2026-09-20
 api2ods --job jobs/my_api.json --bizdate 20260920 --dates 2026-09-01,2026-09-05   # 补零散日期
 
-# 补数月份多的时候并发拉（--workers 只并行网络等待，写库仍是单线程、顺序不变）
+# 补数月份多的时候并发拉（--workers 只并行网络等待，写库仍是单线程，按各单元完成顺序落盘）
 api2ods --job jobs/my_api.json --bizdate 20260920 --start-date 2026-07-01 --end-date 2026-09-20 --workers 3
 ```
 
@@ -199,9 +199,9 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 >
 > **统一口径**：本仓库现有作业一律 `date_tz: America/New_York`（数仓按美东）。
 > `date_tz` 只管两件事——不带 `--bizdate` 时的默认业务日、以及窗口起止怎么切成“一天”；
-> `pt` 永远是业务日 `bizdate` 本身。`format` 只到日期时（阿里云 `BillingDate`）
-> 它**完全不影响**发给接口的参数，改它只是让配置口径统一；
-> `format` 带时分秒 / `unix` 时（DeepSeek）它决定窗口的实际起止，换时区会改变
+> `pt` 永远是业务日 `bizdate` 本身。`format` 只到日期时（阿里云 `BillingDate`），
+> `date_tz` **完全不影响**发给接口的参数，改它只是让配置口径统一；
+> `format` 带时分秒 / `unix` 时（DeepSeek），`date_tz` 决定窗口的实际起止，换时区会改变
 > 每个 `pt` 里装的是哪段时间（同一 `pt` 的内容整体平移，不影响 `count` 校验）。
 
 ### pagination（分页，不写=单页）
@@ -210,7 +210,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 |---|---|---|
 | `type` | 自动推断 | `none` / `page` / `cursor`；不写时：有 `cursor_path`→cursor、有 `total_*` 或 `stop_when_short` 或 `page_param`→page。**只配了 `size_param`/`page_size` 会告警**（没有翻页终点，只会请求一次） |
 | `page_param` / `size_param` / `page_size` / `param_as_string` | page / size / 100 / false | 页码/游标分页用；`size_param` 写 `null` 表示不带页大小参数（接口不认 `size` 时）。**`page_param` 不能与 `size_param` 同名**：同名时页大小会覆盖页码，接口只回同一页、重复行会静默入库 |
-| `total_pages_path` / `total_items_path` | - | page 分页至少给一个（翻页终点）；两个都给时先满足者停。**只认正数**（`-1`/`0` 这类"未知"哨兵会被忽略），且终点值单调不减（某页只回本页条数也不会提前收尾）。cursor 分页也可以用 `total_items_path` 做兜底：游标提前结束但条数没拉够时会报错（防"游标字段写错 → 只拉第一页"） |
+| `total_pages_path` / `total_items_path` | - | page 分页至少给一个（翻页终点）；两个都给时以条数终点为准（页数说翻完、条数没拉够就继续翻，宁可多翻一页也不静默少拉）。**只认正数**（`-1`/`0` 这类"未知"哨兵会被忽略），且终点值单调不减（某页只回本页条数也不会提前收尾）。cursor 分页也可以用 `total_items_path` 做兜底：游标提前结束但条数没拉够时会报错（防"游标字段写错 → 只拉第一页"） |
 | `stop_when_short` | false | 接口不返回总数时用：**本页条数 < `page_size` 即判末页**（含首屏空页=窗口无数据、整页后空页=没有下一页）。与 `total_*` **互斥**、只对 `type=page` 生效，配置阶段报错兜底。假设接口除末页外按请求的 `page_size` 返回 |
 | `strict` | true | 严格模式：空页但 `TotalCount` 没拉够 → 判失败（防静默截断）。接口总数不准才设 `false`，此时按已拉到的收尾并打警告。终点字段只在第一页返回时会被记住并沿用（末页之后的空页不再误判为"无法确认翻完"） |
 | `cursor_param` / `cursor_path` / `cursor_start` | 游标分页；`cursor_start` 写 `""` 表示首页就带上空的游标参数（默认首页不带）。**建议同时配 `total_items_path`**：没配时游标字段写错会被当成"翻完了"只拉第一页（会告警提示） |
@@ -268,6 +268,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
    | 自定义签名（参数拼接/加盐） | `jobs/onerway_transactions.example.json` |
    | 参数走 Header + 返回 CSV 文件 | `jobs/onerway_settlement_details.example.json` |
    | 返回 ZIP/CSV 文件 | `jobs/deepseek_usage.example.json` |
+   | 自定义 md5 签名 + 无总数短页分页 | `jobs/xmp.example.json` |
    | 不想研究字段 | 直接 `api2ods --init`，按问答生成 |
 
 3. **改三处**：`maxcompute`（AK/SK）、`request`（地址/鉴权/records_path）、`target.table`；
@@ -286,9 +287,12 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 4. 写后 `count(*)` 与拉取条数双重核对；
 5. 默认拒绝写 0 行（防接口异常时清空分区），要写空分区显式 `--allow-empty`；
 6. 单行超过约 7MB 提前报错（MaxCompute 单列上限 8MB）；
-7. 建表/删分区/校验 SQL 有超时保护（默认 600 秒，可用 `--sql-timeout` 调整，0=不限制；超时主动取消）；
-8. 日志与异常里的 token/sign/secret 一律脱敏（形态规则 + 按配置里的密钥值精确遮蔽，
-   接口把凭证写进自由文本报错时也不会漏）；
+7. 建表 / 校验 SQL 有超时保护（默认 600 秒，可用 `--sql-timeout` 调整，0=不限制、负数在参数解析阶段报错退出码 2；超时主动取消）。
+   **已知限制**：分区增删（`delete_partition` / `create_partition`）走 pyodps 表 API，**不**受 `--sql-timeout`
+   保护；MaxCompute 侧若在这两处卡住，任务会一直挂起并**占着运行锁**，后续调度会被「已有任务在运行」顶掉
+   ——请在调度侧加整体超时兜底；
+8. 日志与异常里的 token/sign/secret 一律脱敏：形态规则 + 按配置里的密钥值精确遮蔽
+   （凭证的明文与其 URL 编码形态 `quote` / `quote_plus` 都替），接口把凭证写进自由文本报错时也不会漏；
 9. 429/5xx 按 `Retry-After` 退避重试，4xx 直接失败（参数/密钥问题快速暴露）；
    每次重试都重新鉴权（一次性签名如阿里云 `SignatureNonce` 不会因复用被判 400）；
    连接抖动（ConnectionError / Timeout / SSL 错误）走请求级退避重试；
@@ -303,7 +307,8 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
     不跨单元累积**；单次请求单元（一天 / range 模式整个区间）的记录会先在内存里攒齐再落盘，
     峰值内存与"单个请求单元的数据量"成正比、与总天数无关（百万条级别的单日大源建议改用 range 或调大页大小）；
     拉取进度每 1000 条打一次日志；写入分批同时受行数与字节数限制（默认 1000 行 / 8MB），
-    单条记录很大时也不会把内存吃满；失败时可 `--keep-spool` 保留数据文件排查。
+    单条记录很大时也不会把内存吃满；`--keep-spool` 可保留本次落盘的临时文件排查（成功失败都保留，
+    不加时运行结束自动清理）。
 12. **接口新增字段只提醒、不阻塞**：与上次成功运行观察到的字段快照对比，出现新字段时发一条
     飞书提醒（列名 + 处理建议；一次运行最多一条，`--no-notify` / `notify.enabled:false` 可关）。
     数据本身不受影响——json 列原样落库、新字段自动包含；要分析新字段时更新 DWD 提取逻辑即可。
@@ -346,8 +351,9 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 541 个离线用例：不访问网络、不连数仓
+python -m unittest discover -s tests -v    # 568 个离线用例：不访问网络、不连数仓
 pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
+ruff format --check .                      # 格式检查（CI 门禁；需要时先跑 ruff format .）
 ```
 
 CI 在 ubuntu / windows / macos × Python 3.9 / 3.10 / 3.11 / 3.12 / 3.13 / 3.14
@@ -369,6 +375,8 @@ CI 在 ubuntu / windows / macos × Python 3.9 / 3.10 / 3.11 / 3.12 / 3.13 / 3.14
 | `fetch.py` | 请求单元、翻页、并发、整窗重试 |
 | `spool.py` | 流式落盘（大数据量不占内存） |
 | `mc.py` | MaxCompute：建表校验 / 先删再填 / 行数核对 |
+| `notify.py` | 飞书群卡片通知（新增字段提醒等，发送失败不改退出码） |
+| `fieldwatch.py` | 字段漂移检测（快照对比，只提醒不阻塞入库） |
 | `utils.py` | 日志、运行锁、脱敏、重试工具 |
 
 ## License

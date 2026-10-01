@@ -54,7 +54,7 @@ from api2ods.cli import record_to_json  # noqa: E402
 
 # 少数用例要构造真实的 requests.exceptions（ConnectionError/Timeout…），或依赖 requests 自己
 # 抛出的 MissingSchema；没装 requests 时这些类型根本不存在。用一个开关把它们 skip 掉，
-# 其余 490+ 个用例仍然照跑——文档承诺的"没装 requests 也能跑"才是真的。
+# 其余 560+ 个用例仍然照跑——文档承诺的"没装 requests 也能跑"才是真的。
 _REQUESTS_AVAILABLE = getattr(http_mod, "requests", None) is not None
 
 
@@ -5922,6 +5922,39 @@ class TestMainBranches(OfflineTestCase):
         logged = "".join(handle.lines)
         self.assertIn("Token 的值", logged)  # 问题进日志
         self.assertNotIn("hidden-token", logged)  # 密钥不进日志
+
+    def test_init_wizard_config_error_goes_through_log(self):
+        """向导抛的配置错（如 --init-out 指到目录）也要带时间戳进日志、退出码 1。
+
+        这一段在 main 的其它 try 之外：不接住的话消息只落到 stderr、--log-file 里一个字都没有。
+        """
+
+        def fake_run_init(out, ask=None, echo=None, ask_secret=None):
+            raise SystemExit(f"--init-out 指向的是目录，需要给文件名：{out}")
+
+        class Recorder:
+            def __init__(self):
+                self.lines = []
+
+            def write(self, text):
+                self.lines.append(text)
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        handle = Recorder()
+        with (
+            mock.patch.object(cli_mod, "_open_log_file", lambda p: handle),
+            mock.patch.object(init_wizard, "run_init", side_effect=fake_run_init),
+        ):
+            rc = cli_mod.main(["--init", "--init-out", "jobs", "--log-file", "run.log"])
+        self.assertEqual(rc, 1)  # 退出码不变（原来 SystemExit 冒泡出去也是 1）
+        logged = "".join(handle.lines)
+        self.assertIn("--init-out 指向的是目录", logged)  # 报错进了 --log-file
+        self.assertNotIn(handle, utils._sinks)  # 句柄已摘掉
 
     def test_ctrl_c_before_sync_exits_130(self):
         """准备阶段（还没进 run_sync）被 Ctrl+C：走同一个硬退出出口，退出码 130。"""
