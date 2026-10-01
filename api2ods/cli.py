@@ -113,13 +113,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--job", default="", help="作业配置文件（jobs/*.json）")
-    parser.add_argument("--init", action="store_true", help="交互式生成作业配置（生成后自己填密钥，再 --check）")
+    parser.add_argument("--init", action="store_true", help="交互式生成作业配置（密钥类输入不回显，生成后再 --check）")
     parser.add_argument("--init-out", default="", help="--init 的输出路径（默认 jobs/<作业名>.json）")
     parser.add_argument("--config", default="", help=f"可选的共享凭证文件（默认 {DEFAULT_CONFIG_PATH}，没有就不读）")
     parser.add_argument("--check", action="store_true", help="只体检：配置 + API 连通 + 目标表结构")
     parser.add_argument("--bizdate", default="", help="业务日期 yyyyMMdd 或 yyyy-MM-dd（默认时区昨天）")
     parser.add_argument("--days", type=int, default=None, help="回拉天数（含基准日），覆盖作业配置 window.days")
-    parser.add_argument("--dates", default="", help="逗号分隔的日期列表（补零散几天），指定后忽略 --bizdate/--days")
+    parser.add_argument(
+        "--dates",
+        default="",
+        help="逗号分隔的日期列表（补零散几天）：指定后 --days 不生效，写入哪个分区仍由 --bizdate/--pt 决定",
+    )
     parser.add_argument("--start-date", default="", help="补数起始日期（含），与 --end-date 成对使用")
     parser.add_argument("--end-date", default="", help="补数结束日期（含），与 --start-date 成对使用")
     parser.add_argument(
@@ -128,11 +132,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖分区值；不指定时 target.pt 必须是 8 位业务日 yyyyMMdd，"
         "显式指定时可写特殊分区（如测试用 test_20260921——注意调度与 DWD 只自动读 yyyyMMdd 分区）",
     )
-    parser.add_argument("--workers", type=int, default=1, help="并按天/按区间并发拉取，默认 1；回补历史可用 2~4")
+    parser.add_argument("--workers", type=int, default=1, help="并发按天/按区间拉取，默认 1；回补历史可用 2~4")
     parser.add_argument("--dry-run", action="store_true", help="只拉取统计，不写数仓")
     parser.add_argument("--allow-empty", action="store_true", help="本次 0 行时也清空并写空分区（默认拒绝）")
     parser.add_argument(
-        "--keep-spool", action="store_true", help="失败时保留本次落盘的临时 JSONL（排查/手工重传用；默认失败也清理）"
+        "--keep-spool",
+        action="store_true",
+        help="保留本次落盘的临时 JSONL（排查/手工重传用，成功失败都保留）；不加时运行结束自动清理",
     )
     parser.add_argument("--endpoint", default="", help="MaxCompute endpoint（覆盖作业里的配置）")
     parser.add_argument("--mc-profile", default="", help="作业 maxcompute/profiles 里的 profile 名（默认 default）")
@@ -141,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--sql-timeout",
         type=_sql_timeout_arg,
         default=SQL_TIMEOUT_SECONDS,
-        help=f"单条 MaxCompute SQL 最长等待秒数，默认 {SQL_TIMEOUT_SECONDS}；0 表示不限制",
+        help=f"单条 MaxCompute SQL 最长等待秒数，默认 {SQL_TIMEOUT_SECONDS}；0 表示不限制，负数在参数解析阶段报错退出码 2",
     )
     parser.add_argument("--log-file", default="", help="日志同时写一份到该文件（追加，UTF-8）")
     parser.add_argument("--no-notify", action="store_true", help="不发任何飞书通知（如新增字段提醒）")
@@ -361,7 +367,9 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         # 临时目录不可写/磁盘满：给一句人话，而不是裸 traceback（否则 --log-file 里一个字都没有）
         log(f"❌ 无法创建落盘临时文件（检查系统临时目录是否可写/磁盘是否已满）：{exc}")
         return 1
-    keep_spool = bool(args.keep_spool)  # --keep-spool 是用户明确要求：任何失败分支都要生效
+    # --keep-spool 是用户明确要求：本次运行内是常量。下面各失败分支里的重复赋值只是显式标注
+    # （便于逐条分支阅读），真正生效的是 finally 里的 close(keep=...)——成败统一由它处理。
+    keep_spool = bool(args.keep_spool)
     observer = fieldwatch.FieldObserver()  # 字段漂移检测：逐批并集，内存只跟字段数有关
 
     def _on_records(records):
@@ -550,6 +558,12 @@ def main(argv: list[str] | None = None) -> int:
             # echo 也走 log()：带时间戳、写完即 flush（原来用 print，提示语会被输入缓冲
             # 压住、看着像卡死），且切不到 UTF-8 的控制台会降级成可替换字符而不是崩掉
             return run_init(args.init_out, ask=_wizard_ask, echo=log, ask_secret=_wizard_ask_secret)
+        except SystemExit as exc:
+            # 向导自己抛的配置错（如 --init-out 指到目录）：这一步在下面那个大 try 之外，
+            # 不接住的话消息只落到 stderr、没有时间戳、--log-file 里一个字都没有，
+            # 与"准备阶段的配置错也要留痕"的口径不一致（退出码仍是 1）
+            log(f"❌ {redact(str(exc))}")
+            return 1
         finally:
             _detach_log_sink(log_handle)
 

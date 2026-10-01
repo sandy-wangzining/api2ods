@@ -34,7 +34,7 @@
     "records_path": "Data.Items.Item",
     "records_missing": "empty",
     "//records_missing": "零消费日接口返回 Items: {}（没有 Item 键），按空结果处理；默认 error 会报错",
-    "add_fields": { "source_account": "<账号别名，如 alibabacloud1>" },
+    "add_fields": { "source_account": "<账号别名>" },
     "fail_if": [
       { "path": "Code", "not_equals": "Success", "message_path": "Message", "retry": true }
     ]

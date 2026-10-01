@@ -14,6 +14,7 @@ Closes #
 
 - [ ] `python -m unittest discover -s tests` 全过
 - [ ] `ruff check .` 0 告警
+- [ ] `ruff format --check .` 通过
 - [ ] 涉及数据完整性的改动，补了"改之前会失败"的回归用例
 
 ## 自查

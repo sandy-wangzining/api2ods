@@ -3,7 +3,7 @@
   "description": "DeepSeek 用量明细（导出接口返回 ZIP，内含 amount CSV）→ ODS（每行 CSV 一条 JSON）",
 
   "secrets": {
-    "deepseek_token": "<platform.deepseek.com 的 userToken（找持号人要；过期后用旧下载脚本 --set-token 刷新并更新这里）>"
+    "deepseek_token": "<platform.deepseek.com 的 userToken>"
   },
   "maxcompute": {
     "project": "<项目名>",
