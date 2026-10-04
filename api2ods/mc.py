@@ -5,10 +5,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 
-from .utils import log, progress_log, require_identifier, retry_call
+from .utils import ConfigError, log, progress_log, require_identifier, retry_call
 
 try:
     from odps import ODPS
@@ -21,7 +22,10 @@ WRITE_BATCH_SIZE = 1000  # 写入分批的行数上限（实际分批在 SpoolWr
 MAX_BATCH_BYTES = 8_000_000  # 写入分批的字节上限：单条记录很大时防止攒批吃内存
 MAX_ROW_BYTES = 7_000_000  # MaxCompute string 上限 8MB，留余量提前报错
 SQL_HEARTBEAT_SECONDS = 30
-DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
+# https：作业没写 endpoint 时 AK/SK 签名与查询结果不能走明文 HTTP
+DEFAULT_ENDPOINT = "https://service.us-west-1.maxcompute.aliyun.com/api"
+# 分区值白名单：与 config 的 --pt/target.pt 口径一致（字母/数字/下划线/中划线）
+_PARTITION_VALUE_RE = re.compile(r"\A[A-Za-z0-9_\-]{1,64}\Z")
 
 
 # =============================================================================
@@ -31,6 +35,10 @@ DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
 
 def _pick_aksk(item: dict) -> tuple[str, str]:
     """从配置里取 AK/SK：兼容 access_key_id/ak/_id 与 access_key_secret/ak_secret/sk 几种写法。"""
+    if not isinstance(item, dict):
+        # maxcompute 块写成字符串/数组时，get 会抛 'str' object has no attribute 'get' 的裸 AttributeError；
+        # 与同函数对 aliyun CLI 配置的校验口径一致，这里给明确的中文报错
+        raise SystemExit(f"maxcompute 配置必须是对象（键值对），实际 {type(item).__name__}")
     ak_id = next((str(item[key]) for key in ("access_key_id", "ak_id", "ak") if item.get(key)), "")
     secret = next((str(item[key]) for key in ("access_key_secret", "ak_secret", "sk") if item.get(key)), "")
     return (ak_id, secret) if ak_id and secret else ("", "")
@@ -49,6 +57,14 @@ def load_mc_credentials(profile: dict, source_label: str = "作业文件", cli_p
     env_id, env_secret = os.environ.get("ALIYUN_ACCESS_KEY_ID"), os.environ.get("ALIYUN_ACCESS_KEY_SECRET")
     if env_id and env_secret:
         return env_id, env_secret, "环境变量 ALIYUN_ACCESS_KEY_ID/SECRET"
+    if env_id or env_secret:
+        # 只设了一半：原来静默忽略，最终报错只说"找不到 AccessKey"，用户不知道自己设漏了；
+        # 继续往下找其它来源（CLI 配置），但把这条线索留出来
+        log(
+            f"  警告：环境变量只设了 {'ALIYUN_ACCESS_KEY_ID' if env_id else 'ALIYUN_ACCESS_KEY_SECRET'}、"
+            f"缺 {'ALIYUN_ACCESS_KEY_SECRET' if env_id else 'ALIYUN_ACCESS_KEY_ID'}；"
+            f"本次忽略环境变量，继续查找其它凭证来源"
+        )
 
     cli_config_file = Path.home() / ".aliyun" / "config.json"
     if cli_config_file.is_file():
@@ -227,8 +243,8 @@ def write_partition(
       用工厂而不是列表，是为了支持失败重试时重新读一遍，同时内存里只留一个批次。
       批次在读取侧切好（见 SpoolWriter.iter_batches）：单条记录很大时按行数攒批会吃内存。
     - total：预期行数；写完后核对，不一致报错（调用方再与 count(*) 二次校验）。
-    - 单行超过 MAX_ROW_BYTES 直接报错；检查必须在删分区之前——这类记录永远写不进去，
-      先删后失败等于白丢一天数据（重跑也救不回来，只能重拉 API）。
+    - 单行超过 MAX_ROW_BYTES 直接报错；检查在删分区之前只做一次（数据在写入阶段不变）——
+      这类记录永远写不进去，先删后失败等于白丢一天数据（重跑也救不回来，只能重拉 API）。
     """
     spec = f"{PARTITION_COLUMN}={partition_value}"
     # 每一次重试都是"先删分区、再重新写"：只要删成功过，这个分区就已经不在原位了。
@@ -249,10 +265,14 @@ def write_partition(
                         f"是否指到了大对象、或该接口记录过大"
                     )
 
+    # 尺寸校验只做一次、且在删分区之前：spool 在写入阶段不可变（fetch 已结束、只读），
+    # 每轮重试的数据完全相同，放在 _do 里会让源数据被通读 2×尝试次数 遍（大表/多次重试
+    # 时开销明显）。校验失败在动任何分区之前抛错，保住"超长记录绝不先删后失败"的红线。
+    _check_row_sizes()
+
     def _do() -> int:
         """完整的"校验 → 删 → 建 → 写"一趟，交给 retry_call 重试（每趟都从头读数据）。"""
         nonlocal deleted_once
-        _check_row_sizes()
         # 先置位再删：delete_partition 可能在服务端已经删掉分区后才抛异常（网络超时、
         # 响应丢失），此时 deleted_once=False 会把"分区可能已丢数"的提示吞掉。
         # 即使实际上一个字节都没删，保守提示重跑也只多一次幂等覆盖，不会写错数据。
@@ -297,12 +317,24 @@ def write_partition(
     return written
 
 
+def _partition_literal(partition_value) -> str:
+    """拼进 SQL 的分区值：白名单 + 引号转义。
+
+    MaxCompute 没有绑定参数，分区值只能拼进语句；白名单把"能拼什么"锁死
+    （分区名只允许字母/数字/下划线/中划线），反斜杠/引号/空格等注入面直接归零。
+    """
+    text = str(partition_value)
+    if not _PARTITION_VALUE_RE.match(text):
+        raise ConfigError(f"分区值不合法（只允许字母/数字/下划线/中划线，1~64 字符）：{text!r}")
+    return text.replace("'", "''")
+
+
 def count_partition(o, project: str, table_name: str, partition_value: str, timeout: int = SQL_TIMEOUT_SECONDS) -> int:
     """SELECT COUNT(*) 校验分区行数（用于写后核对）。"""
     # 表名同样是拼进 SQL 的标识符：再校验一道，挡住注入与拼错的表名
     project = require_identifier(project, "target.project")
     table_name = require_identifier(table_name, "target.table")
-    literal = str(partition_value).replace("'", "''")  # 拼 SQL 前转义，避免值里有引号炸掉语句
+    literal = _partition_literal(partition_value)
     sql = f"select count(*) as cnt from {project}.{table_name} where {PARTITION_COLUMN} = '{literal}'"
     instance = run_sql_with_timeout(o, sql, timeout=timeout, desc=f"校验 {table_name} 行数")
     with instance.open_reader() as reader:

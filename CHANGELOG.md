@@ -10,6 +10,67 @@
   原来直接冒泡出 `main`——控制台那行没有时间戳、`--log-file` 里一个字都没有，与 2.1.5
   「准备阶段的配置错也要留痕」的口径不一致。现在按运行期错误的格式记一笔并过 `redact`，
   退出码仍是 1（与 `run_init` 直接抛出的行为一致）。
+- **空日期列表给配置错，不再抛裸 IndexError**：`build_units([])` 原来会落到 `days[0]` 上抛
+  `IndexError`（报错毫无指引），也不返回空列表（那会让"没拉到数据"看起来像成功运行）。
+  现在直接报 `ConfigError` 并提示检查 `--days`/`--dates`/`--start-date` 与 window 配置。
+- **`stop_when_short` 与 `size_param: null` 不能同时用（配置错）**：请求里没有页大小参数时
+  接口按自己的默认值返回（如 20 条），"本页条数 < 配置的页大小（默认 100）"会立刻成立——
+  第一页就被当末页收尾、**静默少数据**，写后校验还自洽。现在发请求前直接报配置错，
+  提示改用 `total_pages_path`/`total_items_path`。
+- **配置类错误不再被逐单元吞掉**：串行/并发分支都只对 `FatalApiError` 放行，`ConfigError`
+  （如分页参数非法）会被当成"这个单元自己失败"记入 failures、继续把同一个错误重复 N 遍；
+  现在与 `run_unit` 口径一致，整轮立刻上抛。
+- **`on_records` 回调交付副本**：并发分支在回调后会清空 future 持有的列表以释放内存，
+  回调拿到的如果是原列表，调用方保留引用就会**静默丢数据**。现在交付副本，清空只影响
+  框架自己的列表（峰值内存不变）。
+- **CSV 空白填充行（`,,,,`）按排版垃圾跳过**：空白行判定原来把 restkey（多出的列）也一起看，
+  末尾填充行被判成非空、硬报"列数多于表头"，报表常见的填充行会让整个窗口反复失败。
+- **CSV 行短于表头时报错（与"多出列"对称）**：原来缺失列被 `restval=None` 静默补成 NULL，
+  下游 `get_json_object` 全取空；文件被截断、字段含未转义换行都会走这条路径。
+- **JSON 错误体尾字符判断先 rstrip**：错误体后面带一个换行（nginx/框架常补）时，
+  "像 JSON 错误体"的判断会落空、错误体被当数据解析；现在先裁掉尾部空白再判断。
+- **`parse.skip_rows` 拒绝小数**：`2.9` 原来被 `int()` 静默截断成 2（少跳一行、表头整体错位），
+  NaN/Infinity 一并挡掉；`skip_rows` 跳空文件时的告警不再为拼一行日志把原文再切一遍。
+- **`fail_if` 大整数不折叠**：`_normalize_compare` 一律转 float 会把 >2^53 的整数（19 位订单号、
+  纳秒时间戳）压成同一个浮点值——equals 漏判、not_equals 误杀；现在大整数保持精确值。
+- **`json_encoding` 拼错直接报配置错**：编码名无效（如 `"utf8sig"`、带空格）原来抛的
+  `LookupError` 被候选循环静默跳过——显式配置被悄悄忽略，最后按 UTF-8 解出乱码或报
+  "都解不出来"，指不清方向。
+- **`fail_if` 条件漏写 `path` 不再 KeyError**：命中条件时报"接口返回业务错误"，而不是
+  裸 `KeyError`（库调用方可能没走 `validate_job`）。
+- **`lifecycle_days` 的 NaN/Infinity 给出配置错**：`json.load` 默认接受这些字面量，原表达式
+  会对 NaN 抛未捕获的 `ValueError`（裸 traceback）；config 校验与 cli 兜底两处统一为带字段名的报错。
+- **配置块类型守卫补齐**：`collect_warnings` 对真值非对象块（如 `"window": ["a"]`）不再抛
+  `AttributeError/TypeError`（"收集告警不阻断运行"的契约要成立）；`render_job` 在取值前先
+  `check_block_types`（window 写成字符串时不能再抛裸 traceback）；`get_mc_profile_meta` /
+  `resolve_target` 对非对象 `target` 给中文报错。
+- **`_as_count` / `_pick_aksk` / `auth` 的静默降级修掉**：`window_retries: true` 原来被
+  `int(True)` 当成 1、`2.9` 被静默截断成 2；`maxcompute` 块写成字符串时 `_pick_aksk` 抛裸
+  `AttributeError`；`bearer`/`basic`/`token`/`aliyun_rpc` 缺必填凭据时静默发出空凭证请求
+  （接口 401，问题拖到远端才暴露）——现在都在本地给明确的配置错。
+- **只设半个 `ALIYUN_ACCESS_KEY_*` 环境变量不再静默忽略**：给出明确告警（缺的是哪一个），
+  最终"找不到 AccessKey"的报错不再让用户猜。
+- **字段快照对非对象 JSON 按首次运行处理**：`["a"]` 这类合法但非对象的快照原来抛
+  `AttributeError` 中断主流程（违反"快照读写失败只记日志"的约定）；`updated_at` 改为带时区的
+  UTC（跨时区下可直接比较）。
+- **飞书告警对非对象 JSON 响应按失败处理**（原来 `data.get` 抛 AttributeError 打断主流程）；
+  **`dump_record` 捕 `TypeError`**（set/datetime 等不可序列化对象也走脱敏+中文报错，不是裸 traceback）。
+- **`retry_call` / `require_identifier` 的边界**：`attempts<=0` 原来报"重试 -1 次仍失败：None"
+  （丢失失败原因），现在给明确的参数错误；最终异常补 `from last_err` 保留原始异常链；
+  `require_identifier` 拒绝 `None`/`True`/数字（`str(None)` 曾能被当成合法表名拼进 DDL）。
+- **`--days` 非法值的报错指向正确**（原来说 `window.days` 并打印 `None`）；
+  `window.extra_params` 的格式串报错携带真实字段名（原来是固定的 `window.format`）。
+- **日期白名单改用 `[0-9]`**：`\d` 还认全角/阿拉伯-印度数字，非 ASCII 日期参数会被静默接受
+  （`int()` 也能解析全角数字）。
+- **向导的输入回退不再名不符实**：getpass 不可用退回 `input()` 时显式提示"密钥会明文回显"
+  （提示语里写着不回显）；stdin 关闭（EOFError）按用户中断处理，而不是裸 traceback；
+  `RuntimeError` 只识别明确的 `lost sys.stdin`，其余上抛（不再把真实缺陷当"输入不可用"）；
+  `_split_url` 去掉两个分支完全相同的死三元表达式。
+- **写库前的尺寸校验只做一次**（且在删分区之前）：spool 在写入阶段不可变，原来放在重试循环里
+  会让源数据被通读 `2×尝试次数` 遍（大表/多次重试时开销明显）；校验失败仍在动分区之前抛错。
+- **`run_sync` 的清理失败不再顶掉退出码**：`finally` 里 `spool.close()` 的 `OSError`
+  （磁盘满/句柄异常）原来会把已确定的返回值/原始异常替换成 OSError，破坏"调度只看退出码"的约定；
+  失败列表里的 label 与同一行的 err 一样过脱敏（label 带查询串的接口地址时不再漏遮）。
 
 ### 安全
 
@@ -21,6 +82,19 @@
   会明文回显在终端（进 scrollback、被 `script` 录制或录屏抄走）。现在走 `getpass` 不回显；
   作业名、API 地址、表名等普通输入仍走 `input()`（`ask_secret` 与 `ask` 分离）。无 tty
   （CI/重定向）时自动退回普通输入，向导照常可用。
+- **拼进 count SQL 的分区值加白名单**：MaxCompute 没有绑定参数，分区值只能拼进语句；现在
+  `count_partition` 对分区值做白名单校验（字母/数字/下划线/中划线，与 `--pt`/`target.pt` 口径一致）
+  后再拼接，引号/反斜杠/空格等注入面归零。
+- **默认 MaxCompute endpoint 改 https**：作业未写 endpoint 时走明文 HTTP 会暴露 AK/SK 签名与
+  查询结果；`mc.DEFAULT_ENDPOINT`、向导默认值与 `jobs/*.example.json` 模板统一改 https。
+- **向导写文件先按 0600 创建再写入**：作业文件含 AK/SK/token 明文，原来 `write_text` 先按
+  默认 umask（通常 0644）创建、再 chmod，存在同机其他用户可读的窗口期。
+- **`_URL_AUTH_RE` 的 scheme 部分限长（防回溯）**：无上限时在长小写字母数字串上会在每个起始
+  位置贪婪回扫（实测 20KB 要 10 秒、40KB 要 50 秒）；限长后配合 `://`/`@` 预判保持线性。
+- **`signers.example.py` 的示例写法修正**：缺配置时抛 `SystemExit`（`BaseException`，绕过框架
+  `except Exception` 的配置错包装）改为 `ValueError`；`ctx["params"]` 改防御式取值；`secret_key`
+  缺失时显式报错（原来静默用空密钥签名，只在服务端 401 才暴露）；md5 加
+  `usedforsecurity=False` 显式声明非安全用途（FIPS 环境放行）。
 
 ### 工程
 
@@ -32,6 +106,13 @@
   清理（临时作业路径每次哈希都不同，原来会无限累积锁文件）。生产行为完全不变。
 - `VERSION` 从 2.3.1 同步到 2.3.2：CHANGELOG 已发布条目是 `[2.3.2]`，版本字符串是漏改的
   陈旧值（约定为 `VERSION` == 最新已发布条目，与 sftp2ods / feishu2ods 一致）。纯字符串同步。
+- **离线用例补齐本轮修复的回归覆盖**：空日期列表、`stop_when_short`+`size_param:null`、
+  配置错不被逐单元吞、回调副本、CSV 填充行/短行、JSON 错误体尾换行、大整数比较、编码名拼错、
+  `fail_if` 缺 path、空凭证、分区值白名单、半个环境变量、快照非对象、非对象 JSON 告警、
+  `dump_record` 的 TypeError、退出码不被清理失败顶掉、退避时长按预期请求（基类把 sleep
+  换成空操作，退避时长用记录调用的方式单独验证）、`signers.example.py` 的示例函数等。
+- 测试自身的小修：临时目录改用 `TemporaryDirectory` 注册清理（不再往系统 temp 累积）；
+  跨本地午夜的"默认业务日"断言改容差（`expected` 或 `expected - 1 天`），消除偶发 flaky。
 
 ### 文档
 
@@ -48,6 +129,7 @@
     `bug_report` 模板的版本占位符更新。
 - `jobs/*.example.json`：`//total` 的停止口径同步、`//entry_field` 的病句改通；两处疑似真实
   来源的占位符（账号别名、指向仓库外脚本的 token 说明）改为通用占位符。
+- README：`maxcompute.endpoint` 默认值标注为 https；离线用例数 568 → 607。
 
 ## [2.3.2] - 2026-10-01
 

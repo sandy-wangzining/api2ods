@@ -49,6 +49,10 @@ def _as_int(value, fallback: int, field: str) -> int:
     """
     if value is None or value == "":
         return fallback
+    if isinstance(value, float) and not value.is_integer():
+        # 2.9 静默截断成 2 会让 skip_rows 少跳/多跳一行、表头整体错位；
+        # NaN/Infinity 的 is_integer() 同样是 False，一并挡掉
+        raise ConfigError(f"{field} 必须是整数，实际 {value!r}")
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -198,13 +202,14 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
 
     if skip_rows:
         before = text
-        text = "".join(_split_lines(text, keepends=True)[skip_rows:])
+        before_lines = _split_lines(text, keepends=True)
+        text = "".join(before_lines[skip_rows:])
         if before.strip() and not text.strip():
             # 文件本来有内容，被 skip_rows 一行不剩地跳空了：要么 skip_rows 配大了，
             # 要么源文件结构缩水（比如错误页只有两行）。空结果是静默的，得留个痕
             log(
                 f"  警告：{label or '文件'} 按 skip_rows={skip_rows} 跳过之后没有任何内容"
-                f"（原文件 {len(_split_lines(before))} 行）；请核对 parse.skip_rows 与文件结构"
+                f"（原文件 {len(before_lines)} 行）；请核对 parse.skip_rows 与文件结构"
             )
     if skip_until and not text.strip():
         # 配置了两个跳过项、且 skip_rows 正好把内容全跳空了：按空结果处理。
@@ -270,19 +275,32 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
             return []
         try:
             for line_no, row in enumerate(reader, start=2):
-                if all(v is None or str(v).strip() == "" for v in row.values()) and len(fieldnames) > 1:
-                    # 全空白行：多列文件里是排版垃圾，跳过；单列文件里它更像"值为空"的
-                    # 一条记录，保留下来（下游自己判空）。
+                # 先把多出的列（restkey=None 里的列表）取出来再判空行：留着它一起做"全空白"
+                # 判断，",,,," 这类末尾填充行会被判成非空、硬报"列数多于表头"
+                extra = row.pop(None, None)
+                blank_row = all(v is None or str(v).strip() == "" for v in row.values())
+                extra_has_content = extra is not None and any(v is not None and str(v).strip() for v in extra)
+                if blank_row and not extra_has_content and len(fieldnames) > 1:
+                    # 全空白行（含末尾填充行）：多列文件里是排版垃圾，跳过；单列文件里它更像
+                    # "值为空"的一条记录，保留下来（下游自己判空）。
                     # 注意：真正一个字符都没有的行 csv 模块在迭代时就吞掉了，
                     # 到不了这里——所以"单列文件的空行能作为空值记录保留"只对
                     # "有分隔符/空格"的空白行成立
                     continue
-                # 列数比表头多：多出来的字段会落进 restkey=None，静默丢字段等于写错数据
-                extra = row.pop(None, None)
-                if extra:
+                if extra_has_content:
+                    # 列数比表头多：多出来的字段会落进 restkey=None，静默丢字段等于写错数据
                     raise RuntimeError(
                         f"{label or '文件'} 第 {line_no} 行列数多于表头（多出 {len(extra)} 个值：{extra[:3]}），"
                         f"字段会被截断；请检查文件格式或分隔符"
+                    )
+                if any(v is None for v in row.values()):
+                    # 列数少于表头：DictReader 给缺失列补 restval=None，静默写库会变全 NULL
+                    # （下游 get_json_object 取不到值）；与"多出列"对称，同样硬报错。
+                    # 字段里含未转义换行、文件被截断都会走到这里
+                    missing = sum(1 for v in row.values() if v is None)
+                    raise RuntimeError(
+                        f"{label or '文件'} 第 {line_no} 行列数少于表头（缺 {missing} 列，会被静默补成 NULL）；"
+                        f"请检查文件是否被截断、字段里是否有未转义的换行"
                     )
                 record = {str(k): (None if v is None else str(v)) for k, v in row.items()}
                 if entry_field:
@@ -366,9 +384,11 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
     if not parsed:
         # 解不出来又以 }/] 收尾：大概率是含 NaN/被截断的 JSON 错误体。
         # （CSV 表头以 { [ 开头虽罕见但合法，所以只在这个更窄的形态上报错）
+        # 尾字符判断前先 rstrip：错误体后面跟一个换行/空格太常见（nginx/框架/工具自己补），
+        # 不裁掉的话判断落空、错误体被当数据解析
         # jsonl 不走这一支：多行 JSONL 本来就不是一个 JSON 值，整包解不出来是正常的，
         # 真有坏行由 _parse_text 带着行号报出来，比这里的"疑似被截断"准得多
-        if fmt != "jsonl" and probe[-1:] in (b"}", b"]"):
+        if fmt != "jsonl" and probe.rstrip()[-1:] in (b"}", b"]"):
             raise RuntimeError(
                 f"{label} {where}期望文件流，但响应像一个无法解析的 JSON（含 NaN/Infinity 或被截断）："
                 f"{data[:200].decode('utf-8', 'replace')!r}"

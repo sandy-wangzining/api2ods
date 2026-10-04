@@ -14,7 +14,7 @@
   "//maxcompute_短写": "access_key_id/access_key_secret 可简写成 ak/sk；endpoint 不写默认 us-west-1",
   "maxcompute": {
     "project": "<项目名>",
-    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "endpoint": "https://service.us-west-1.maxcompute.aliyun.com/api",
     "access_key_id": "<AK>",
     "access_key_secret": "<SK>"
   },

@@ -228,6 +228,9 @@ def render_job(job_raw: dict, config: dict, bizdate: date) -> dict:
 
     作业文件里的 secrets 原样保留（密钥本身不参与占位符替换），只用于 ${secrets.x}。
     """
+    # 类型检查必须在任何取值之前：下面 date_tz_of 就要取 window.date_tz / window 块，
+    # 而 window 写成字符串时那是 'str' object has no attribute 'get' 的裸 traceback
+    check_block_types(job_raw)
     context = build_context(config, bizdate, job_raw.get("secrets"), tz=date_tz_of(job_raw))
     job = {key: value for key, value in job_raw.items() if key != "secrets"}
     rendered = deep_substitute(job, context)
@@ -326,13 +329,20 @@ def collect_warnings(job: dict) -> list[str]:
     # 留在 job 里会被下面的未知键扫描当成拼写错误再报一条
     warnings.extend(job.pop(_WARNINGS_KEY, None) or [])
     _check_unknown_keys(job, JOB_KEYS, "作业", warnings)
-    _check_unknown_keys(job.get("request") or {}, REQUEST_KEYS, "request", warnings)
-    _check_unknown_keys(job.get("window") or {}, WINDOW_KEYS, "window", warnings)
-    _check_unknown_keys(job.get("pagination") or {}, PAGINATION_KEYS, "pagination", warnings)
-    _check_unknown_keys(job.get("parse") or {}, PARSE_KEYS, "parse", warnings)
-    _check_unknown_keys(job.get("target") or {}, TARGET_KEYS, "target", warnings)
-    if isinstance(job.get("notify"), dict):
-        _check_unknown_keys(job["notify"], NOTIFY_KEYS, "notify", warnings)
+    # 逐块判断 isinstance 而不是 `or {}` 兜底：`or {}` 只挡假值，
+    # "window": ["a"] / "target": 5 这类真值非对象会让 _check_unknown_keys 抛
+    # AttributeError/TypeError，而"收集告警不阻断运行"是本函数的契约
+    for block, allowed in (
+        ("request", REQUEST_KEYS),
+        ("window", WINDOW_KEYS),
+        ("pagination", PAGINATION_KEYS),
+        ("parse", PARSE_KEYS),
+        ("target", TARGET_KEYS),
+        ("notify", NOTIFY_KEYS),
+    ):
+        value = job.get(block)
+        if isinstance(value, dict):
+            _check_unknown_keys(value, allowed, block, warnings)
     return warnings
 
 
@@ -613,8 +623,13 @@ def validate_job(job: dict) -> None:
         if (
             isinstance(raw_lifecycle, bool)
             or not isinstance(raw_lifecycle, (int, float))
-            or float(raw_lifecycle) != int(raw_lifecycle)
-            or int(raw_lifecycle) <= 0
+            # NaN/Infinity 先挡掉：json.load 默认接受这些字面量，而 float(raw) != int(raw)
+            # 会对 NaN 直接抛 ValueError（裸 traceback）；浮点相等比较也不可靠，改判 is_integer()
+            or (
+                isinstance(raw_lifecycle, float)
+                and (not math.isfinite(raw_lifecycle) or not raw_lifecycle.is_integer())
+            )
+            or raw_lifecycle <= 0
         ):
             raise SystemExit(f"target.lifecycle_days 必须是正整数（天），实际 {raw_lifecycle!r}")
 
@@ -639,7 +654,8 @@ def _backfill_without_bizdate(args) -> bool:
     anchored = explicit_bizdate or explicit_pt or env_bizdate() is not None
     dates = str(getattr(args, "dates", "") or "").strip()
     window = str(getattr(args, "start_date", "") or "").strip() or str(getattr(args, "end_date", "") or "").strip()
-    return (dates or window) and not explicit_pt and not anchored
+    # 显式 bool()：`dates or window` 返回的是字符串，函数标注的返回值是 bool
+    return bool((dates or window) and not explicit_pt and not anchored)
 
 
 def resolve_notify(job: dict, config: dict) -> dict:
@@ -656,6 +672,8 @@ def resolve_notify(job: dict, config: dict) -> dict:
 
 def resolve_target(job: dict, config: dict, args, bizdate: date) -> tuple[str, str, str, str]:
     """解析目标表信息 → (project, table, column, pt值)。"""
+    # 与 get_mc_profile_meta 同一道防线：target 非对象时给中文报错而不是裸 AttributeError
+    check_block_types(job)
     target = job.get("target") or {}
     profile = get_mc_profile_meta(config, job, args)
     project = str(target.get("project") or profile.get("project") or "")
@@ -722,6 +740,8 @@ def get_mc_profile_meta(config: dict, job: dict, args) -> dict:
     查找顺序：作业文件的 profiles.<名> / maxcompute → --config 文件的 profiles.<名> / maxcompute。
     （作业内优先，方便一份作业自带全部凭证。）
     """
+    # target 写成字符串/数字时，下面的 .get 是裸 AttributeError；与其它入口统一先挡块类型
+    check_block_types(job)
     name = str(getattr(args, "mc_profile", "") or (job.get("target") or {}).get("profile") or "default").strip()
     available: list[str] = []
 

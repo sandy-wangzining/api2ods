@@ -8,7 +8,7 @@ import os
 import re
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .utils import ConfigError, log, log_once
 
@@ -81,9 +81,10 @@ def _locale_free_values(value: datetime) -> dict:
 
 _DIRECTIVE_RE = re.compile(r"%(.)", re.S)
 _MODIFIERS = "-_0^#"
-# 日期参数白名单：只认紧凑与 ISO 两种写法（见 parse_day_arg 的说明）
-_DAY_COMPACT_RE = re.compile(r"\A\d{8}\Z")
-_DAY_ISO_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
+# 日期参数白名单：只认紧凑与 ISO 两种写法（见 parse_day_arg 的说明）。
+# 用 [0-9] 而不是 \d：\d 还认全角/阿拉伯-印度数字，非 ASCII 日期参数会被静默接受
+_DAY_COMPACT_RE = re.compile(r"\A[0-9]{8}\Z")
+_DAY_ISO_RE = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 
 
 def is_date_only_format(fmt: str) -> bool:
@@ -128,10 +129,12 @@ def load_zone(name: str) -> ZoneInfo:
     """按名称加载时区（如 America/New_York、UTC、Asia/Shanghai）。"""
     try:
         return ZoneInfo(str(name))
-    except Exception:
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        # 只认"时区名不认识/不合法"两类：别的异常（如 TypeError）是编程错误，不该伪装成时区问题；
+        # from exc 保留原始原因链
         raise SystemExit(
             f"无法识别时区：{name}（如 America/New_York / Asia/Shanghai / UTC；Windows 本机需 pip install tzdata）"
-        )
+        ) from exc
 
 
 def date_tz_of(job: dict) -> ZoneInfo:
@@ -246,6 +249,10 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
                 # 不用 `or 1`：0 会被静默当成默认值 1（window.days=0 是笔误，该报错）
                 count = 1 if configured is None or configured == "" else int(configured)
         except (TypeError, ValueError):
+            # 报错要指向真正的来源：--days 传了非法值时，原来固定说 window.days 并打印 None，
+            # 用户会以为是配置问题
+            if from_cli:
+                raise SystemExit(f"--days 必须是整数，实际 {args.days!r}")
             raise SystemExit(f"window.days 必须是整数，实际 {window.get('days')!r}")
         if count < 1:
             raise SystemExit(f"{'--days' if from_cli else 'window.days'} 必须 >= 1，实际 {count}")
@@ -310,7 +317,7 @@ def _protect_extension(fmt: str, code: str, sentinel: str) -> str:
     return "".join(out)
 
 
-def format_time(value: datetime, fmt: str):
+def format_time(value: datetime, fmt: str, field: str = "window.format"):
     """按配置格式化时间：支持 unix（秒）/ unix_ms（毫秒），并自己实现 %s / %P。
 
     `%s`（epoch 秒）与 `%P`（小写 am/pm）是 glibc/BSD 扩展，MSVC 的 strftime 不认：
@@ -321,6 +328,8 @@ def format_time(value: datetime, fmt: str):
 
     fmt 恰好是 "%s" 时返回 int（保持"时间戳"语义，_moment 直接当参数发出去）；
     与其它文本混用时返回 str（如 "%Y-%s" → "2026-1789889400"）。
+
+    field 只用于报错文案：window.extra_params 的格式串写错时，报错要指向那一项而不是 window.format。
     """
     fmt = str(fmt or DEFAULT_TIME_FORMAT)
     lowered = fmt.lower()
@@ -330,7 +339,7 @@ def format_time(value: datetime, fmt: str):
         return int(value.timestamp() * 1000)
     if fmt == "%s":
         return int(value.timestamp())
-    check_format_string(fmt)
+    check_format_string(fmt, field=field)
     # %s / %P 先换成哨兵再交给 strftime（不这么绕的话，Windows 上 strftime 会直接抛错）。
     # 哨兵不能用 \x00：strftime 收的是 C 字符串，NUL 会把它后面的内容整段截掉（Linux 实测输出空串）。
     # 替换按 %% 转义规则逐段扫描：只换真正是"指令"的那个，%%s / %%P 是字面量。
@@ -353,16 +362,18 @@ def format_time(value: datetime, fmt: str):
     return out
 
 
-def _moment(value: datetime, fmt: str, api_tz) -> str | int:
+def _moment(value: datetime, fmt: str, api_tz, field: str = "window.format") -> str | int:
     """按 format 输出一个时间点；纯日期格式不做时区换算。
 
     format 只到"日"（如 %Y-%m-%d）时，接口要的是"date_tz 里的哪一天"，
     再按 api_tz 换算只会把日期顶到前一天/后一天（如 UTC 的 00:00 在 +08:00 是 08:00，
     但反过来 -05:00 的 00:00 在 +08:00 就跑到下一天）。
+
+    field 透传给 format_time 的报错文案（window.format / window.extra_params[名]）。
     """
     if not is_date_only_format(fmt):
         value = value.astimezone(api_tz)
-    return format_time(value, fmt)
+    return format_time(value, fmt, field=field)
 
 
 def _format_window(win: dict, start: datetime, end: datetime, day: date, last_day: date, tz: ZoneInfo) -> dict:
@@ -390,7 +401,7 @@ def _format_window(win: dict, start: datetime, end: datetime, day: date, last_da
     if win.get("extra_params"):
         base = datetime.combine(day, dtime(0, 0), tzinfo=tz)
         for name, extra_fmt in dict(win["extra_params"]).items():
-            result[str(name)] = _moment(base, str(extra_fmt), api_tz)
+            result[str(name)] = _moment(base, str(extra_fmt), api_tz, field=f"window.extra_params[{name!r}]")
     return result
 
 
@@ -408,8 +419,8 @@ def _check_range_extra_params(win: dict, days: list[date], tz) -> None:
     base_first = datetime.combine(days[0], dtime(0, 0), tzinfo=tz)
     base_last = datetime.combine(days[-1], dtime(0, 0), tzinfo=tz)
     for name, extra_fmt in dict(extra).items():
-        first_value = _moment(base_first, str(extra_fmt), api_tz)
-        last_value = _moment(base_last, str(extra_fmt), api_tz)
+        first_value = _moment(base_first, str(extra_fmt), api_tz, field=f"window.extra_params[{name!r}]")
+        last_value = _moment(base_last, str(extra_fmt), api_tz, field=f"window.extra_params[{name!r}]")
         if first_value != last_value:
             raise ConfigError(
                 f"window.extra_params 的 {name}（{extra_fmt}）在区间 {days[0]} ~ {days[-1]} 上会变"

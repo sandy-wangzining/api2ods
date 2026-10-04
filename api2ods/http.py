@@ -117,7 +117,17 @@ def _decode_json_body(response, json_encoding: str | None) -> str:
                 f"request.json_encoding 不能是 {json_encoding!r}：它能把任何字节序列解成乱码"
                 f'而不报错；源是 GBK 之类请写具体编码（如 "gbk"），是 UTF-8 就删掉这一项'
             )
-        candidates.append(str(json_encoding))
+        # 编码名先单独校验：拼错了（如 "gbk " / "utf8sig"）原来会抛 LookupError 被候选循环
+        # 静默跳过——显式配置被悄悄忽略，最后按 UTF-8 解出乱码或报"都解不出来"，指不清方向
+        encoding_name = str(json_encoding).strip()
+        try:
+            codecs.lookup(encoding_name)
+        except LookupError:
+            raise ConfigError(
+                f"request.json_encoding 不是有效的编码名：{json_encoding!r}；"
+                f"常见取值：utf-8 / utf-8-sig / gbk / gb18030 / utf-16"
+            ) from None
+        candidates.append(encoding_name)
     # utf-8-sig：有些源会在 JSON 最前面带 BOM，按 utf-8 解出来是 "﻿{"，
     # loads_json 会一直解析失败并重试到耗尽
     candidates.append("utf-8-sig")
@@ -260,23 +270,37 @@ def request_once(
         raise RuntimeError(f"接口返回不是 JSON 或含非法数值（{exc}）：{redact(text[:300])}")
 
 
+# float 能精确表示的最大整数：再大的整数转 float 会折叠（19 位订单号/纳秒时间戳
+# 会与相邻值压成同一个浮点数），equals 漏判、not_equals 误杀
+_SAFE_INT = 2**53
+
+
 def _normalize_compare(value):
     """fail_if 比较用：布尔转 'true'/'false'；数字统一按 float，数字样字符串也按 float。
 
     原实现把数字 str() 后比：接口返回 0.0（浮点序列化）与配置 0 会判成"不相等"——
     equals 方向漏判（把业务错误当成功继续写库）、not_equals 方向误杀；
     反过来 str(2e2)="200.0" 与 "200" 也对不上。统一按数值比后这些形态一致。
+
+    超过 2^53 的整数保持精确值不折叠（见 _SAFE_INT）；字符串路径同理。
     """
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return float(value)
+    if isinstance(value, int):
+        return float(value) if abs(value) <= _SAFE_INT else value
+    if isinstance(value, float):
+        return value
     if isinstance(value, str):
+        text = value.strip()
         try:
-            number = float(value.strip())
+            number = int(text)
         except ValueError:
-            return value
-        return number if math.isfinite(number) else value
+            try:
+                number = float(text)
+            except ValueError:
+                return value
+            return number if math.isfinite(number) else value
+        return float(number) if abs(number) <= _SAFE_INT else number
     return value
 
 
@@ -296,7 +320,9 @@ def check_fail_if(payload, fail_if: list | None) -> None:
         )
         if not bad:
             continue
-        message = f"接口返回业务错误：{cond['path']}={value!r}"
+        # cond.get 而不是下标：validate_job 要求 fail_if 每项带 path，但库调用方可能没走校验，
+        # 命中条件时抛裸 KeyError 看不出是配置问题（上一行取值就是 .get 容错）
+        message = f"接口返回业务错误：{cond.get('path', '')}={value!r}"
         if cond.get("message_path"):
             message += f"，{cond['message_path']}={get_path(payload, cond['message_path'], default=None)!r}"
         if cond.get("retry"):

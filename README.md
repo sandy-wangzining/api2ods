@@ -132,7 +132,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `job` | 否 | 作业名（日志用） |
 | `description` | 否 | 一句话描述（日志用） |
 | `secrets` | 否 | 密钥键值对；`request` 里用 `${secrets.键名}` 引用。**也可以直接把密钥写在用到的地方** |
-| `maxcompute` | 是* | 目标项目与凭证：`project` / `endpoint`（默认 us-west-1）/ `access_key_id`+`access_key_secret`（可简写 `ak`/`sk`） |
+| `maxcompute` | 是* | 目标项目与凭证：`project` / `endpoint`（默认 us-west-1，https）/ `access_key_id`+`access_key_secret`（可简写 `ak`/`sk`） |
 | `profiles` | 否 | 多套 MaxCompute 凭证，配合 `target.profile` 切换 |
 
 > 占位符：`${secrets.键名}`、`${bizdate}`（YYYYMMDD）、`${bizdate_iso}`、`${today}`、`${today_iso}`。
@@ -351,7 +351,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 568 个离线用例：不访问网络、不连数仓
+python -m unittest discover -s tests -v    # 607 个离线用例：不访问网络、不连数仓
 pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
 ruff format --check .                      # 格式检查（CI 门禁；需要时先跑 ruff format .）
 ```

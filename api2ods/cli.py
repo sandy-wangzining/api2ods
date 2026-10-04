@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import getpass
 import hashlib
+import math
 import os
 import sys
 import tempfile
@@ -163,10 +164,19 @@ def _as_count(value, fallback: int, field: str) -> int:
     """
     if value is None or value == "":
         return fallback
+    if isinstance(value, bool):
+        # int(True) == 1：window_retries: true 曾被静默当成 1，与实际预期不符
+        raise SystemExit(f"{field} 必须是整数，实际 {value!r}")
+    if isinstance(value, int):
+        return value
     try:
-        return int(value)
+        number = float(value)
     except (TypeError, ValueError):
         raise SystemExit(f"{field} 必须是整数，实际 {value!r}")
+    # NaN/Infinity 与小数都要拦：原来是 int(value) 静默截断（2.9 → 2）
+    if not math.isfinite(number) or number != int(number):
+        raise SystemExit(f"{field} 必须是整数，实际 {value!r}")
+    return int(number)
 
 
 def _open_log_file(path_text: str):
@@ -373,6 +383,8 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     observer = fieldwatch.FieldObserver()  # 字段漂移检测：逐批并集，内存只跟字段数有关
 
     def _on_records(records):
+        # workers>1 时本回调由多个工作线程并发执行：SpoolWriter.write_records 与
+        # FieldObserver.update 内部都自带锁（各自的类注释有说明），这里直接调用即可
         observer.update(records)
         spool.write_records(records)
 
@@ -390,12 +402,13 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             log("")
             log("以下请求失败，本次不写库（避免分区缺数，重跑即可）：")
             for label, err in failures:
-                # fetch_all 已脱敏，这里再走一遍兜底：除 fetch 之外的失败源也要进同一道口
-                log(f"  - {label}: {_redact_job(job, err)}")
+                # fetch_all 已脱敏，这里再走一遍兜底：除 fetch 之外的失败源也要进同一道口。
+                # label 里可能带 URL/签名（如带查询串的接口地址），与同一行的 err 同口径脱敏
+                log(f"  - {_redact_job(job, label)}: {_redact_job(job, err)}")
             return 1
 
         log(
-            f"拉取完成：{spool.count:,} 条记录，约 {spool.bytes / 1024 / 1024:.2f} MB，"
+            f"拉取完成：{spool.count:,} 条记录（{len(stats)} 个请求单元），约 {spool.bytes / 1024 / 1024:.2f} MB，"
             f"耗时 {(time.time() - started) / 60:.1f} 分钟"
         )
 
@@ -440,10 +453,17 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             raw_lifecycle = target_cfg.get("lifecycle_days")
             if raw_lifecycle is not None and raw_lifecycle != "":
                 # 布尔要单独挡：JSON 里写 true 时 int(True) == 1，新表会拿到 lifecycle 1，
-                # 建表当天数据就被生命周期回收；浮点静默截断、负数原样写进 DDL 同理
-                if isinstance(raw_lifecycle, bool) or not isinstance(raw_lifecycle, (int, float)):
-                    raise SystemExit(f"target.lifecycle_days 必须是正整数（天），实际 {raw_lifecycle!r}")
-                if float(raw_lifecycle) != int(raw_lifecycle) or int(raw_lifecycle) <= 0:
+                # 建表当天数据就被生命周期回收；NaN/Infinity（json.load 默认接受）会让
+                # float(raw) != int(raw) 直接抛 ValueError（裸 traceback），一并挡掉
+                if (
+                    isinstance(raw_lifecycle, bool)
+                    or not isinstance(raw_lifecycle, (int, float))
+                    or (
+                        isinstance(raw_lifecycle, float)
+                        and (not math.isfinite(raw_lifecycle) or not raw_lifecycle.is_integer())
+                    )
+                    or raw_lifecycle <= 0
+                ):
                     raise SystemExit(f"target.lifecycle_days 必须是正整数（天），实际 {raw_lifecycle!r}")
                 lifecycle_days = int(raw_lifecycle)
             profile = get_mc_profile_meta(config, job, args)
@@ -510,7 +530,12 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     finally:
         if keep_spool:
             log(f"已保留本次数据文件（--keep-spool）：{spool.path}")
-        spool.close(keep=keep_spool)
+        try:
+            spool.close(keep=keep_spool)
+        except OSError as exc:
+            # 清理失败（磁盘满/句柄异常）不能把已经确定的返回值/原始异常顶掉：
+            # 调度只看退出码，多一条告警比换个错误码安全
+            log(f"  警告：清理落盘临时文件失败（{exc}）；不影响本次运行结果")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -546,13 +571,22 @@ def main(argv: list[str] | None = None) -> int:
             """密钥类提问：问题同样走 log（留痕），回答走 getpass 不回显。
 
             不回显是为了密钥不进终端 scrollback，也不被 `script` / 录屏抄走——原来走
-            input() 时密钥明文回显在终端上。无 tty 等读不到隐藏输入的场景退回 input()。
+            input() 时密钥明文回显在终端上。无 tty 等读不到隐藏输入的场景退回 input()，
+            但显式提示"会明文回显"（提示语里写着不回显，不能名不符实）。
             """
             log(prompt)
             try:
                 return getpass.getpass("")
-            except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
-                return input()
+            except EOFError:
+                # stdin 已关闭：按用户中断处理，走向导的取消出口，而不是冒成裸 traceback
+                raise KeyboardInterrupt from None
+            except OSError as exc:
+                # 只接"读不到隐藏输入"这类预期错误；其余异常上抛，别把真实缺陷掩盖成输入问题
+                log(f"  警告：当前环境无法隐藏输入（{exc}），退回明文回显的普通输入")
+                try:
+                    return input()
+                except EOFError:
+                    raise KeyboardInterrupt from None
 
         try:
             # echo 也走 log()：带时间戳、写完即 flush（原来用 print，提示语会被输入缓冲

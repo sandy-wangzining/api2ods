@@ -101,13 +101,22 @@ class AuthApplier:
         if self.type == "basic":
             username = str(self.cfg.get("username") or "")
             password = str(self.cfg.get("password") or "")
+            # 缺字段时原来会拼出 "Basic <空>:" 这种请求：接口多半回 401，用户看到的
+            # 是一句含糊的鉴权失败，而不是"配置漏了 password"。库调用方可能没走 validate_job，
+            # 这里也要显式拦住（与其它分支的 ConfigError 口径一致）
+            for field in ("username", "password"):
+                if not str(self.cfg.get(field) or ""):
+                    raise ConfigError(f"auth.type=basic 必须给 auth.{field}（缺了会发出空凭证请求）")
             token = base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
             headers["Authorization"] = f"Basic {token}"
             return
 
         if self.type == "token":
             header = str(self.cfg.get("header") or "Authorization")
-            value = str(self.cfg.get("value") or "")
+            value = str(self.cfg.get("value") or self.cfg.get("token") or "")
+            if not value:
+                # 静默发空值会变成"Bearer "这类必然 401 的请求，问题拖到接口侧才暴露
+                raise ConfigError("auth.type=token 必须给 auth.value（要放进自定义请求头的值）")
             prefix = str(self.cfg.get("prefix") or "")
             headers[header] = f"{prefix}{value}"
             return
@@ -115,6 +124,8 @@ class AuthApplier:
         if self.type == "bearer":
             # 最常见的写法：Authorization: Bearer <token>（配置只需 token 一个字段）
             token = str(self.cfg.get("token") or self.cfg.get("value") or "")
+            if not token:
+                raise ConfigError("auth.type=bearer 必须给 auth.token（如 Bearer <token> 里的值）")
             headers["Authorization"] = f"Bearer {token}"
             return
 
@@ -139,10 +150,16 @@ class AuthApplier:
             return
 
         if self.type == "aliyun_rpc":
+            access_key_id = str(self.cfg.get("access_key_id") or "")
+            access_key_secret = str(self.cfg.get("access_key_secret") or "")
+            if not access_key_id or not access_key_secret:
+                # 用空密钥签名会产出一个格式合法、服务端必然判签名错的请求
+                missing = "access_key_id" if not access_key_id else "access_key_secret"
+                raise ConfigError(f"auth.type=aliyun_rpc 必须给 auth.{missing}（缺了签名必然通不过）")
             sign_aliyun_rpc(
                 params,
-                access_key_id=str(self.cfg.get("access_key_id") or ""),
-                access_key_secret=str(self.cfg.get("access_key_secret") or ""),
+                access_key_id=access_key_id,
+                access_key_secret=access_key_secret,
                 method=method,
             )
             return

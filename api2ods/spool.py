@@ -41,7 +41,9 @@ def dump_record(record) -> str:
     """一条记录 → 单行 JSON（全工具唯一的序列化出口）。"""
     try:
         return json.dumps(record, **_JSON_KWARGS)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
+        # TypeError 与 ValueError 都要接：不可序列化的对象（datetime/set/自定义对象）抛的是
+        # TypeError，只接 ValueError 会让它绕过本处的脱敏与中文报错、变成裸 traceback
         # 先过 redact 再截断：这条报错的正文会被上层原样打进控制台 / --log-file /
         # 调度告警，前 200 字符里完全可能带着 token / 手机号这类密钥与 PII
         # （dump_record 是唯一序列化出口，在这里堵住就断掉了整条泄漏链）
@@ -79,8 +81,14 @@ class SpoolWriter:
             return len(records)
 
     def iter_rows(self):
-        """重新从头逐行读出（可多次调用：写库失败重试时会重新读一遍）。"""
-        self._handle.flush()
+        """重新从头逐行读出（可多次调用：写库失败重试时会重新读一遍）。
+
+        读回必须在"全部写入结束"之后：fetch 全部完成后才进入写库阶段。
+        这里仍把 flush 放进锁里——与并发的 write_records 竞争时，不会在"正在写一半"的
+        时刻刷盘，读到的每一行都是完整的。
+        """
+        with self._lock:
+            self._handle.flush()
         with open(self.path, "r", encoding="utf-8", newline="") as handle:
             for line in handle:  # 逐行读：对超长行（大 JSON）也安全
                 line = line.rstrip("\n")

@@ -13,6 +13,7 @@ import getpass
 import json
 import os
 import re
+import sys
 import urllib.parse
 from pathlib import Path
 
@@ -23,7 +24,7 @@ DEFAULT_METHOD = "GET"
 DEFAULT_DATE_TZ = "Asia/Shanghai"
 DEFAULT_API_TZ = "+08:00"
 DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-DEFAULT_ENDPOINT = "http://service.us-west-1.maxcompute.aliyun.com/api"
+DEFAULT_ENDPOINT = "https://service.us-west-1.maxcompute.aliyun.com/api"
 DEFAULT_START_PARAM = "startTime"
 DEFAULT_END_PARAM = "endTime"
 
@@ -57,6 +58,8 @@ def _default_ask_secret(prompt: str = "") -> str:
     try:
         return getpass.getpass(prompt)
     except Exception:  # noqa: BLE001 - 没有 tty 等场景退回普通输入
+        # 退回 input() 时输入会明文回显，而向导提示语里写着"输入不回显"——必须显式纠正预期
+        print("（警告：当前环境无法隐藏输入，接下来输入的密钥会明文回显）", file=sys.stderr)
         return input(prompt)
 
 
@@ -93,8 +96,10 @@ def _split_url(raw: str) -> tuple[str, str] | None:
     base = f"{parsed.scheme}://{parsed.netloc}"
     path = parsed.path or ""
     if parsed.query:
-        # URL 里的固定 query 参数（如 ?app=xx）：提示用户改成 params（这里先拼回 path 会错）
-        return base, path + ("?" + parsed.query if path else "?" + parsed.query)
+        # URL 里的固定 query 参数（如 ?app=xx）：先原样拼回 path 保证参数不丢
+        # （Fetcher 用 base_url + "/" + path 拼最终地址，"?xx" 会被正确解析成查询串），
+        # 由调用方提示用户改成 request.params（写进 params 更直观、也便于统一加签名）
+        return base, f"{path}?{parsed.query}"
     return base, path
 
 
@@ -330,10 +335,19 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             raise SystemExit(
                 f"--init-out 指向的是目录，需要给文件名：{target_path}（例如 {target_path / (job_name + '.json')}）"
             )
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        if os.name != "nt":
-            os.chmod(target_path, 0o600)  # 含密钥，收紧权限（Windows 忽略）
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            # 文件含 access_key_secret/token/password 明文：先按 0600 创建再写入（write_text 会先按
+            # 默认 umask（通常 0644）创建，再 chmod 之间存在同机其他用户可读的窗口期）
+            fd = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
+            if os.name != "nt":
+                os.chmod(target_path, 0o600)  # 已存在文件的旧权限一并收紧（Windows 忽略）
+        except OSError as exc:
+            echo("")
+            echo(f"写文件失败：{exc}")
+            return 1
 
         echo("")
         echo(f"✅ 已生成：{target_path}")
@@ -350,7 +364,9 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo("已取消，未生成任何文件。")
         return 1
     except RuntimeError as exc:  # "lost sys.stdin"（没有标准输入）
-        if "stdin" not in str(exc):
+        # 只识别明确的 "lost sys.stdin"：靠子串 "stdin" 判断太宽（CPython 换措辞/被包装过的
+        # input 都会漏判或误判），其余 RuntimeError 是真实缺陷，一律上抛
+        if "lost sys.stdin" not in str(exc):
             raise
         echo("")
         echo(f"无法读取交互输入（{exc}）；--init 需要在终端里交互运行。")

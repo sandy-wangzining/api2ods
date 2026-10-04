@@ -47,7 +47,9 @@ def setup_console() -> None:
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:  # noqa: BLE001 - 某些重定向流不支持 reconfigure（如 CI 捕获）
+        except (AttributeError, OSError, ValueError):
+            # 只吞"这个流不支持 reconfigure"（含 io.UnsupportedOperation，它是 OSError/ValueError
+            # 的子类）；吞掉别的异常会把本函数自身的编程错误也一起静默，日后无从排查乱码
             pass
 
 
@@ -115,12 +117,17 @@ def log(message: str) -> None:
     """
     global _console_patched
     if not _console_patched:
-        setup_console()
-        _console_patched = True
+        # check-then-set 放进锁里：多线程首次调用时不会重复执行 setup_console
+        # （TextIOWrapper.reconfigure 不是线程安全的）
+        with _lock:
+            if not _console_patched:
+                setup_console()
+                _console_patched = True
 
     import datetime as _dt
 
-    stamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # 带时区偏移的本地时间：跨时区/夏令时排障时能和调度系统、服务端日志对齐
+    stamp = _dt.datetime.now(_dt.timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
     line = f"[{stamp}] {message}"
     with _lock:
         try:
@@ -278,10 +285,13 @@ def require_identifier(value, where: str) -> str:
     返回 str，方便调用方直接拿去拼语句；不合法抛 ConfigError（SystemExit 子类，
     不可重试、快速失败）。
     """
-    text = str(value)
-    if not _IDENT_RE.match(text):
-        raise ConfigError(f"{where} 不是合法的 MaxCompute 标识符：{text!r}；只允许字母/数字/下划线且不能以数字开头")
-    return text
+    if not isinstance(value, str) or not value:
+        # 不能先 str() 再校验：str(None) == "None"、str(True) == "True" 都能过标识符正则，
+        # 配置漏填时会被静默拼出一个名叫 None / True 的表名——快速失败，别写错对象
+        raise ConfigError(f"{where} 缺失或不是字符串：{value!r}")
+    if not _IDENT_RE.match(value):
+        raise ConfigError(f"{where} 不是合法的 MaxCompute 标识符：{value!r}；只允许字母/数字/下划线且不能以数字开头")
+    return value
 
 
 def check_header_values(headers: dict) -> None:
@@ -351,8 +361,10 @@ _JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
 # URL 里的 userinfo（https://user:pass@host）：代理/接口地址常把账号密码写在地址里，
-# requests 自己的 ProxyError 不带密码，但配置报错与 --check 概要会原样回显整条地址
-_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]*://[^/\s:@]+):([^/\s@]+)@")
+# requests 自己的 ProxyError 不带密码，但配置报错与 --check 概要会原样回显整条地址。
+# scheme 部分限长（{0,63}）：无上限时在长小写字母数字串上会在每个起始位置贪婪回扫
+# （实测 20KB 要 10 秒、40KB 要 50 秒），限长后整条规则保持线性
+_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]{0,63}://[^/\s:@]+):([^/\s@]+)@")
 # 请求头行：'X-Api-Key: xxx' / 'X-Api-Key=xxx'（requests 抛错时带的 headers 是这种形态）。
 # 上一条 Authorization 规则只认 Basic/Bearer 两种值，其余自定义头名要靠这里兜。
 # 值要吃到行尾：只吃第一个词的话，"Authorization: Token abc…" 会变成 "*** abc…"
@@ -469,10 +481,10 @@ def redact(text: str) -> str:
     out = str(text)
     out = _BEARER_RE.sub(_bearer, out)
     out = _BASIC_RE.sub(_bearer, out)
-    # URL userinfo 规则必须同时出现 "://" 与 "@" 才可能匹配，先做一次 O(n) 预判：
-    # 它的 [a-z0-9+.\-]* 没有长度上限，在长文本（整段十六进制转储、超长 token）上会在每个
-    # 起始位置贪婪回扫，实测 20KB 就要 10 秒、40KB 要 50 秒，且 C 层正则期间 Ctrl+C 也打断不了。
-    # 其余规则都有 {1,64} 之类的长度上限（实测线性），只有这一条需要预判。
+    # URL userinfo 规则必须同时出现 "://" 与 "@" 才可能匹配，先做一次 O(n) 预判省掉
+    # 一次无谓的全量扫描。该规则的 scheme 部分已限长（见 _URL_AUTH_RE），配合预判在
+    # 长文本（整段十六进制转储、超长 token）上保持线性；没有预判 + 无上限的旧写法
+    # 实测 20KB 要 10 秒、40KB 要 50 秒，且 C 层正则期间 Ctrl+C 也打断不了。
     # （与 sftp2ods 的同款修复保持一致，见其 utils.redact）
     if "://" in out and "@" in out:
         out = _URL_AUTH_RE.sub(_url_auth, out)
@@ -663,6 +675,10 @@ def retry_call(
 
     重试日志与最终异常都会做脱敏，避免把 URL 里的签名/token 打进日志。
     """
+    if attempts < 1:
+        # attempts<=0 时循环体一次都不执行，last_err 保持 None，最终报错会变成
+        # "重试 -1 次仍失败：None"（丢失失败原因）——提前给一句明确的参数错误
+        raise ValueError(f"retry_call 的 attempts 必须 >= 1，当前 {attempts}")
     delay = base_delay
     last_err = None
     for attempt in range(1, attempts + 1):
@@ -674,9 +690,11 @@ def retry_call(
             last_err = exc
             if attempt == attempts:
                 break
-            log(f"  [{desc} 第 {attempt}/{attempts - 1} 次失败] {redact(str(exc))}；{delay:g}s 后重试")
+            # 分子/分母都按"总尝试次数"口径，避免写成 第 x/(n-1) 次 这种对不上的读法
+            log(f"  [{desc} 第 {attempt}/{attempts} 次尝试失败] {redact(str(exc))}；{delay:g}s 后重试")
             time.sleep(delay)
             delay = min(delay * 2, max_delay)
     # 报"重试 N-1 次"（成功那次之外又试了几次），和 http.py 的口径一致：
-    # 写 attempts 会让人以为总共发了 attempts+1 个请求，对不上实际请求数
-    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{redact(str(last_err))}")
+    # 写 attempts 会让人以为总共发了 attempts+1 个请求，对不上实际请求数；
+    # from last_err 保住原始异常链（调用方按异常类型分流、看底层 SDK 栈都需要它）
+    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{redact(str(last_err))}") from last_err

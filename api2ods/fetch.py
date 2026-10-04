@@ -214,6 +214,10 @@ class Fetcher:
         - range：整个区间一个单元；
         - 没配 window：只有一个单元（不做时间过滤）。
         """
+        if not days:
+            # 空列表原来会掉进 days[0]/param_sets[0] 的裸 IndexError（报错毫无指引）；
+            # 也不返回空列表——那会让"没拉到任何数据"看起来像一次成功运行
+            raise ConfigError("没有可执行的日期（days 为空），请检查 --days/--dates/--start-date 等参数与 window 配置")
         window = self.job.get("window") or {}
         mode = str(window.get("mode") or "per_day").lower()
         param_sets = window_param_sets(self.job, days)
@@ -397,6 +401,16 @@ class Fetcher:
         if "stop_when_short" in page_cfg:
             stop_when_short = as_bool(
                 page_cfg.get("stop_when_short"), default=False, field="pagination.stop_when_short"
+            )
+        if stop_when_short and size_param is None:
+            # 请求里根本没有页大小参数：接口按自己的默认值返回（如 20 条），
+            # "本页条数 < effective_page_size(默认 100)" 会立刻成立——第一页就被当末页收尾，
+            # 静默少数据、写后校验还自洽。配置错要在这里快速失败
+            raise ConfigError(
+                "pagination.stop_when_short 不能与「size_param: null（不发页大小参数）」同时用："
+                "请求里没有页大小，无法用「本页条数 < 页大小」判断末页（接口默认页大小比配置值小时，"
+                "第一页就会被误判成最后一页）。请改用 total_pages_path/total_items_path，"
+                "或恢复 size_param 并在接口文档确认页大小"
             )
 
         effective_page_size = int(_as_number(raw_page_size, 100, "pagination.page_size"))
@@ -593,7 +607,9 @@ class Fetcher:
             # 先落盘再统计：落盘抛错时这条不该算进"成功条数"（磁盘满就是这样，
             # 原来日志会显示拉取成功、实际一条没落盘）
             if on_records is not None:
-                on_records(records)
+                # 交付副本：下面的并发分支在回调后会清空原列表以释放 future 持有的内存，
+                # 调用方即使保留了引用也不会被这次清理影响（传原列表会让"保留引用"静默丢数据）
+                on_records(list(records))
             stats.append((label, len(records)))
             log(f"  {label}：拉取 {len(records):,} 条")
 
@@ -603,9 +619,10 @@ class Fetcher:
                 try:
                     label, records = run_unit(unit)
                     handle(label, records)
-                except FatalApiError:
+                except (FatalApiError, ConfigError):
                     # 同上：不接住就会被下面的 except Exception 吃掉，同一份配置下后面的单元
-                    # 必然同样失败，继续跑只是把错误重复几十遍
+                    # 必然同样失败，继续跑只是把错误重复几十遍（ConfigError 与 run_unit 里的
+                    # 放行口径一致：配置类错误与具体某天数据无关）
                     raise
                 except Exception as exc:  # noqa: BLE001
                     # 统一 redact：on_records（落盘）的报错里可能带着记录原文/密钥，
@@ -624,12 +641,13 @@ class Fetcher:
                         handle(label, records)
                         # future 会一直持有返回值（as_completed 内部的集合要到 fetch_all 返回
                         # 才释放）：不做处理的话，--workers 回补时全窗口数据都驻留内存，打破
-                        # "峰值内存=单个请求单元"的承诺。落盘完成后立即清空（数据已进 spool）
+                        # "峰值内存=单个请求单元"的承诺。落盘完成后立即清空（数据已进 spool；
+                        # on_records 拿到的是副本，不受这次清空影响）
                         if isinstance(records, list):
                             records.clear()
-                    except FatalApiError:
+                    except (FatalApiError, ConfigError):
                         # 不能省：下面的 except Exception 会把它吃掉，变成"每个单元各失败一次"，
-                        # 而 401 对所有单元都成立，继续跑只是把同一个错误重复几十遍
+                        # 而 401/配置错对所有单元都成立，继续跑只是把同一个错误重复几十遍
                         raise
                     except Exception as exc:  # noqa: BLE001
                         # 同上：on_records（落盘）抛出的报错不经 run_unit，必须自己脱敏
