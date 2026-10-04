@@ -225,15 +225,20 @@ def _lock_path(job_path: Path) -> Path:
     for base in candidates:
         try:
             base.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            continue
+        try:
             # 探测文件名必须唯一（mkstemp）：原来用所有作业共享的 ".probe"，并发启动时
             # 别的进程先 unlink 会让本进程抛 FileNotFoundError，于是"静默"落到下一个候选
             # 目录——同一作业的两个实例锁在不同路径上，互斥失效
             handle, probe = tempfile.mkstemp(prefix=".probe-", dir=str(base))
             os.close(handle)
             os.unlink(probe)
-            return base / f"{name}.lock"
-        except OSError:
-            continue
+        except OSError as exc:
+            # 目录已经建出来：探测失败（EMFILE/ENOSPC 等）不能再换一把锁路径，
+            # 否则两个实例各拿各的锁；至少留一条日志，并仍用这个目录
+            log(f"  警告：运行锁目录 {base} 探测写入失败（{exc}），仍使用该目录，避免互斥落到另一路径")
+        return base / f"{name}.lock"
     return Path(tempfile.gettempdir()) / f"api2ods-{name}.lock"
 
 
@@ -350,6 +355,10 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     project, table_name, column, pt = resolve_target(job, config, args, bizdate)
     target_cfg = job.get("target") or {}
     days = resolve_days(args, job, bizdate)
+    if not days:
+        # 后面日志/通知会取 days[0]/days[-1]；空列表是裸 IndexError，调度侧看不到原因
+        log("❌ 没有可执行的日期（days 为空），请检查 --days/--dates/--start-date 等参数与 window 配置")
+        return 1
     pagination = job.get("pagination") or {}
     job_name = job.get("job") or job_path.stem
     notifier = _notifier(job, args)

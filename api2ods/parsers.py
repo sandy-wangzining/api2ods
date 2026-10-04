@@ -358,23 +358,36 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
     （nginx/框架/工具自己补），而 JSONL 规范（jsonlines.org）明确允许最后一行不带换行分隔符，
     `{"a":1}\n{"b":2}` 这种多行 JSONL 整包也解不成一个 JSON 值，照常解析。
     """
-    probe = data.lstrip(b" \t\r\n\xef\xbb\xbf")
-    if probe[:1] not in (b"{", b"["):
-        # 不以 {/[ 开头（整个 ZIP 响应也在这里）不可能是 JSON 错误体
-        return
-    fmt = str(parse_cfg.get("format") or "").lower()
-    # 按配置的编码试，再按 utf-8-sig 试（源是 GBK 时 JSON 错误体同样要抓得住）
-    encodings = []
-    for name in (str(parse_cfg.get("encoding") or "utf-8-sig"), "utf-8-sig"):
+    # 不能只看原始首字节：utf-16/utf-32 带 BOM 时首字节是 \xff/\xfe/\x00，
+    # 会把 JSON 错误体当成 CSV 写进 ODS。先按配置编码解码，再剥 BOM / 空白看首字符。
+    encodings: list[str] = []
+    configured = str(parse_cfg.get("encoding") or "utf-8-sig")
+    for name in (configured, "utf-8-sig"):
         if name.lower() not in [seen.lower() for seen in encodings]:
             encodings.append(name)
-    payload = None
-    parsed = False
+    # utf-16/32 的 BOM 不是 `{`/`[` 的 ASCII 字节；配置没写对应编码时也要认
+    # （不要用 utf-16-sig：标准库没有这个名字，LookupError 会把整次探测短路掉）
+    if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        encodings.append("utf-32")
+    elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings.append("utf-16")
+    texts: list[str] = []
     for name in encodings:
         try:
             text = data.decode(name, "replace")
         except LookupError:
-            return  # 编码名写错：交给 decode() 报"parse.encoding 不是有效的编码名"
+            if name.lower() == configured.lower():
+                return  # 配置的编码名写错：交给 decode() 报 ConfigError
+            continue
+        stripped = text.lstrip("\ufeff").lstrip()
+        if stripped[:1] in "{[":
+            texts.append(stripped)
+    if not texts:
+        return
+    fmt = str(parse_cfg.get("format") or "").lower()
+    payload = None
+    parsed = False
+    for text in texts:
         try:
             payload = loads_json(text)
         except ValueError:
@@ -383,15 +396,13 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
         break
     if not parsed:
         # 解不出来又以 }/] 收尾：大概率是含 NaN/被截断的 JSON 错误体。
-        # （CSV 表头以 { [ 开头虽罕见但合法，所以只在这个更窄的形态上报错）
-        # 尾字符判断前先 rstrip：错误体后面跟一个换行/空格太常见（nginx/框架/工具自己补），
-        # 不裁掉的话判断落空、错误体被当数据解析
-        # jsonl 不走这一支：多行 JSONL 本来就不是一个 JSON 值，整包解不出来是正常的，
-        # 真有坏行由 _parse_text 带着行号报出来，比这里的"疑似被截断"准得多
-        if fmt != "jsonl" and probe.rstrip()[-1:] in (b"}", b"]"):
+        # 尾字符判断用解码后的文本：utf-16 的 } 不是单字节 0x7d。
+        # jsonl 不走这一支：多行 JSONL 本来就不是一个 JSON 值，整包解不出来是正常的
+        stripped = texts[0].lstrip("\ufeff").rstrip()
+        if fmt != "jsonl" and stripped[-1:] in ("}", "]"):
             raise RuntimeError(
                 f"{label} {where}期望文件流，但响应像一个无法解析的 JSON（含 NaN/Infinity 或被截断）："
-                f"{data[:200].decode('utf-8', 'replace')!r}"
+                f"{stripped[:200]!r}"
             )
         return
     if not isinstance(payload, (dict, list)):
@@ -481,12 +492,14 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
             )
         if len(names) > 1:
             # 指定了 entry_contains 却命中多个条目：常见用法（按地区/批次分包、表头一致）
-            # 需要合并，所以不拦；但表头不一致时会拼出字段不齐的记录，得让用户看见
+            # 需要合并，所以不拦；但表头不一致时会拼出字段不齐的记录，必须硬报错
             log(
                 f"  提示：{label} ZIP 里匹配 entry_contains={entry_contains!r} 的条目有 "
                 f"{len(names)} 个，将按文件名顺序合并：{sorted(names)[:5]}"
             )
         records: list[dict] = []
+        seen_headers: tuple | None = None
+        seen_name = ""
         for name in sorted(names):
             try:
                 raw = archive.read(name)
@@ -505,7 +518,18 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
             # 条目单独再过一道：整包是 ZIP（PK 开头）时上面的检查看不到条目内容，
             # 导出失败的 ZIP 里常有一个 {"code":500,...} 的错误体条目，不能当数据写进去
             _reject_json_error_body(raw, parse_cfg, label, where=f"条目 {name!r} ")
-            records.extend(_parse_text(decode(raw, f"条目 {name!r} "), parse_cfg, entry=name, label=label))
+            chunk = _parse_text(decode(raw, f"条目 {name!r} "), parse_cfg, entry=name, label=label)
+            if chunk:
+                headers = tuple(chunk[0])
+                if seen_headers is None:
+                    seen_headers, seen_name = headers, name
+                elif headers != seen_headers:
+                    raise RuntimeError(
+                        f"{label} ZIP 条目表头不一致：{seen_name!r}={list(seen_headers)} "
+                        f"vs {name!r}={list(headers)}；混在一起会写出错位记录，"
+                        f"请用 parse.entry_contains 只取同结构的文件"
+                    )
+            records.extend(chunk)
         return records
 
 

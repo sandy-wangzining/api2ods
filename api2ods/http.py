@@ -373,6 +373,12 @@ def request_with_retry(
     mask = redactor or redact
     delay = retry_delay
     last_err = None
+    # AttributeError/TypeError/KeyError 是配置或代码缺陷，重试只会白等。
+    # 可重试：网络/超时（RequestException 及其子类）、以及 request_once 把解析失败
+    # 包装成的 RuntimeError（截断 JSON / 网关 HTML 页，契约上允许重拉）。
+    retryable: tuple[type[BaseException], ...] = (TimeoutError, ConnectionError, OSError, RuntimeError)
+    if requests is not None:
+        retryable = (requests.exceptions.RequestException, TimeoutError, OSError, RuntimeError)
     for attempt in range(1, attempts + 1):
         try:
             params, headers = build_request()
@@ -383,19 +389,18 @@ def request_with_retry(
             return payload
         except (FatalApiError, ConfigError):
             # 鉴权/配置类错误：重试不会变好，快速失败让调度看到真实原因。
-            # 注意别在这里捕 OSError：requests 的 ConnectionError / Timeout / SSLError
-            # 都是 OSError 子类，捕了会把连接抖动的请求级重试整个误杀
+            # FatalApiError 是 RuntimeError 子类，必须写在 retryable 前面。
             raise
         except RetryLater as exc:
             last_err = exc
             if attempt >= attempts:
                 break
-            wait = exc.seconds if exc.seconds else delay
+            wait = delay if exc.seconds is None else exc.seconds
             # 业务错误（fail_if）的文案可能带接口返回的原文，一样过脱敏
             log(f"  [{desc}] {mask(str(exc))}（第 {attempt}/{attempts - 1} 次），{wait:g}s 后重试")
             time.sleep(wait)
             delay = min(delay * 2, 300)
-        except Exception as exc:  # noqa: BLE001 - 网络/解析类错误统一重试
+        except retryable as exc:
             last_err = exc
             if attempt >= attempts:
                 break

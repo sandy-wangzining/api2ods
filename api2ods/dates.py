@@ -413,6 +413,8 @@ def _check_range_extra_params(win: dict, days: list[date], tz) -> None:
     拉不到（请求有效、条数 > 0、写后校验还自洽），属于"宁可失败"要拦下的那类。
     """
     extra = win.get("extra_params") or {}
+    if not days:
+        raise ConfigError("日期列表为空")
     if not extra or days[0] == days[-1]:
         return
     api_tz = load_api_zone(win.get("api_tz"))
@@ -441,6 +443,8 @@ def window_param_sets(job: dict, days: list[date]) -> list[dict | None]:
     win = job.get("window") or {}
     if not win:
         return [None]
+    if not days:
+        raise ConfigError("日期列表为空")
     try:
         pad_hours = float(win.get("pad_hours") or 0)
     except (TypeError, ValueError):

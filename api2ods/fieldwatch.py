@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -79,8 +81,16 @@ def save_snapshot(job_path: Path, fields, job_name: str) -> None:
     payload = {"job": job_name, "fields": names, "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        handle, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+        try:
+            with os.fdopen(handle, "w", encoding="utf-8") as tmp:
+                tmp.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
     except OSError as exc:
         log(f"  警告：字段快照写入失败（{path}）：{exc}（不影响本次数据）")

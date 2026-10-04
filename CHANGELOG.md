@@ -71,6 +71,40 @@
 - **`run_sync` 的清理失败不再顶掉退出码**：`finally` 里 `spool.close()` 的 `OSError`
   （磁盘满/句柄异常）原来会把已确定的返回值/原始异常替换成 OSError，破坏"调度只看退出码"的约定；
   失败列表里的 label 与同一行的 err 一样过脱敏（label 带查询串的接口地址时不再漏遮）。
+- **运行锁的两处加固**：`_try_lock` 区分 busy（别人持锁）/ 文件系统不支持锁（告警后无锁继续）/
+  其它 OSError（原样抛出）——原来任何 OSError 都被当成"锁被占用"；`_lock_path` 的目录探测
+  失败不再静默落到下一个候选目录（那会让同一作业的两个实例拿不同的锁），而是留告警仍用该目录。
+- **HTTP 重试只重试"可能自己好起来"的错误**：原 `except Exception` 会把 AttributeError/
+  TypeError/KeyError 这类配置或代码缺陷当成网络抖动（默认白等 15+30+60+120+240 秒）；现在只
+  重试 requests 异常/网络/超时/解析类 RuntimeError；`Retry-After: 0` 按立即重试执行（原来 0
+  被当成"没给"退回默认退避）。
+- **`redact` 对敏感请求头整值遮蔽**：Cookie/Set-Cookie 这类不含 token 词的头名整行遮掉；
+  `check_header_values` 显式要求头值是字符串（bytes 走 latin-1，list/dict/int 直接配置错）——
+  不再先 str() 再发出去。
+- **配置校验的假值陷阱**：`fail_if` 不再用 `or []` 兜底（"" / 0 / {} 会被静默当成"没有失败
+  条件"）；page_param/size_param 的"同名"检查只在两者都非空时生效（避免误报）；`target.table`
+  缺失走中文报错而不是裸 KeyError。
+- **分页：`size_param: ""` 与显式 `null` 等价**（原来空串能绕过 stop_when_short 的守卫：
+  不发页大小参数、却让 `is None` 检查认为"没问题"）。
+- **ZIP 多条目合并时表头不一致直接报错**（原来只提示"将合并"，表头不同的条目会拼出字段错位
+  的记录写库）；`_reject_json_error_body` 支持 utf-16/utf-32 BOM（原来只看原始首字节，
+  utf-16 的 JSON 错误体会被当 CSV 写进 ODS）。
+- **SpoolWriter 三处加固**：mkstemp 后直接 `os.fdopen`（不再关 fd 按路径重开，消除竞争窗口）；
+  `close()` 后写入给明确错误（而不是 "I/O operation on closed file"）；整段读回持锁
+  （并发写时不会读到半行）。
+- **auth 的错误类型统一为 ConfigError**（未知鉴权类型/缺 secret_key 原来抛裸 SystemExit，
+  库调用方 catch 不到配置错）；aliyun_rpc 签名前 `pop` 旧 Signature（重复签名不再污染请求）。
+- **向导写配置改为原子写**：先写同目录临时文件（0600）再 `os.replace`，写一半崩溃不会把已有
+  作业（含密钥）截成空文件；覆盖前先 chmod 目标，缩短旧权限窗口；`ValueError` 只把"stdin 已
+  关闭"当取消，其它一律上抛（不再把真实缺陷误报成"已取消"）。
+- **字段快照原子写**（唯一临时名 + `os.replace`，同作业并发写不再互相覆盖出半截 JSON）。
+- **空日期列表给配置错**（不再裸 IndexError）；`_is_zero_count` 对 NaN/Infinity/超大整数按
+  "读不出来"处理（不会误判成"明确的 0 条"提前收尾）。
+- **飞书告警的成功判定兼容 `code=null` / `"0"`**（部分网关只回 `{}` 或 `{"msg":"success","code":null}`，
+  原来会误报失败并反复告警）。
+- **表注释转义反斜杠**（与 sftp2ods/feishu2ods 同款）；`write_partition` 入口先校验分区值白名单。
+- **signers.example.py**：`ctx["request"]` 防御式取值（缺失给明确 ValueError 而不是 KeyError）、
+  xmp 签名兼容 `secret_key` 别名、注释明确"厂商拼接规则不要改"。
 
 ### 安全
 
@@ -111,6 +145,11 @@
   `fail_if` 缺 path、空凭证、分区值白名单、半个环境变量、快照非对象、非对象 JSON 告警、
   `dump_record` 的 TypeError、退出码不被清理失败顶掉、退避时长按预期请求（基类把 sleep
   换成空操作，退避时长用记录调用的方式单独验证）、`signers.example.py` 的示例函数等。
+- **第二次复审批次的回归用例**：ZIP 同表头合并、锁错误分类（busy/不支持/其它）、utf-16
+  错误体、`fail_if` 假值、Cookie/Set-Cookie 遮蔽、`Retry-After: 0` 立即重试、空 days、
+  原子写断言强化（不 O_TRUNC 打开在用文件 + `os.replace` + chmod）、签名 `secret_key` 别名、
+  编程错误不重试等；若干断言改为更强形式（记录级精确比较、`SystemExit` 附带消息断言）
+  （离线用例 607 → 629）。
 - 测试自身的小修：临时目录改用 `TemporaryDirectory` 注册清理（不再往系统 temp 累积）；
   跨本地午夜的"默认业务日"断言改容差（`expected` 或 `expected - 1 天`），消除偶发 flaky。
 

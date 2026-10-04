@@ -58,20 +58,35 @@ class SpoolWriter:
     """线程安全的 JSONL 落盘器（fetch 阶段多个并发单元会同时往里写）。"""
 
     def __init__(self, path: Path | None = None):
-        """path 为 None 时在系统临时目录建文件（mkstemp 先占位，马上以文本模式重新打开）。"""
+        """path 为 None 时在系统临时目录建文件（mkstemp 占位后 fdopen，避免关 fd 再按路径重开）。"""
         if path is None:
             handle, name = tempfile.mkstemp(prefix="api2ods-", suffix=".jsonl")
-            os.close(handle)
-            path = Path(name)
-        self.path = Path(path)
-        self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
+            try:
+                self.path = Path(name)
+                self._handle = os.fdopen(handle, "w", encoding="utf-8", newline="\n")
+            except Exception:
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(name)
+                except OSError:
+                    pass
+                raise
+        else:
+            self.path = Path(path)
+            self._handle = open(self.path, "w", encoding="utf-8", newline="\n")
         self._lock = threading.Lock()
+        self._closed = False
         self.count = 0  # 已写入记录数
         self.bytes = 0  # 已写入字节数（近似值，含换行）
 
     def write_records(self, records: list) -> int:
         """把一批记录序列化后写入文件（返回本批条数）。"""
         with self._lock:
+            if self._closed:
+                raise RuntimeError(f"落盘文件已关闭，不能再写入：{self.path}")
             for record in records:
                 line = dump_record(record)
                 self._handle.write(line + "\n")
@@ -84,16 +99,16 @@ class SpoolWriter:
         """重新从头逐行读出（可多次调用：写库失败重试时会重新读一遍）。
 
         读回必须在"全部写入结束"之后：fetch 全部完成后才进入写库阶段。
-        这里仍把 flush 放进锁里——与并发的 write_records 竞争时，不会在"正在写一半"的
-        时刻刷盘，读到的每一行都是完整的。
+        整段读持锁：否则并发 write_records 可能 flush 出半行，读到的就不是完整 JSON。
         """
         with self._lock:
-            self._handle.flush()
-        with open(self.path, "r", encoding="utf-8", newline="") as handle:
-            for line in handle:  # 逐行读：对超长行（大 JSON）也安全
-                line = line.rstrip("\n")
-                if line:
-                    yield line
+            if not self._closed:
+                self._handle.flush()
+            with open(self.path, "r", encoding="utf-8", newline="") as handle:
+                for line in handle:  # 逐行读：对超长行（大 JSON）也安全
+                    line = line.rstrip("\n")
+                    if line:
+                        yield line
 
     def iter_batches(self, batch_size: int = 1000, max_bytes: int = 8_000_000):
         """按批读回，每批 ≤ batch_size 行且 ≤ max_bytes 字节。
@@ -114,15 +129,23 @@ class SpoolWriter:
             yield batch
 
     def close(self, keep: bool = False) -> None:
-        """关闭并（默认）删除临时文件；keep=True 时保留（排障/手工重传用）。"""
-        try:
-            self._handle.close()
-        finally:
-            if not keep:
-                try:
-                    self.path.unlink()
-                except OSError:
-                    pass
+        """关闭并（默认）删除临时文件；keep=True 时保留（排障/手工重传用）。
+
+        与 write_records 共用一把锁：并发单元还在写时不能先关句柄；关完置位，
+        之后再写入给出明确错误，而不是 "I/O operation on closed file"。
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._handle.close()
+            finally:
+                if not keep:
+                    try:
+                        self.path.unlink()
+                    except OSError:
+                        pass
 
     def __enter__(self):
         """支持 with 写法（目前调用方是按需 close，见 __exit__ 注释）。"""

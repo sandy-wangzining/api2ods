@@ -108,9 +108,13 @@ def _is_zero_count(value) -> bool:
     """
     if value is None or value == "" or isinstance(value, bool):
         return False
+    if isinstance(value, float) and not math.isfinite(value):
+        # NaN == 0 为 False，但 inf 也不能当"明确的 0 条"去收尾
+        return False
     try:
         return float(value) == 0
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # 超大整数转 float 会 OverflowError：不是 0，按"读不出来"处理
         return False
 
 
@@ -366,7 +370,12 @@ class Fetcher:
         # size_param 显式写 null = 不带页大小参数（游标接口不认 size 时用）；
         # 没写才用默认名 "size"
         size_param_value = page_cfg.get("size_param", "size")
-        size_param = None if size_param_value is None else str(size_param_value)
+        # 显式 null 与空串都当成"不带页大小"：空串原来会绕过下面的 stop_when_short 守卫
+        # （`if size_param:` 为假、不发参数），却过得了 `is None` 检查
+        if size_param_value is None or size_param_value == "":
+            size_param = None
+        else:
+            size_param = str(size_param_value)
         # 不能写成 `page_size_override or page_cfg.get("page_size") or 100`：
         # 配了 page_size=0（想表达"别带 size"却漏了 size_param:null）会被静默换成 100，
         # 页大小翻 100 倍、条数校验还拿这一页自比。这里显式区分"没填"和"填了 0/负数"

@@ -166,7 +166,7 @@ def build_target_ddl(
     column = require_identifier(column, "target.column")
     if stored_as:
         stored_as = require_identifier(stored_as, "target.stored_as")
-    table_comment = (comment or "API 原始 JSON 原样落库").replace("'", "''")
+    table_comment = (comment or "API 原始 JSON 原样落库").replace("\\", "\\\\").replace("'", "''")
     lines = [
         f"create table if not exists {project}.{table} (",
         f"    {column} string comment 'API 原始 JSON 文本（整条记录原样）'",
@@ -246,6 +246,7 @@ def write_partition(
     - 单行超过 MAX_ROW_BYTES 直接报错；检查在删分区之前只做一次（数据在写入阶段不变）——
       这类记录永远写不进去，先删后失败等于白丢一天数据（重跑也救不回来，只能重拉 API）。
     """
+    partition_value = _partition_literal(partition_value)
     spec = f"{PARTITION_COLUMN}={partition_value}"
     # 每一次重试都是"先删分区、再重新写"：只要删成功过，这个分区就已经不在原位了。
     # 重试全部失败时，旧数据不会自己回来——必须让调度侧知道"这里可能缺数、要重跑"。

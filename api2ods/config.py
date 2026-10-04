@@ -546,9 +546,12 @@ def validate_job(job: dict) -> None:
             )
         # 两个参数同名时：组装请求时 size 会覆盖 page，接口永远收到同一页的请求，
         # 同一页被反复拉取、再按终点正常收尾——重复行写进 ODS，写后条数校验还自洽
-        if str(pagination.get("page_param") or "") == str(pagination.get("size_param") or ""):
+        page_param = str(pagination.get("page_param") or "")
+        size_param = str(pagination.get("size_param") or "")
+        # 两个都空时（没走 normalize、也没写参数名）不是"同名覆盖"，后面会按缺省各自补默认值
+        if page_param and size_param and page_param == size_param:
             raise SystemExit(
-                f"pagination.page_param 与 size_param 不能同名（都是 {pagination.get('page_param')!r}）："
+                f"pagination.page_param 与 size_param 不能同名（都是 {page_param!r}）："
                 f"页大小会覆盖页码参数，接口只会返回同一页，重复行会静默写进 ODS"
             )
         if not has_total and not stop_when_short:
@@ -599,10 +602,14 @@ def validate_job(job: dict) -> None:
             f"时生效：当前每条记录会多出一个恒为空的字段；不需要请删掉它，需要就用 unzip 打开"
         )
 
-    fail_if = request.get("fail_if") or []
-    if not isinstance(fail_if, list):
-        raise SystemExit('request.fail_if 必须是数组（每个元素形如 {"path": "Code", "not_equals": "Success"}）')
-    for cond in fail_if:
+    fail_if = request.get("fail_if")
+    if fail_if is not None and not isinstance(fail_if, list):
+        # 不能 `or []` 再查类型："" / 0 / {} 都是假值，会静默当成"没有失败条件"
+        raise SystemExit(
+            f'request.fail_if 必须是数组（每个元素形如 {{"path": "Code", "not_equals": "Success"}}），'
+            f"实际 {type(fail_if).__name__}：{_show(fail_if)}"
+        )
+    for cond in fail_if or []:
         if not isinstance(cond, dict) or not cond.get("path"):
             raise SystemExit("request.fail_if 每个元素必须包含 path")
         if "equals" not in cond and "not_equals" not in cond:
@@ -611,7 +618,8 @@ def validate_job(job: dict) -> None:
     # 目标表标识符会直接拼进 DDL / SQL：在这里白名单校验，挡住拼错/SQL 注入
     if target.get("project"):
         require_identifier(target["project"], "target.project")
-    require_identifier(target["table"], "target.table")
+    # .get：缺 table 走 require_identifier 的中文配置错，不要裸 KeyError
+    require_identifier(target.get("table"), "target.table")
     if target.get("column"):
         require_identifier(target["column"], "target.column")
     if target.get("stored_as"):

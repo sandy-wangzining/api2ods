@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -199,22 +200,49 @@ class RunLock:
                 self.fh.close()
 
 
+# flock / msvcrt 忙：别人正持锁。只把这类错误当成"已有任务在运行"。
+_LOCK_BUSY = {errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK}
+if hasattr(errno, "EDEADLK"):
+    _LOCK_BUSY.add(errno.EDEADLK)
+if hasattr(errno, "EDEADLOCK"):
+    _LOCK_BUSY.add(errno.EDEADLOCK)
+# 文件系统不支持锁 / 锁资源耗尽：不能伪装成"已有任务在运行"
+_LOCK_UNSUPPORTED = set()
+for _name in ("ENOLCK", "ENOTSUP", "EOPNOTSUPP"):
+    if hasattr(errno, _name):
+        _LOCK_UNSUPPORTED.add(getattr(errno, _name))
+
+
 def _try_lock(fh) -> bool:
-    """对已打开的文件加排它锁；别人拿着锁时返回 False（不阻塞等待）。"""
+    """对已打开的文件加排它锁；别人拿着锁时返回 False（不阻塞等待）。
+
+    三类 OSError 必须分开：忙=False，文件系统不支持=告警后当没锁继续，其余原样抛出。
+    """
     if fcntl is not None:
         try:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return True
-        except OSError:
-            return False
+        except OSError as exc:
+            return _lock_oserror_result(exc)
     if msvcrt is not None:
         try:
             fh.seek(0)
             msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
             return True
-        except OSError:
-            return False
+        except OSError as exc:
+            return _lock_oserror_result(exc)
     return True  # 两种锁都没有：不阻塞（退回"无锁"行为）
+
+
+def _lock_oserror_result(exc: OSError) -> bool:
+    """busy → False；不支持 → True（不加锁继续）；其它 OSError 上抛。"""
+    code = exc.errno
+    if code in _LOCK_BUSY:
+        return False
+    if code in _LOCK_UNSUPPORTED:
+        log(f"  警告：当前文件系统不支持运行锁（{exc}），本次不加锁继续；并发启动同一作业将无法互斥")
+        return True
+    raise exc
 
 
 def _unlock(fh) -> None:
@@ -303,7 +331,19 @@ def check_header_values(headers: dict) -> None:
     所以在这里提前拦下，报错只给头名、不回显值。
     """
     for name, value in (headers or {}).items():
-        text = str(value)
+        if isinstance(value, bytes):
+            try:
+                text = value.decode("latin-1")
+            except UnicodeDecodeError:
+                raise ConfigError(
+                    f"请求头 {name} 的值含非 latin-1 字符（中文等），HTTP 头发不出去；值不回显以免泄漏密钥"
+                )
+        elif isinstance(value, str):
+            text = value
+        else:
+            # 先拦再 str()：list/dict/int 转成字符串再发出去，接口行为未定义；
+            # 报错只给类型、不回显值（值里可能就是 token）
+            raise ConfigError(f"请求头 {name} 的值必须是字符串（实际 {type(value).__name__}）；值不回显以免泄漏密钥")
         if text != text.strip() or "\r" in text or "\n" in text:
             raise ConfigError(
                 f"请求头 {name} 的值首尾有空白或含换行（配置或密钥里多半抄多了空格/换行）；值不回显以免泄漏密钥"
@@ -473,8 +513,12 @@ def redact(text: str) -> str:
         return f"{match.group(1)}={redact(value)}"
 
     def _header(match: re.Match) -> str:
-        """多行文本里的一行 "Header: value"：只吃头名命中密钥词的行。"""
-        if _is_sensitive_key(match.group(2)):
+        """多行文本里的一行 "Header: value"：只吃头名命中密钥词 / 敏感头名的行。
+
+        Cookie / Set-Cookie 不含 token/secret 这类词，但整行都是会话凭证，必须整值遮掉。
+        """
+        header_name = match.group(2)
+        if header_name.lower() in _SECRET_HEADER_KEYS or _is_sensitive_key(header_name):
             return f"{match.group(1)}***"
         return f"{match.group(1)}{redact(match.group(3))}"
 

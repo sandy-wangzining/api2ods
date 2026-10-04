@@ -38,6 +38,7 @@ def sign_aliyun_rpc(
 
     nonce / timestamp 参数只为单测固定值用；生产走默认（随机 nonce + 当前 UTC 时间）。
     """
+    params.pop("Signature", None)
     params.setdefault("Format", "JSON")
     params.setdefault("SignatureMethod", "HMAC-SHA1")
     params.setdefault("SignatureVersion", ALIYUN_RPC_SIGNATURE_VERSION)
@@ -182,7 +183,7 @@ class AuthApplier:
                 raise ConfigError(f"自定义签名函数 {self._custom_name} 执行失败：{redact(repr(exc))}") from exc
             return
 
-        raise SystemExit(f"未知鉴权类型：{self.type}")
+        raise ConfigError(f"未知鉴权类型：{self.type}")
 
     def _apply_sha256_concat(self, params: dict, headers: dict) -> None:
         """Onerway 式签名：非空参数按 key 排序拼接 + 密钥，sha256 十六进制。
@@ -192,7 +193,7 @@ class AuthApplier:
         """
         secret = str(self.cfg.get("secret_key") or "")
         if not secret:
-            raise SystemExit("auth.type=sha256_concat 必须给 auth.secret_key")
+            raise ConfigError("auth.type=sha256_concat 必须给 auth.secret_key")
         sign_field = str(self.cfg.get("sign_field") or "sign")
         sign_in = str(self.cfg.get("sign_in") or "body").lower()
         keys = sorted(k for k in params if k != sign_field and params[k] not in (None, ""))

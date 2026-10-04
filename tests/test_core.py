@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import errno
 import gc
 import hashlib
 import hmac
@@ -184,8 +185,10 @@ class TestValidateJob(OfflineTestCase):
     def test_missing_table(self):
         job = minimal_job()
         del job["target"]["table"]
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(SystemExit) as ctx:
             config_mod.validate_job(job)
+        self.assertIn("target.table", str(ctx.exception))
+        self.assertNotIn("KeyError", str(ctx.exception))
 
     def test_bad_method(self):
         job = minimal_job()
@@ -863,10 +866,20 @@ class TestParsers(OfflineTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             parsers.parse_bytes(self._zip_bytes(), {"format": "csv", "unzip": True}, "t")
         self.assertIn("entry_contains", str(ctx.exception))
+        with self.assertRaises(RuntimeError) as ctx:
+            parsers.parse_bytes(self._zip_bytes(), {"format": "csv", "unzip": True, "allow_multi_entry": True}, "t")
+        self.assertIn("表头不一致", str(ctx.exception))
+
+    def test_zip_multi_entry_same_headers_merge(self):
+        """表头一致的多条目才允许合并。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("a.csv", "user,amount\nu1,5\n")
+            archive.writestr("b.csv", "user,amount\nu2,6\n")
         records = parsers.parse_bytes(
-            self._zip_bytes(), {"format": "csv", "unzip": True, "allow_multi_entry": True}, "t"
+            buffer.getvalue(), {"format": "csv", "unzip": True, "allow_multi_entry": True}, "t"
         )
-        self.assertEqual(len(records), 2)
+        self.assertEqual(records, [{"user": "u1", "amount": "5"}, {"user": "u2", "amount": "6"}])
 
     def test_encoding_mismatch_warns_and_strict_raises(self):
         """GBK 字节按默认编码解出乱码：默认告警（行数仍 >0），strict_encoding=true 直接报错。"""
@@ -2696,10 +2709,10 @@ class TestInitWizard(OfflineTestCase):
                 )
             self.assertEqual(code, 0)
             self.assertTrue(path.is_file())
-        fake_os.chmod.assert_called_once_with(path, 0o600)
-        # 创建时就带 0600（不是先 0644 再收紧）
-        open_call = next(call for call in fake_os.open.call_args_list if os.fspath(call.args[0]) == str(path))
-        self.assertEqual(open_call.args[2], 0o600)
+        self.assertTrue(fake_os.chmod.called)
+        fake_os.chmod.assert_called_with(path, 0o600)
+        open_modes = [call.args[2] for call in fake_os.open.call_args_list if len(call.args) >= 3]
+        self.assertIn(0o600, open_modes)
 
     def test_relative_out_path_is_resolved_under_workdir(self):
         """--init-out 给相对路径时按工作目录解析（否则会落到进程的当前目录）。"""
@@ -4661,7 +4674,7 @@ class TestUtilsDefensiveBranches(OfflineTestCase):
         with mock.patch.object(utils, "fcntl", fake_fcntl):
             self.assertTrue(utils._try_lock("fh"))
             fake_fcntl.flock.assert_called_once_with("fh", 6)
-            fake_fcntl.flock.side_effect = OSError("Resource temporarily unavailable")
+            fake_fcntl.flock.side_effect = OSError(errno.EAGAIN, "Resource temporarily unavailable")
             self.assertFalse(utils._try_lock("fh"))
 
     def test_unlock_releases_flock_and_swallows_oserror(self):
@@ -5361,7 +5374,7 @@ class TestAuthErrorBranches(OfflineTestCase):
 
     def test_sha256_concat_requires_secret_key(self):
         applier = auth_mod.AuthApplier({"auth": {"type": "sha256_concat"}}, Path("."))
-        with self.assertRaises(SystemExit) as ctx:
+        with self.assertRaises(utils.ConfigError) as ctx:
             applier.apply({"a": 1}, {}, "GET")
         self.assertIn("secret_key", str(ctx.exception))
 
@@ -5423,6 +5436,9 @@ class TestFetchDefensiveBranches(OfflineTestCase):
         self.assertTrue(fetch_mod._is_zero_count("0"))
         self.assertFalse(fetch_mod._is_zero_count([]))
         self.assertFalse(fetch_mod._is_zero_count("很多"))
+        self.assertFalse(fetch_mod._is_zero_count(float("nan")))
+        self.assertFalse(fetch_mod._is_zero_count(float("inf")))
+        self.assertFalse(fetch_mod._is_zero_count(10**10000))
 
     def test_probe_with_no_units_reports_clearly(self):
         """日期列表为空（如 --dates 全是空值）时窗口展开不出任何单元：要明确报错。"""
@@ -6320,6 +6336,12 @@ class TestSeventhPassRedaction(OfflineTestCase):
             self.assertIn("X-Api-Key", str(ctx.exception))
             self.assertNotIn("SECRET", str(ctx.exception))
         utils.check_header_values({"X-Api-Key": "ok-token-123"})
+        utils.check_header_values({"X-Api-Key": b"ok-token-123"})
+        with self.assertRaises(utils.ConfigError) as ctx:
+            utils.check_header_values({"X-Api-Key": ["SECRET", "list"]})
+        self.assertIn("X-Api-Key", str(ctx.exception))
+        self.assertIn("字符串", str(ctx.exception))
+        self.assertNotIn("SECRET", str(ctx.exception))
 
 
 class TestSeventhPassRetryAndPlatform(OfflineTestCase):
@@ -7147,6 +7169,14 @@ class TestTenthPassReview(OfflineTestCase):
             config_mod.validate_job(job)
         self.assertIn("同名", str(ctx.exception))
 
+    def test_page_and_size_param_same_name_skipped_when_either_empty(self):
+        """两个参数名都空（没走 normalize）不是同名覆盖，不能误拦。"""
+        job = minimal_job()
+        job["pagination"] = {"type": "page", "total_pages_path": "pages"}
+        config_mod.validate_job(job)
+        job["pagination"] = {"type": "page", "page_param": "p", "total_pages_path": "pages"}
+        config_mod.validate_job(job)
+
     def test_range_extra_params_boundary_rejected(self):
         """range 模式下 extra_params 跨月：整段只发一次请求、派生参数只能取首日的值，
         后半段数据会静默拉不到——配置阶段直接拦下。"""
@@ -7293,10 +7323,19 @@ class TestEleventhPassReview(OfflineTestCase):
         signers = self._load_signers_example()
         with self.assertRaises(ValueError):
             signers.onerway_sign({"request": {}})  # 缺 params
+        with self.assertRaises(ValueError) as ctx:
+            signers.onerway_sign({"params": {}})  # 缺 request
+        self.assertIn("request", str(ctx.exception))
         with self.assertRaises(ValueError):
             signers.onerway_sign({"params": {}, "request": {}})  # 缺 secret_key
         with self.assertRaises(ValueError):
             signers.xmp_sign({"request": {}})  # 缺 client_id/secret
+        with self.assertRaises(ValueError) as ctx:
+            signers.xmp_sign({"params": {}})  # 缺 request
+        self.assertIn("request", str(ctx.exception))
+        with self.assertRaises(ValueError) as ctx:
+            signers.xmp_sign({"request": {"client_id": "cid"}})
+        self.assertIn("secret_key", str(ctx.exception))
 
     def test_signers_example_xmp_sign_works(self):
         signers = self._load_signers_example()
@@ -7697,6 +7736,221 @@ class TestRunSyncFieldDrift(SyncFlowTestCase):
         self.assertEqual(code, 1)
         notifier.assert_not_called()
         self.assertEqual(fieldwatch_mod.load_snapshot(self.job_path), before)
+
+
+class TestHarnessReviewFixes(OfflineTestCase):
+    """harness 复审点：空 days、Cookie 脱敏、Retry-After 0、鉴权 ConfigError、Spool 关闭。"""
+
+    def test_run_sync_empty_days_returns_1(self):
+        job = config_mod.normalize_job(config_mod.render_job(minimal_job(), {}, date(2026, 9, 20)))
+        logs = []
+        with (
+            mock.patch.object(cli_mod, "resolve_days", return_value=[]),
+            mock.patch.object(cli_mod, "log", side_effect=lambda msg: logs.append(str(msg))),
+        ):
+            code = cli_mod.run_sync(job, {}, Path("config.json"), make_args(), date(2026, 9, 20), Path("demo.json"))
+        self.assertEqual(code, 1)
+        self.assertTrue(any("days 为空" in line for line in logs))
+
+    def test_cookie_header_is_redacted(self):
+        for text in ("Cookie: session=abc123secret", "Set-Cookie: sid=abc123secret; Path=/"):
+            redacted = utils.redact(text)
+            self.assertNotIn("abc123secret", redacted, text)
+            self.assertIn("***", redacted)
+
+    def test_retry_after_zero_is_immediate_retry(self):
+        """Retry-After: 0 表示立刻重试，不能当成假值而改走默认退避。"""
+        sleeps = []
+
+        def once_then_ok(*_args, **_kwargs):
+            if not sleeps:
+                raise http_mod.RetryLater(0.0, "HTTP 429")
+            return {"ok": True}
+
+        with (
+            mock.patch.object(http_mod, "request_once", side_effect=once_then_ok),
+            mock.patch.object(http_mod.time, "sleep", side_effect=sleeps.append),
+        ):
+            payload = http_mod.request_with_retry(
+                "GET", "https://x", lambda: ({}, {}), "json", 5, retry_times=2, retry_delay=15, desc="拉取"
+            )
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(sleeps, [0.0])
+
+    def test_unknown_auth_type_is_config_error(self):
+        applier = auth_mod.AuthApplier({"auth": {"type": "magic"}}, Path("."))
+        with self.assertRaises(utils.ConfigError) as ctx:
+            applier.apply({}, {})
+        self.assertIn("未知鉴权类型", str(ctx.exception))
+
+    def test_aliyun_rpc_pops_previous_signature(self):
+        params = {"Action": "X", "Signature": "OLD_SIGNATURE"}
+        expected = reference_aliyun_sign({"Action": "X"}, "AKID", "SECRET", "nonce123", "2026-09-18T00:00:00Z")
+        got = auth_mod.sign_aliyun_rpc(params, "AKID", "SECRET", nonce="nonce123", timestamp="2026-09-18T00:00:00Z")
+        self.assertEqual(got, expected)
+        self.assertEqual(params["Signature"], expected)
+
+    def test_spool_write_after_close_errors_clearly(self):
+        spool = spool_mod.SpoolWriter()
+        try:
+            spool.write_records([{"a": 1}])
+            spool.close(keep=True)
+            with self.assertRaises(RuntimeError) as ctx:
+                spool.write_records([{"b": 2}])
+            self.assertIn("已关闭", str(ctx.exception))
+        finally:
+            spool.close()
+
+    def test_xmp_sign_accepts_secret_key_alias(self):
+        path = Path(__file__).resolve().parents[1] / "signers.example.py"
+        spec = importlib.util.spec_from_file_location("signers_example_secret_key", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        result = module.xmp_sign({"request": {"client_id": "cid", "secret_key": "sec"}})
+        self.assertEqual(result["params"]["client_id"], "cid")
+        self.assertEqual(len(result["params"]["sign"]), 32)
+
+    def test_ddl_comment_escapes_backslash_then_quotes(self):
+        ddl = mc_mod.build_target_ddl("p", "t", "json", r"it's a \path")
+        self.assertIn(r"'it''s a \\path'", ddl)
+
+    def test_write_partition_rejects_illegal_partition_value(self):
+        table = FakeTable()
+        with self.assertRaises(utils.ConfigError) as ctx:
+            mc_mod.write_partition(table, "ods_x", "pt'; drop table x", lambda: iter([]), total=0)
+        self.assertIn("分区值", str(ctx.exception))
+        self.assertEqual(table.deleted, [])
+
+
+class TestRemainingProductBugs(OfflineTestCase):
+    """剩余产品缺陷回归：JSON BOM、ZIP 表头、fail_if、锁、分页、重试、日期空列表、通知码。"""
+
+    def test_utf16_bom_json_error_body_detected(self):
+        payload = '{"error": "no permission"}'.encode("utf-16")
+        with self.assertRaises(RuntimeError) as ctx:
+            parsers.parse_bytes(payload, {"format": "csv", "encoding": "utf-16"}, "导出")
+        self.assertIn("返回了 JSON", str(ctx.exception))
+        with self.assertRaises(RuntimeError) as ctx:
+            parsers.parse_bytes(payload, {"format": "csv"}, "导出")
+        self.assertIn("返回了 JSON", str(ctx.exception))
+
+    def test_fail_if_falsey_non_list_rejected(self):
+        for bad in ("", 0, {}, False):
+            job = minimal_job()
+            job["request"]["fail_if"] = bad
+            with self.assertRaises(SystemExit) as ctx:
+                config_mod.validate_job(job)
+            self.assertIn("必须是数组", str(ctx.exception))
+
+    def test_try_lock_unsupported_continues_without_mutex(self):
+        fake_fcntl = mock.Mock()
+        fake_fcntl.LOCK_EX, fake_fcntl.LOCK_NB = 2, 4
+        if not utils._LOCK_UNSUPPORTED:
+            self.skipTest("platform has no ENOLCK/ENOTSUP")
+        code = next(iter(utils._LOCK_UNSUPPORTED))
+        fake_fcntl.flock.side_effect = OSError(code, "Operation not supported")
+        with mock.patch.object(utils, "fcntl", fake_fcntl), mock.patch.object(utils, "log"):
+            self.assertTrue(utils._try_lock("fh"))
+
+    def test_try_lock_other_oserror_raises(self):
+        fake_fcntl = mock.Mock()
+        fake_fcntl.LOCK_EX, fake_fcntl.LOCK_NB = 2, 4
+        fake_fcntl.flock.side_effect = OSError(errno.EBADF, "Bad file descriptor")
+        with mock.patch.object(utils, "fcntl", fake_fcntl):
+            with self.assertRaises(OSError):
+                utils._try_lock("fh")
+
+    def test_lock_path_probe_failure_does_not_silently_fallback(self):
+        logged = []
+        job_path = Path("jobs/demo.json")
+        with (
+            mock.patch.object(tempfile, "mkstemp", side_effect=OSError(errno.ENOSPC, "No space left")),
+            mock.patch.object(cli_mod, "log", side_effect=lambda msg: logged.append(str(msg))),
+        ):
+            path = cli_mod._lock_path(job_path)
+        self.assertTrue(logged)
+        self.assertIn("探测", "".join(logged))
+        self.assertEqual(path.parent, cli_mod.ROOT / ".run-locks")
+
+    def test_empty_size_param_blocks_stop_when_short(self):
+        job = minimal_job(
+            pagination={
+                "type": "page",
+                "page_param": "page",
+                "size_param": "",
+                "page_size": 100,
+                "stop_when_short": True,
+                "delay_seconds": 0,
+            }
+        )
+        with self.assertRaises(utils.ConfigError) as ctx:
+            fetch_mod.Fetcher(job, Path(".")).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+        self.assertIn("stop_when_short", str(ctx.exception))
+
+    def test_http_retry_skips_programming_errors(self):
+        for exc in (AttributeError("x"), TypeError("x"), KeyError("x")):
+            calls = []
+
+            def boom(*_a, _exc=exc, **_k):
+                calls.append(1)
+                raise _exc
+
+            with (
+                mock.patch.object(http_mod, "request_once", side_effect=boom),
+                mock.patch.object(http_mod.time, "sleep") as slept,
+            ):
+                with self.assertRaises(type(exc)):
+                    http_mod.request_with_retry(
+                        "GET", "http://x", lambda: ({}, {}), "json", 5, retry_times=3, retry_delay=0
+                    )
+            self.assertEqual(len(calls), 1, msg=type(exc).__name__)
+            slept.assert_not_called()
+
+    def test_empty_days_is_config_error(self):
+        with self.assertRaises(utils.ConfigError) as ctx:
+            dates_mod.window_param_sets({"window": {"start_param": "s", "end_param": "e"}}, [])
+        self.assertIn("日期列表为空", str(ctx.exception))
+
+    def test_notify_string_zero_and_null_code_are_success(self):
+        if not _REQUESTS_AVAILABLE:
+            self.skipTest("没装 requests")
+        for payload in ({"code": "0"}, {"code": None, "msg": "ok"}, {"StatusCode": 0}):
+            resp = mock.Mock(status_code=200)
+            resp.json.return_value = payload
+            with mock.patch.object(notify_mod.requests, "post", return_value=resp):
+                self.assertTrue(notify_mod.notify("https://hook", "t", ["x"]), msg=payload)
+
+    def test_wizard_value_error_from_dumps_is_not_cancel(self):
+        mapping = {"API 完整地址": "https://a.example.com/x", "AccessKeyId": "A", "AccessKeySecret": "S"}
+        ask = TestInitWizard._answers(mapping, ["0", "0", "0", "0"])
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(init_wizard.json, "dumps", side_effect=ValueError("circular")):
+                with self.assertRaises(ValueError):
+                    init_wizard.run_init(
+                        out_path=str(Path(tmp) / "w.json"),
+                        ask=ask,
+                        ask_secret=ask,
+                        echo=lambda *a: None,
+                        workdir=Path(tmp),
+                    )
+
+    def test_snapshot_uses_unique_tmp_name(self):
+        names = []
+        real_mkstemp = tempfile.mkstemp
+
+        def spy_mkstemp(*args, **kwargs):
+            handle, name = real_mkstemp(*args, **kwargs)
+            names.append(name)
+            return handle, name
+
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp) / "demo.json"
+            with mock.patch.object(tempfile, "mkstemp", side_effect=spy_mkstemp):
+                fieldwatch_mod.save_snapshot(job, ["a"], "demo")
+                fieldwatch_mod.save_snapshot(job, ["a", "b"], "demo")
+        self.assertEqual(len(names), 2)
+        snap = fieldwatch_mod.snapshot_path(job).name
+        self.assertTrue(all(snap in Path(item).name for item in names))
 
 
 if __name__ == "__main__":

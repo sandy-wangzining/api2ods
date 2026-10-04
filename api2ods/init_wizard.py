@@ -103,6 +103,34 @@ def _split_url(raw: str) -> tuple[str, str] | None:
     return base, path
 
 
+def _atomic_write_job(target_path: Path, job: dict) -> None:
+    """先写同目录临时文件再 replace：写入中途失败不会把已有作业（含密钥）截成空文件。
+
+    覆盖已存在文件时，os.open 的 0600 只影响新建；先 chmod 目标再写，缩短旧权限窗口。
+    """
+    payload = json.dumps(job, ensure_ascii=False, indent=2) + "\n"
+    if os.name != "nt":
+        try:
+            if target_path.exists():
+                os.chmod(target_path, 0o600)
+        except OSError:
+            pass
+    tmp_path = target_path.with_name(f"{target_path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp_path, target_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    if os.name != "nt":
+        os.chmod(target_path, 0o600)
+
+
 def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = None, ask_secret=None) -> int:
     """交互式生成作业配置，返回退出码（0 成功 / 1 取消）。
 
@@ -337,13 +365,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             )
         try:
             target_path.parent.mkdir(parents=True, exist_ok=True)
-            # 文件含 access_key_secret/token/password 明文：先按 0600 创建再写入（write_text 会先按
-            # 默认 umask（通常 0644）创建，再 chmod 之间存在同机其他用户可读的窗口期）
-            fd = os.open(target_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(job, ensure_ascii=False, indent=2) + "\n")
-            if os.name != "nt":
-                os.chmod(target_path, 0o600)  # 已存在文件的旧权限一并收紧（Windows 忽略）
+            _atomic_write_job(target_path, job)
         except OSError as exc:
             echo("")
             echo(f"写文件失败：{exc}")
@@ -357,9 +379,17 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo(f"  3) 试跑：  api2ods --job {target_path.name} --days 1 --dry-run")
         echo(f"  4) 正式：  api2ods --job {target_path.name} --bizdate ${{bizdate}}")
         return 0
-    except (KeyboardInterrupt, EOFError, ValueError):
+    except (KeyboardInterrupt, EOFError):
         # stdin 被关闭（`api2ods --init <&-`、CI 里没接管道）时 input() 抛的是
-        # ValueError / RuntimeError，不是 EOFError，漏掉就是一屏裸 traceback
+        # ValueError / RuntimeError，不是 EOFError；ValueError 只认"关闭的 stdin"，
+        # 其余是真实缺陷（json.dumps / 组装逻辑），一律上抛
+        echo("")
+        echo("已取消，未生成任何文件。")
+        return 1
+    except ValueError as exc:
+        message = str(exc).lower()
+        if "closed" not in message and "i/o operation" not in message:
+            raise
         echo("")
         echo("已取消，未生成任何文件。")
         return 1
