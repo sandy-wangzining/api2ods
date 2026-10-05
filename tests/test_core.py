@@ -5592,6 +5592,11 @@ class TestFourthPassParsers(OfflineTestCase):
         got = parsers._parse_text("报表\x0c\n生成时间,今天\na,b\n1,x\n", {"format": "csv", "skip_rows": 2}, label="t")
         self.assertEqual(got, [{"a": "1", "b": "x"}])
 
+    def test_jsonl_empty_object_line_is_skipped(self):
+        """JSONL 里的空对象行（{}）与 Items:{} / [{}] 同义：跳过，不写全 NULL 假记录。"""
+        body = '{"a": 1}' + chr(10) + "{}" + chr(10)
+        self.assertEqual(parsers.parse_bytes(body.encode(), {"format": "jsonl"}, "t"), [{"a": 1}])
+
     def test_jsonl_line_with_u2028_kept(self):
         """U+2028 是合法 JSON 字符（工具自己 dump 的记录就有），不能被劈成两行。"""
         first = spool_mod.dump_record({"a": "x y"})
