@@ -35,6 +35,15 @@ def onerway_sign(ctx: dict) -> dict:
         raise ValueError("auth.secret_key 未配置（Onerway 签名密钥）")
     keys = sorted(k for k in params if k != "sign" and params[k] not in (None, ""))
     # 无分隔符拼接是 Onerway 服务端规定的签名规则（改分隔符/带键名会与厂商校验失配），不要改算法。
+    # 但 str() 只对"发送出去时也长这样"的标量成立：列表会被 requests 按 doseq 展开成
+    # ids=1&ids=2、对象走 JSON 时是 {"a":1}——签名串必须与框架实际发出的形态一致，否则
+    # 服务端重算的摘要必然对不上（恒定 401）。非标量参数先在这里显式拒绝，提示规范化
+    non_scalar = [k for k in keys if isinstance(params[k], (list, dict, tuple, set))]
+    if non_scalar:
+        raise ValueError(
+            f"签名串无法可靠推导非标量参数 {non_scalar!r} 的发送形态（列表会被展开、对象走 JSON）；"
+            f"请把 params 里的这类值先按服务端约定的格式规范化为字符串再发送"
+        )
     text = "".join(str(params[k]) for k in keys) + secret
     return {"params": {"sign": hashlib.sha256(text.encode("utf-8")).hexdigest()}}
 

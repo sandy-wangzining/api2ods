@@ -446,21 +446,30 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
             # 只有"包小"或"整包单行"时才解码：多行判断必须扫整包字节——只看前 4KB 的话，
             # 宽表单行 >4KB 的 JSONL 会被误判成单行 JSON、照样整包解码（b"\n" in data 是
             # C 层线性扫描，不产生副本）
-            if len(data) > _SNIFF_MAX_BYTES and b"\n" in data:
-                # 大且多行（如 pretty-printed 的大 JSON/错误体）：为内存不解码整包——
-                # 但"以 }/] 收尾"的错误体特征仍要拦（与小包同口径；只取尾部小样本，
-                # jsonl 格式不适用）。不拦会把 JSON 当 CSV 解析成垃圾记录写进 ODS
-                if str(parse_cfg.get("format") or "").lower() != "jsonl":
-                    tail = data[-4096:]
-                    try:
-                        tail_text = tail.decode(name, "replace").lstrip("﻿").rstrip()
-                    except LookupError:
-                        continue
-                    if tail_text[-1:] in ("}", "]"):
-                        raise RuntimeError(
-                            f"{label} {where}期望文件流，但响应像一个无法解析的 JSON"
-                            f"（大响应按尾部采样判定：以 }} / ] 收尾）：{tail_text[-120:]!r}"
-                        )
+            if len(data) > _SNIFF_MAX_BYTES:
+                if b"\n" in data:
+                    # 大且多行（如 pretty-printed 的大 JSON/错误体）：为内存不解码整包——
+                    # 但"以 }/] 收尾"的错误体特征仍要拦（与小包同口径；只取尾部小样本，
+                    # jsonl 格式不适用）。不拦会把 JSON 当 CSV 解析成垃圾记录写进 ODS
+                    if str(parse_cfg.get("format") or "").lower() != "jsonl":
+                        tail = data[-4096:]
+                        try:
+                            tail_text = tail.decode(name, "replace").lstrip("﻿").rstrip()
+                        except LookupError:
+                            continue
+                        if tail_text[-1:] in ("}", "]"):
+                            raise RuntimeError(
+                                f"{label} {where}期望文件流，但响应像一个无法解析的 JSON"
+                                f"（大响应按尾部采样判定：以 }} / ] 收尾）：{tail_text[-120:]!r}"
+                            )
+                    continue
+                # 大且单行（如 300MB 单行 JSON 导出）：整包 decode 是 OOM 源——只按
+                # 首/尾字节判定「整包就是一个 JSON」（首 {/[ 且尾 }/]），宁失败勿 OOM
+                tail_bytes = data.rstrip(b"\r\n\t ")
+                if data[:1] in (b"{", b"[") and tail_bytes[-1:] in (b"}", b"]"):
+                    raise RuntimeError(
+                        f"{label} {where}期望文件流，但响应像一个 JSON（大响应不整包解码：首尾字符与 JSON 一致）"
+                    )
                 continue
             try:
                 texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())

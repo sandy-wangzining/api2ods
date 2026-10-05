@@ -2499,6 +2499,28 @@ class TestFetcher(OfflineTestCase):
         units = self._fetcher(job_range).build_units([date(2026, 9, 17), date(2026, 9, 18)])
         self.assertEqual(len(units), 1)
 
+    def test_example_signer_rejects_non_scalar_params(self):
+        """示例签名器对非标量参数显式拒绝（str() 与框架实际发送形态不一致会恒定 401）。"""
+        import importlib.util
+
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location("signers_example", root / "signers.example.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        with self.assertRaises(ValueError) as err:
+            module.onerway_sign({"params": {"ids": [1, 2]}, "request": {"secret_key": "s"}})
+        self.assertIn("非标量", str(err.exception))
+        ok = module.onerway_sign({"params": {"a": "1", "b": 2}, "request": {"secret_key": "s"}})
+        self.assertIn("sign", ok["params"])
+
+    def test_retry_times_fractional_or_negative_rejected(self):
+        """retry_times 先校验再取整：-0.5/2.5 不能被 int() 截断后绕过校验。"""
+        for bad in (-0.5, 2.5, -1):
+            with self.assertRaises(SystemExit) as ctx:
+                self._fetcher(minimal_job(request={"retry_times": bad}))
+            self.assertIn("retry_times", str(ctx.exception))
+
     def test_probe_size_retry_unconfirmed_end_is_ok(self):
         """page_size=1 被拒后按配置页大小重试、重试仍"无法确证翻完"：按能连通处理。"""
         job = minimal_job(pagination={"type": "page", "page_param": "p", "size_param": "n", "page_size": 100})
@@ -6193,6 +6215,14 @@ class TestParserErrorBranches(OfflineTestCase):
         self.assertEqual(parsers.ensure_object_records([{}], "单次请求"), [])
         self.assertEqual(parsers.ensure_object_records([{"a": 1}, {}], "单次请求"), [{"a": 1}])
 
+    def test_large_single_line_json_rejected_without_full_decode(self):
+        """>1MB 的单行 JSON：不整包 decode（OOM 源），按首/尾字节判定拦下。"""
+        big = b"{" + b'"k": 1,' * 200000 + b'"z": 2}'
+        self.assertGreater(len(big), 1024 * 1024)
+        with self.assertRaises(RuntimeError) as ctx:
+            parsers.parse_bytes(big, {"format": "csv"}, "t")
+        self.assertIn("首尾字符与 JSON 一致", str(ctx.exception))
+
     def test_cr_only_file_not_treated_as_text_error_body(self):
         """CR-only 换行文件不会被当"单行文本错误体"（那是"无任何行界"的判据）：
         交给 csv 层按真实结构报错（csv 不认裸 CR，报 new-line 提示），而不是误导性的
@@ -6571,6 +6601,30 @@ class TestFetchDefensiveBranches(OfflineTestCase):
             )
         self.assertEqual([r["id"] for r in records], [1])
         self.assertEqual(len(calls), 1)
+
+    def test_cursor_respects_param_as_string(self):
+        """param_as_string 对游标同样生效（原来只有 page/size 字符串化）。"""
+        job = minimal_job(
+            pagination={
+                "type": "cursor",
+                "cursor_param": "c",
+                "cursor_path": "next",
+                "param_as_string": True,
+                "cursor_start": 1000,
+                "page_size": 5,
+            }
+        )
+        fetcher = self._fetcher(job)
+        seen = []
+
+        def fake_request(params, *a, **k):
+            seen.append(dict(params))
+            return {"next": None, "data": {"list": [{"id": 1}]}}
+
+        with mock.patch.object(fetcher, "_do_request", side_effect=fake_request):
+            fetcher.fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+        self.assertEqual(seen[0]["c"], "1000")
+        self.assertEqual(seen[0]["size"], "5")
 
     def test_page_delay_sleeps_between_pages(self):
         """pagination.delay_seconds 是给限速接口留的间隔，翻页时必须真的等。"""

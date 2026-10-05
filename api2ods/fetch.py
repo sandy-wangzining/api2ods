@@ -210,10 +210,12 @@ class Fetcher:
         self.json_encoding = str(request_cfg.get("json_encoding") or "").strip() or None
         self.response_type = str(request_cfg.get("response_type") or "json").lower()
         self.fail_if = request_cfg.get("fail_if") or []
-        self.retry_times = int(_as_number(request_cfg.get("retry_times"), 5, "request.retry_times"))
-        if self.retry_times < 0:
-            # 负数会被 max(1, ...) 吞成 0 次重试（配置意图不明），与 timeout/retry_delay 同口径
-            raise SystemExit(f"request.retry_times 不能为负数，实际 {self.retry_times}")
+        raw_retry = _as_number(request_cfg.get("retry_times"), 5, "request.retry_times")
+        if raw_retry < 0 or raw_retry != int(raw_retry):
+            # int() 截断会把 -0.5 变成 0（负值守卫失效）、把 2.5 变成 2（静默改变行为）：
+            # 先按原值校验，只接受非负整数
+            raise SystemExit(f"request.retry_times 必须是非负整数，实际 {raw_retry:g}")
+        self.retry_times = int(raw_retry)
         self.retry_delay = _as_number(request_cfg.get("retry_delay"), 15.0, "request.retry_delay")
         if self.retry_delay < 0:
             # 负值会在 time.sleep() 里抛裸 ValueError，被当成网络抖动静默重试，
@@ -519,7 +521,9 @@ class Fetcher:
                 # 否则接口按自己的默认值返回，可能每页只有几条。
                 # cursor_start 显式写 "" 也算"要带上这个空参数"，别静默丢掉。
                 if cursor is not None:
-                    params[cursor_param] = cursor
+                    # 与 page/size 同口径：param_as_string 的意义就是"接口要求分页参数
+                    # 以字符串形式发送"，游标不能是例外
+                    params[cursor_param] = str(cursor) if param_as_string else cursor
             if size_param:
                 params[size_param] = str(effective_page_size) if param_as_string else effective_page_size
 
@@ -623,7 +627,9 @@ class Fetcher:
                             raise RuntimeError(message)
                         log(f"  警告：{message}；pagination.strict=false，按已拉到的 {len(records)} 条收尾")
                     break
-                if next_cursor == cursor:
+                if str(next_cursor) == str(cursor):
+                    # 按字符串判等：param_as_string 场景下发出去的是 "1000"、接口回显可能
+                    # 是数字 1000——类型不一致时漏判"游标未推进"会一路翻满 max_pages
                     # 游标原样回显（cursor_path 配到了恒定字段）：继续翻只会把同一页拉满
                     # max_pages 次——重复数据无上限累积、还向接口打几千次重复请求
                     raise ConfigError(
