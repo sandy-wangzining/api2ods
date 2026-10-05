@@ -425,6 +425,7 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
                 return  # 配置的编码名写错：交给 decode() 报 ConfigError
             continue
         stripped = head.lstrip("\ufeff").lstrip()
+        trimmed = data.strip(b"\r\n\t ")
         if not stripped and len(data) > 4096:
             # 前 4KB 全是空白/BOM：极罕见，退回整包解码保持原语义
             try:
@@ -447,13 +448,14 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
         elif (
             stripped
             and len(data) <= _SNIFF_MAX_BYTES
-            and b"\n" not in data
-            and not any(sep in data for sep in (b",", b"\t", b";", b"|"))
+            and b"\n" not in trimmed
+            and not any(sep in trimmed for sep in (b",", b"\t", b";", b"|"))
         ):
-            # \u5355\u884c\u3001\u65e0\u5217\u5206\u9694\u7b26\u3001\u8fd8\u6709\u5185\u5bb9\uff1a\u7591\u4f3c JSON \u6807\u91cf\u9519\u8bef\u4f53\uff08"\u9519\u8bef\u6d88\u606f" / 500 / null\uff09\u3002
-            # \u5f53 CSV \u89e3\u6790\u4f1a\u9759\u9ed8\u4ea7\u51fa 0 \u884c\uff08\u552f\u4e00"\u5217\u540d"\u5c31\u662f\u9519\u8bef\u6d88\u606f\u672c\u8eab\uff09\u3001\u8c03\u5ea6\u6309"\u96f6\u6570\u636e"\u6536\u5c3e\uff1b
-            # \u786e\u5c5e\u5355\u884c\u5355\u5217\u6570\u636e\u7684\u6e90\u6781\u5c11\uff08\u8be5\u8def\u5f84\u672c\u6765\u5c31\u6309\u6587\u4ef6\u6d41\u914d\u7684\uff09\uff0c\u5b81\u5931\u8d25\u52ff\u5199\u9519\u3002
-            # \u5224\u65ad\u8d70 bytes\uff08b"\n"/\u5206\u9694\u7b26\u662f C \u5c42\u626b\u63cf\uff09\u4e14\u9650\u4f53\u79ef\uff1a\u4e0d\u5236\u9020\u6574\u5305\u89e3\u7801\u526f\u672c
+            # 去掉首尾空白（含服务器补的尾随换行——nginx/框架很常见）后：单行、无列分隔符、
+            # 还有内容 → 疑似 JSON 标量错误体（"错误消息" / 500 / null）。
+            # 当 CSV 解析会静默产出 0 行（唯一"列名"就是错误消息本身）、调度按"零数据"收尾；
+            # 确属单行单列数据的源极少（该路径本来就按文件流配的），宁失败勿写错。
+            # 判断走 bytes（b"\n"/分隔符是 C 层扫描）且限体积：不制造整包解码副本
             try:
                 texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())
             except LookupError:

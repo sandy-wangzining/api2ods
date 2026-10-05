@@ -6150,7 +6150,7 @@ class TestParserErrorBranches(OfflineTestCase):
     def test_scalar_error_body_rejected_on_csv_path(self):
         """HTTP 200 + JSON 标量错误体（"rate limit exceeded" / 500 / null）：当 CSV 会静默
         产出 0 行（唯一“列名”就是错误消息本身），必须拦下而不是按空数据收尾。"""
-        for payload in (b'"rate limit exceeded"', b"500", b"null", b"true"):
+        for payload in (b'"rate limit exceeded"', b"500", b"null", b"true", b"502\n", b'"rate limit exceeded"\n'):
             with self.assertRaises(RuntimeError) as ctx:
                 parsers.parse_bytes(payload, {"format": "csv"}, "结算")
             self.assertIn("JSON 标量", str(ctx.exception))
@@ -6158,6 +6158,7 @@ class TestParserErrorBranches(OfflineTestCase):
     def test_single_line_text_with_separator_is_not_scalar_error_body(self):
         """单行但带列分隔符（或本来就多行）的文本不按标量错误体处理，仍走正常解析。"""
         self.assertEqual(parsers.parse_bytes(b"a,b", {"format": "csv"}, "结算"), [])
+        self.assertEqual(parsers.parse_bytes(b"a,b\n", {"format": "csv"}, "结算"), [])
         self.assertEqual(parsers.parse_bytes(b"a,b\n1,2\n", {"format": "csv"}, "结算"), [{"a": "1", "b": "2"}])
 
     def test_header_with_surrounding_spaces_is_error(self):
