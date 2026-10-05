@@ -249,7 +249,7 @@ def _lock_path(job_path: Path) -> Path:
             raise SystemExit(f"API2ODS_LOCK_DIR 指定的锁目录不可用（{exc}）：{base}") from exc
         return base / f"{name}.lock"
     candidates = [ROOT / ".run-locks", Path(tempfile.gettempdir()) / "api2ods-locks"]
-    for base in candidates:
+    for index, base in enumerate(candidates):
         try:
             base.mkdir(parents=True, exist_ok=True)
         except OSError:
@@ -265,8 +265,20 @@ def _lock_path(job_path: Path) -> Path:
             # 目录已经建出来：探测失败（EMFILE/ENOSPC 等）不能再换一把锁路径，
             # 否则两个实例各拿各的锁；至少留一条日志，并仍用这个目录
             log(f"  警告：运行锁目录 {base} 探测写入失败（{exc}），仍使用该目录，避免互斥落到另一路径")
+        if index > 0:
+            # 退回目录按用户/环境解析（TMPDIR、macOS /var/folders、systemd PrivateTmp）：
+            # 不同身份/环境跑同一作业可能拿到不同目录、互斥静默失效——至少把事实说出来
+            log(
+                f"  提示：工具目录不可写，运行锁放在 {base}；"
+                f"若存在多用户/多环境混跑，请用 API2ODS_LOCK_DIR 固定同一锁目录"
+            )
         return base / f"{name}.lock"
-    return Path(tempfile.gettempdir()) / f"api2ods-{name}.lock"
+    fallback = Path(tempfile.gettempdir()) / f"api2ods-{name}.lock"
+    log(
+        f"  警告：工具目录与系统临时目录都不可写，运行锁临时退回 {fallback}；"
+        f"请用 API2ODS_LOCK_DIR 指定一个可写的固定锁目录，否则并发保护可能失效"
+    )
+    return fallback
 
 
 def _redact_job(job: dict, text) -> str:
