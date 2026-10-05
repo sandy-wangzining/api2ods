@@ -306,6 +306,13 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
             raise SystemExit(f"window.days 必须是整数，实际 {window.get('days')!r}")
         if count < 1:
             raise SystemExit(f"{'--days' if from_cli else 'window.days'} 必须 >= 1，实际 {count}")
+        if count > 3660:
+            # 与 --start-date/--end-date 的区间上限同口径：--days 打成 999999 会展开成
+            # 数十万个日期（先 OOM 再按天打接口），报错提示分批回拉
+            raise SystemExit(
+                f"{'--days' if from_cli else 'window.days'} 过大（{count:,} 天，上限 3660≈10 年）："
+                f"像是多打了一个 9；确需超长回拉请分批执行"
+            )
         days = [base - timedelta(days=count - 1 - i) for i in range(count)]
     return sorted(set(days))
 
