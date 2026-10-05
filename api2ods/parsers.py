@@ -470,7 +470,7 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
             # 只对小包做 strip：bytes.strip 会新建等长副本，百 MB 的包不能无条件裁
             trimmed = data.strip(b"\r\n\t ")
             if (
-                b"\n" not in trimmed
+                b"\r" not in trimmed
                 and b"\n" not in trimmed
                 and not any(sep in trimmed for sep in (b",", b"\t", b";", b"|"))
                 and not data.startswith(_BINARY_MAGICS)

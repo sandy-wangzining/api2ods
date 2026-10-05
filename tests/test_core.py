@@ -2499,6 +2499,23 @@ class TestFetcher(OfflineTestCase):
         units = self._fetcher(job_range).build_units([date(2026, 9, 17), date(2026, 9, 18)])
         self.assertEqual(len(units), 1)
 
+    def test_probe_size_retry_unconfirmed_end_is_ok(self):
+        """page_size=1 被拒后按配置页大小重试、重试仍"无法确证翻完"：按能连通处理。"""
+        job = minimal_job(pagination={"type": "page", "page_param": "p", "size_param": "n", "page_size": 100})
+        fetcher = self._fetcher(job)
+        calls = {"n": 0}
+
+        def fake_fetch_unit(unit, **kwargs):
+            calls["n"] += 1
+            if kwargs.get("page_size_override") is not None:
+                raise utils.FatalApiError("HTTP 400: invalid page size")
+            raise fetch_mod.UnconfirmedEndError("d 第 1 页返回为空，但无法确认已翻完（接口没有给总页数/总条数）")
+
+        with mock.patch.object(fetcher, "fetch_unit", side_effect=fake_fetch_unit):
+            label, count = fetcher.probe([date(2026, 9, 18)])
+        self.assertEqual(count, 0)
+        self.assertEqual(calls["n"], 2)
+
     def test_probe_empty_units_is_config_error(self):
         """体检时算出 0 个请求单元：按配置错报（ConfigError），不是裸 RuntimeError。"""
         fetcher = self._fetcher(minimal_job())
@@ -6175,6 +6192,17 @@ class TestParserErrorBranches(OfflineTestCase):
         """数组里的空对象（Items: [{}]）与 Items: {} 同义：归一成空列表，不写全 NULL 假记录。"""
         self.assertEqual(parsers.ensure_object_records([{}], "单次请求"), [])
         self.assertEqual(parsers.ensure_object_records([{"a": 1}, {}], "单次请求"), [{"a": 1}])
+
+    def test_cr_only_file_not_treated_as_text_error_body(self):
+        """CR-only 换行文件不会被当"单行文本错误体"（那是"无任何行界"的判据）：
+        交给 csv 层按真实结构报错（csv 不认裸 CR，报 new-line 提示），而不是误导性的
+        "疑似纯文本错误体"。"""
+        CR = bytes([13])
+        with self.assertRaises(RuntimeError) as ctx:
+            parsers.parse_bytes(b"amount" + CR + b"100" + CR + b"200", {"format": "csv"}, "t")
+        message = str(ctx.exception)
+        self.assertNotIn("单行文本", message)
+        self.assertIn("表头解析失败", message)
 
     def test_small_zip_not_treated_as_text_error_body(self):
         """二进制（小 ZIP）的字节里恰好没有换行/分隔符时，不能被当成"单行文本错误体"。"""

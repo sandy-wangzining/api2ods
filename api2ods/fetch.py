@@ -293,7 +293,13 @@ class Fetcher:
             if size_override is None or not _looks_like_size_error(str(exc)):
                 raise
             log(f"  体检用 page_size=1 被接口拒绝（{self.redact(exc)}），改回配置的页大小重试一次")
-            records = self.fetch_unit(unit, max_pages_override=1, stop_after_first_page=True)
+            try:
+                records = self.fetch_unit(unit, max_pages_override=1, stop_after_first_page=True)
+            except UnconfirmedEndError as exc2:
+                # 重试仍在 except 块里：这里必须内层捕获，"无法确证翻完"同样按
+                # 能连通、空结果处理（否则异常扩散、体检以裸 traceback 结束）
+                log(f"  体检提示：单页体检无法确证翻完（{self.redact(exc2)}），按“能连通、当日无数据”处理")
+                return unit.label, 0
         except UnconfirmedEndError as exc:
             # 体检只拉一页，对"接口不给总数"的源永远无法确证翻完——按"能连通、空结果"
             # 处理，不能把这类好源判成体检失败（空数据日尤其常见）
