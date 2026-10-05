@@ -260,7 +260,15 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
         start, end = parse_day_arg(start_arg), parse_day_arg(end_arg)
         if end < start:
             raise SystemExit("--end-date 不能早于 --start-date")
-        days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+        span = (end - start).days + 1
+        if span > 3660:
+            # 年份打错（--end-date 写成下个世纪）会展开成几十万个日期：先 OOM 再（per_day）
+            # 无休止按天打接口——超长补数本来就该分段跑
+            raise SystemExit(
+                f"--start-date/--end-date 区间过大（{span:,} 天，上限 3660≈10 年）：像是日期写错了；"
+                f"确需超长补数请分段执行"
+            )
+        days = [start + timedelta(days=i) for i in range(span)]
     else:
         # 顺序要紧：先看显式 --bizdate，没有才读环境变量。反过来写的话，
         # env 畸形会在这里二次抛错——即使调用方已经用 --bizdate 拿到了正确业务日
@@ -325,6 +333,11 @@ def check_format_string(fmt: str, field: str = "window.format") -> None:
     rest = _DIRECTIVE_RE.sub(_check, str(fmt))
     if "%" in rest:
         raise ConfigError(f"{field} 里有写坏的格式指令（孤立的 %）：{fmt!r}")
+    if not _DIRECTIVE_RE.search(str(fmt).replace("%%", "")):
+        # 一个真正的时间指令都没有（先剥掉 %% 转义对："%%Y-%%m-%%d" 会被 strftime
+        # 原样输出成字面量 "%Y-%m-%d"），又不是 epoch 别名（unix/unix_s/unix_ms/unix_millis
+        # 在 format_time 里前面就 return 了）：配置预检（config.py）已拦，这里是库调用方的兜底
+        raise ConfigError(f"{field} 里没有任何时间指令：{fmt!r}；epoch 秒请写 unix 或 %s，毫秒写 unix_ms")
 
 
 def _protect_extension(fmt: str, code: str, sentinel: str) -> str:
@@ -514,10 +527,15 @@ def window_param_sets(job: dict, days: list[date]) -> list[dict | None]:
         return [None]
     if not days:
         raise ConfigError("日期列表为空")
+    raw_pad = win.get("pad_hours")
+    if isinstance(raw_pad, bool):
+        # YAML 里把 pad 当开关写 true 会被 float(True)=1.0 静默当 1 小时（与 window.days
+        # 的布尔口径一致：当笔误报错）；配置预检已拦，这里是库调用方的兜底
+        raise ConfigError(f"window.pad_hours 必须是数字（小时），实际 {raw_pad!r}")
     try:
-        pad_hours = float(win.get("pad_hours") or 0)
+        pad_hours = float(raw_pad or 0)
     except (TypeError, ValueError):
-        raise ConfigError(f"window.pad_hours 必须是数字（小时），实际 {win.get('pad_hours')!r}")
+        raise ConfigError(f"window.pad_hours 必须是数字（小时），实际 {raw_pad!r}")
     if not math.isfinite(pad_hours):
         # NaN 跟谁比都是 False，会绕过下面的 0~24 校验，最后在 timedelta 里抛裸 ValueError
         raise ConfigError(f"window.pad_hours 必须是有限数字，实际 {win.get('pad_hours')!r}")

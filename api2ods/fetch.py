@@ -301,12 +301,13 @@ class Fetcher:
 
     # ------------------------------------------------------------------ 单次
 
-    def _sleep(self, delay: float) -> bool:
+    def _sleep(self, delay: float, stop: threading.Event | None = None) -> bool:
         """可中断等待：返回 True 表示等待期间收到了停止信号（其它单元已失败/中断）。
 
-        封装成方法也便于测试替换（单测不想真等 10s/20s 的整窗重试间隔）。
+        stop 由并发路径注入「本轮」的信号（默认用实例当前的）；封装成方法也便于
+        测试替换（单测不想真等 10s/20s 的整窗重试间隔）。
         """
-        return self._stop.wait(delay)
+        return (stop or self._stop).wait(delay)
 
     def _decorate(self, records: list) -> list:
         """给记录追加固定字段（add_fields）；API 已有同名键时保留 API 原值。"""
@@ -368,10 +369,13 @@ class Fetcher:
         page_size_override: int | None = None,
         max_pages_override: int | None = None,
         stop_after_first_page: bool = False,
+        _stop: threading.Event | None = None,
     ) -> list[dict]:
         """执行一个请求单元，返回该单元的记录列表。
 
         三个 override 参数仅供 --check 限量使用（正式同步不传），确保体检只发一次请求。
+        _stop 仅供并发路径注入「本轮」的停止信号（默认用实例当前的 self._stop）：
+        必须按轮注入——下一轮会换新对象，遗留 worker 只认自己那轮、不会被复活。
         """
         # 基础参数 + 该单元的窗口参数（如 startTime/endTime）
         params = dict(self.base_params)
@@ -386,7 +390,7 @@ class Fetcher:
             )
             return self._decorate(records)
         return self._decorate(
-            self._fetch_pages(unit, params, page_size_override, max_pages_override, stop_after_first_page)
+            self._fetch_pages(unit, params, page_size_override, max_pages_override, stop_after_first_page, stop=_stop)
         )
 
     def _fetch_pages(
@@ -396,6 +400,7 @@ class Fetcher:
         page_size_override: int | None = None,
         max_pages_override: int | None = None,
         stop_after_first_page: bool = False,
+        stop: threading.Event | None = None,
     ) -> list[dict]:
         """页码 / 游标分页循环。
 
@@ -408,6 +413,7 @@ class Fetcher:
         - 任何模式：超过 max_pages 页主动中止（防死循环）。
         """
         page_cfg = self.pagination
+        stop = stop or self._stop
         page_type = str(page_cfg.get("type") or "none").strip().lower()
         if page_type not in ("none", "page", "cursor"):
             # 拼错（pages/offset）或尾随空格的值原来会落到下面的 else 分支、被当成 cursor：
@@ -609,6 +615,12 @@ class Fetcher:
                             raise RuntimeError(message)
                         log(f"  警告：{message}；pagination.strict=false，按已拉到的 {len(records)} 条收尾")
                     break
+                if next_cursor == cursor:
+                    # 游标原样回显（cursor_path 配到了恒定字段）：继续翻只会把同一页拉满
+                    # max_pages 次——重复数据无上限累积、还向接口打几千次重复请求
+                    raise ConfigError(
+                        f"{unit.label} 游标未推进（接口回显了同一个游标）：请检查 cursor_path / cursor_param 配置"
+                    )
                 cursor = next_cursor
 
             # ④ 翻页间隔 + 体检模式的提前返回
@@ -616,11 +628,11 @@ class Fetcher:
                 return records
             if stop_after_first_page:
                 return records
-            if self._stop.is_set():
+            if stop.is_set():
                 # 其它单元已致命失败（或用户中断）：不再发新请求；raise 让本 worker 尽早
                 # 结束，异常由 future 承载（此时无人接收，无害）
                 raise FatalApiError(f"{unit.label}：其它单元已失败，停止翻页")
-            if delay > 0 and self._sleep(delay):
+            if delay > 0 and self._sleep(delay, stop):
                 raise FatalApiError(f"{unit.label}：其它单元已失败，停止翻页")
         else:
             # 用 ConfigError（不可重试）而不是 RuntimeError：整窗重试会把同一份数据
@@ -646,7 +658,11 @@ class Fetcher:
         - 返回 (每单元条数统计 [(label, 条数)], 失败明细 [(label, 错误)])；
         - 只要 failures 非空，调用方必须放弃写库（见 cli.run_sync）。
         """
-        self._stop.clear()  # 上一轮退出时置过位：新一轮用户/串行路径不能一进来就被它拦下
+        # 每轮换一个全新的停止信号（不是 clear 复用）：并发分支的 shutdown(wait=False)
+        # 可能留下还在退避/请求中的旧 worker——它们只认自己那轮的 event（闭包/参数传入），
+        # 换新对象后旧 worker 永远看到"已停止"，不会被新一轮的清位动作复活
+        stop = threading.Event()
+        self._stop = stop
         units = self.build_units(days)
         try:
             attempts = max(1, 1 + int(window_retries or 0))
@@ -667,11 +683,11 @@ class Fetcher:
             delay = 10
             last_err = None
             for attempt in range(1, attempts + 1):
-                if self._stop.is_set():
+                if stop.is_set():
                     # worker 还没起跑（或刚醒来）时其它单元已失败：直接收手，不发任何请求
                     raise FatalApiError(f"{unit.label}：其它单元已失败，不再尝试")
                 try:
-                    return unit.label, self.fetch_unit(unit)
+                    return unit.label, self.fetch_unit(unit, _stop=stop)
                 except (FatalApiError, ConfigError):
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -680,7 +696,7 @@ class Fetcher:
                         break
                     log(f"  [{unit.label}] 第 {attempt}/{attempts - 1} 次失败：{self.redact(exc)}；{delay}s 后整窗重试")
                     # 可中断的退避：其它单元已致命失败时立刻收手，不再空等 10s/20s
-                    if self._sleep(delay):
+                    if self._sleep(delay, stop):
                         raise FatalApiError(f"{unit.label}：其它单元已失败，停止重试")
                     delay *= 2
             # 走得到这里的只有可重试的异常（FatalApiError / ConfigError 在循环里就抛了），
@@ -717,8 +733,8 @@ class Fetcher:
                         log(f"  ❌ {unit.label} 拉取失败：{self.redact(exc)}")
             finally:
                 # 与并发分支同口径：fetch_all 退出（成功/失败/中断）就置停止信号，
-                # 保持"方法结束即 _stop 已置位"的不变式；下一次 fetch_all 入口会 clear
-                self._stop.set()
+                # 保持"方法结束即当轮 _stop 已置位"的不变式；下一轮会换新对象（不复位这个）
+                stop.set()
         else:
             # 并发：只并发网络等待；回调在主线程的 as_completed 循环里，天然串行安全
             pool = ThreadPoolExecutor(max_workers=workers)
@@ -744,10 +760,11 @@ class Fetcher:
                         failures.append((unit.label, self.redact(exc)))
                         log(f"  ❌ {unit.label} 拉取失败：{self.redact(exc)}")
             finally:
-                # 置停止信号：本方法要退出了（成功/失败/中断都一样），在飞 worker 据此
+                # 置当轮停止信号：本方法要退出了（成功/失败/中断都一样），在飞 worker 据此
                 # 不再发新请求、不再空等退避 sleep——否则它们会带着整窗重试继续打接口，
-                # 且 ThreadPoolExecutor 的非守护线程会让解释器退出/下一次用例启动时被拖住
-                self._stop.set()
+                # 且 ThreadPoolExecutor 的非守护线程会让解释器退出/下一次用例启动时被拖住。
+                # 置的是当轮对象：下一轮换新 event，这些旧 worker 永远看到"已停止"、不会复活
+                stop.set()
                 # 不用 with：它的 __exit__ 是 shutdown(wait=True)，Ctrl+C 之后还要等
                 # 所有在飞的请求（可能正卡在 180s 超时或整窗重试的 sleep 里）跑完才退出。
                 # cancel_futures 取消没开始的，在飞的请求收到停止信号后尽快结束，进程不再被拖住

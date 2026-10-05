@@ -2545,17 +2545,20 @@ class TestFetcher(OfflineTestCase):
             label, count = self._fetcher(job).probe([date(2026, 9, 18)])
         self.assertEqual(count, 0)
 
-    def test_fetch_all_sets_stop_on_exit_and_clears_on_next_run(self):
-        """fetch_all 退出（成功/失败/中断）都要置停止信号让在飞 worker 收手；
-        下一轮开头必须清掉，否则串行路径一进来就被拦下。"""
+    def test_fetch_all_renews_stop_each_round(self):
+        """fetch_all 退出（成功/失败/中断）时置当轮停止信号；下一轮换新对象而不是复位——
+        已 set 的旧对象保持 set，上一轮遗留的 worker 永远看到"已停止"、不会被复活。"""
         job = minimal_job()
         fetcher = self._fetcher(job)
         with mock.patch.object(fetcher, "fetch_unit", return_value=[]):
             fetcher.fetch_all([date(2026, 9, 18)])
-        self.assertTrue(fetcher._stop.is_set())
+        first_stop = fetcher._stop
+        self.assertTrue(first_stop.is_set())
         with mock.patch.object(fetcher, "fetch_unit", return_value=[]) as fu:
             fetcher.fetch_all([date(2026, 9, 18)])
         self.assertEqual(fu.call_count, 1)
+        self.assertTrue(first_stop.is_set())  # 旧对象不复位
+        self.assertIsNot(fetcher._stop, first_stop)  # 新一轮换新对象
 
     def test_sleep_is_interruptible(self):
         """停止信号已置位时 _sleep 立即返回 True（不真等 10s/20s 的退避）。"""
@@ -2575,7 +2578,7 @@ class TestFetchAll(OfflineTestCase):
         attempts = {"n": 0}
         collected: list = []
 
-        def flaky(unit):
+        def flaky(unit, **_kw):
             attempts["n"] += 1
             if attempts["n"] == 1:
                 raise RuntimeError("boom")
@@ -2598,7 +2601,7 @@ class TestFetchAll(OfflineTestCase):
         days = [date(2026, 9, 17), date(2026, 9, 18)]
         collected: list = []
 
-        def flaky(unit):
+        def flaky(unit, **_kw):
             if unit.day.day == 17:
                 raise RuntimeError("bad day")
             return [{"id": 2}]
@@ -2622,7 +2625,7 @@ class TestFetchAll(OfflineTestCase):
         days = [date(2026, 9, 16), date(2026, 9, 17), date(2026, 9, 18)]
         calls = {"n": 0}
 
-        def unauthorized(unit):
+        def unauthorized(unit, **_kw):
             calls["n"] += 1
             raise utils.FatalApiError("HTTP 401：Unauthorized")
 
@@ -2640,7 +2643,7 @@ class TestFetchAll(OfflineTestCase):
         fetcher = fetch_mod.Fetcher(job, Path("."))
         calls = {"n": 0}
 
-        def bad_config(unit):
+        def bad_config(unit, **_kw):
             calls["n"] += 1
             raise utils.ConfigError("parse.skip_rows 不能为负：-1")
 
@@ -2658,7 +2661,7 @@ class TestFetchAll(OfflineTestCase):
         fetcher = fetch_mod.Fetcher(job, Path("."))
         calls = {"n": 0}
 
-        def flaky(unit):
+        def flaky(unit, **_kw):
             calls["n"] += 1
             if calls["n"] == 1:
                 raise ConnectionError("connection reset")
@@ -6062,6 +6065,13 @@ class TestDatesErrorBranches(OfflineTestCase):
             dates_mod.resolve_days(make_args(bizdate="20260918", days=0), {})
         self.assertIn("--days 必须 >= 1", str(ctx.exception))
 
+    def test_backfill_range_too_large_is_error(self):
+        """年份打错（--end-date 写成下个世纪）会展开成几十万个日期：先 OOM 再无休止
+        按天打接口——区间上限 3660 天，超了直接报错。"""
+        with self.assertRaises(SystemExit) as ctx:
+            dates_mod.resolve_days(make_args(start_date="2026-01-01", end_date="9999-12-31"), {})
+        self.assertIn("区间过大", str(ctx.exception))
+
     def test_format_time_unix_ms(self):
         value = datetime(2026, 9, 18, 12, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(dates_mod.format_time(value, "unix_ms"), dates_mod.format_time(value, "unix") * 1000)
@@ -6078,6 +6088,21 @@ class TestDatesErrorBranches(OfflineTestCase):
         value = datetime(1969, 12, 31, 23, 59, 59, 999000, tzinfo=timezone.utc)
         self.assertEqual(dates_mod.format_time(value, "unix"), -1)
         self.assertEqual(dates_mod.format_time(value, "unix_ms"), -1)
+
+    def test_format_without_directives_is_error(self):
+        """ "unixtime"/空白这类没有任何 % 指令的格式串：strftime 会原样输出成参数值，
+        请求带着字面量发出去（0 数据还退出 0）——配置预检之外，库调用方也要拦。"""
+        value = datetime(2026, 9, 18, tzinfo=timezone.utc)
+        for bad in ("unixtime", "epoch", "  "):
+            with self.assertRaises(SystemExit) as ctx:
+                dates_mod.format_time(value, bad)
+            self.assertIn("没有任何时间指令", str(ctx.exception))
+
+    def test_pad_hours_bool_is_error(self):
+        """YAML 里把 pad 当开关写 true：float(True)=1.0 会静默多拉前后各 1 小时。"""
+        with self.assertRaises(SystemExit) as ctx:
+            dates_mod.window_param_sets({"window": {"pad_hours": True}}, [date(2026, 9, 18)])
+        self.assertIn("pad_hours", str(ctx.exception))
 
 
 class TestParserErrorBranches(OfflineTestCase):
@@ -6099,6 +6124,26 @@ class TestParserErrorBranches(OfflineTestCase):
         """数组里的空对象（Items: [{}]）与 Items: {} 同义：归一成空列表，不写全 NULL 假记录。"""
         self.assertEqual(parsers.ensure_object_records([{}], "单次请求"), [])
         self.assertEqual(parsers.ensure_object_records([{"a": 1}, {}], "单次请求"), [{"a": 1}])
+
+    def test_scalar_error_body_rejected_on_csv_path(self):
+        """HTTP 200 + JSON 标量错误体（"rate limit exceeded" / 500 / null）：当 CSV 会静默
+        产出 0 行（唯一“列名”就是错误消息本身），必须拦下而不是按空数据收尾。"""
+        for payload in (b'"rate limit exceeded"', b"500", b"null", b"true"):
+            with self.assertRaises(RuntimeError) as ctx:
+                parsers.parse_bytes(payload, {"format": "csv"}, "结算")
+            self.assertIn("JSON 标量", str(ctx.exception))
+
+    def test_single_line_text_with_separator_is_not_scalar_error_body(self):
+        """单行但带列分隔符（或本来就多行）的文本不按标量错误体处理，仍走正常解析。"""
+        self.assertEqual(parsers.parse_bytes(b"a,b", {"format": "csv"}, "结算"), [])
+        self.assertEqual(parsers.parse_bytes(b"a,b\n1,2\n", {"format": "csv"}, "结算"), [{"a": "1", "b": "2"}])
+
+    def test_header_with_surrounding_spaces_is_error(self):
+        """表头列名带首尾空格（" amount"，导出常见）：json 键原样带空格、下游
+        get_json_object 取不到——与空列名同属静默丢列，直接报错。"""
+        with self.assertRaises(RuntimeError) as ctx:
+            parsers.parse_bytes(b"id, amount\n1,2\n", {"format": "csv"}, "结算")
+        self.assertIn("空白", str(ctx.exception))
 
     def test_oversized_header_reports_csv_error(self):
         """表头行超过 csv 字段上限（解析层把上限调到 7MB，这里压小来模拟）：给可读报错。"""
@@ -6427,7 +6472,33 @@ class TestFetchDefensiveBranches(OfflineTestCase):
         ):
             records = self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
         self.assertEqual([r["id"] for r in records], [1, 2])
-        sleep.assert_called_once_with(0.5)
+        sleep.assert_called_once()
+        self.assertEqual(sleep.call_args.args[0], 0.5)  # 间隔秒数；第二参是本轮停止信号
+
+    def test_cursor_not_advancing_is_error(self):
+        """游标原样回显（cursor_path 配到恒定字段）：继续翻会把同一页拉满 max_pages 次、
+        重复数据无上限累积——直接按配置错中止，而不是翻 2000 页。"""
+        job = minimal_job(
+            pagination={
+                "type": "cursor",
+                "cursor_param": "c",
+                "cursor_path": "next",
+                "page_size": 2,
+                "delay_seconds": 0,
+            }
+        )
+        fetcher = self._fetcher(job)
+        calls = []
+
+        def same_cursor(*_a, **_k):
+            calls.append(1)
+            return {"next": "same", "data": {"list": [{"id": 1}]}}
+
+        with mock.patch.object(http_mod, "request_once", side_effect=same_cursor):
+            with self.assertRaises(SystemExit) as ctx:
+                fetcher.fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+        self.assertIn("游标未推进", str(ctx.exception))
+        self.assertEqual(len(calls), 2)  # 第二页发现游标没动就中止，没有翻满 max_pages
 
     def test_window_retries_must_be_integer(self):
         """pagination.window_retries 写错：配置错直接退出，别在整窗重试里空等。"""
@@ -6453,7 +6524,7 @@ class TestFetchAllConcurrent(OfflineTestCase):
         fetcher, days = self._fetcher_and_days()
         in_main_thread, collected = [], []
 
-        def fake(unit):
+        def fake(unit, **_kw):
             in_main_thread.append(threading.current_thread() is threading.main_thread())
             return [{"id": unit.label}]
 
@@ -6467,7 +6538,7 @@ class TestFetchAllConcurrent(OfflineTestCase):
     def test_concurrent_failure_only_fails_its_own_unit(self):
         fetcher, days = self._fetcher_and_days()
 
-        def fake(unit):
+        def fake(unit, **_kw):
             if unit.day.day == 17:
                 raise ConnectionError("connection reset")
             return [{"id": 1}]
@@ -6485,7 +6556,7 @@ class TestFetchAllConcurrent(OfflineTestCase):
         """并发模式下 4xx 同样要立刻中止：不能变成"每个单元各失败一次"继续跑。"""
         fetcher, days = self._fetcher_and_days()
 
-        def unauthorized(_unit):
+        def unauthorized(_unit, **_kw):
             raise utils.FatalApiError("HTTP 401：Unauthorized")
 
         with mock.patch.object(fetcher, "fetch_unit", side_effect=unauthorized):
@@ -7323,8 +7394,17 @@ class TestSeventhPassRetryAndPlatform(OfflineTestCase):
     def test_common_formats_survive_whitelist(self):
         """ "两个平台都认"的常见写法不能被白名单误伤。"""
         value = datetime(2026, 9, 18, 15, 30, 5)
-        for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d/%b/%Y", "%e", "%%Y"):
+        for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d/%b/%Y", "%e"):
             self.assertIsInstance(dates_mod.format_time(value, fmt), str)
+
+    def test_pure_percent_escape_format_is_error(self):
+        """纯 %% 转义构成的格式（"%%Y-%%m-%%d"）：参数恒等于字面量 "%Y-%m-%d"、
+        静默查不到数据——一个真实时间指令都没有就报错。"""
+        value = datetime(2026, 9, 18, tzinfo=timezone.utc)
+        for bad in ("%%Y", "%%Y-%%m-%%d", "%%P"):
+            with self.assertRaises(SystemExit) as ctx:
+                dates_mod.format_time(value, bad)
+            self.assertIn("没有任何时间指令", str(ctx.exception))
 
     def test_empty_extra_param_format_falls_back_like_format_time(self):
         """空格式串在 _moment 判定"只到日"、在 format_time 却回退成带时刻的默认格式：
@@ -7352,9 +7432,9 @@ class TestSeventhPassRetryAndPlatform(OfflineTestCase):
         self.assertEqual(dates_mod.format_time(value, "%s"), int(value.timestamp()))
         self.assertEqual(dates_mod.format_time(value, "%P"), "pm")
         self.assertEqual(dates_mod.format_time(datetime(2026, 9, 18, 9, 0, 0), "%P"), "am")
-        self.assertEqual(dates_mod.format_time(value, "%%P"), "%P")
         # %%P（字面量）与 %P 混用：只替换未转义的那个（str.replace 会把 %%P 也换掉、
-        # 剩下 "%\x01" 让 strftime 抛 ValueError）
+        # 剩下 "%\x01" 让 strftime 抛 ValueError）。纯转义的 "%%P" 全无真实指令，
+        # 见 test_pure_percent_escape_format_is_error：这里只测混用形态
         self.assertEqual(dates_mod.format_time(value, "%Y-%%P-%P"), "2026-%P-pm")
         self.assertEqual(dates_mod.format_time(value, "%%P-%P"), "%P-pm")
 
@@ -7675,6 +7755,11 @@ class TestEighthPassReview(OfflineTestCase):
         self.assertIn("id=***", out)
         self.assertIn("count=None", out)
         self.assertIn("flag=True", out)
+
+    def test_redact_secrets_accepts_bare_scalar_values(self):
+        """values 直接传裸标量（数字/字符串，没有列表壳）也不能炸：与单字符串同口径。"""
+        out = utils.redact_secrets(123456, "charge failed id=123456")
+        self.assertNotIn("123456", out)
 
     def test_cli_job_redaction_masks_free_text_secret(self):
         """CLI 出口（run_check / run_sync / 外层 SystemExit）用作业上下文脱敏。"""
@@ -8390,7 +8475,7 @@ class TestEleventhPassReview(OfflineTestCase):
         fetcher = fetch_mod.Fetcher(job, Path("."))
         retained: list = []
 
-        def fake(unit):
+        def fake(unit, **_kw):
             return [{"id": unit.label}, {"id": unit.label + "b"}]
 
         with mock.patch.object(fetcher, "fetch_unit", side_effect=fake):

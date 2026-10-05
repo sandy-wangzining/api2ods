@@ -342,10 +342,14 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
                 f"{label or '文件'} 第 {reader.line_num} 行 CSV 解析失败：{exc}；"
                 f"多半是引号未闭合/字段内含未转义的引号，整份文件的行数会因此对不上"
             )
-        # 同名列会让前面的列被后面的覆盖、空列名的键是 ""（下游 get_json_object 取不到），
-        # 都等于静默丢列（表头都是字符串时才可能出现）
-        if fieldnames and any(str(name).strip() == "" for name in fieldnames):
-            raise RuntimeError(f"{label or '文件'} 的 CSV 表头有空列名（行尾多了一个分隔符？）：{fieldnames}")
+        # 同名列会让前面的列被后面的覆盖；空列名的键是 ""、带首尾空白的列名（" amount"）
+        # 会原样成为 json 键——下游按精确名 get_json_object 取不到，都等于静默丢列
+        if fieldnames and any(
+            str(name) != str(name).strip() or str(name).strip() == "" for name in fieldnames
+        ):
+            raise RuntimeError(
+                f"{label or '文件'} 的 CSV 表头有空列名或带首尾空白的列名（导出格式问题？）：{fieldnames}"
+            )
         if fieldnames and len(fieldnames) != len(set(fieldnames)):
             raise RuntimeError(f"{label or '文件'} 的 CSV 表头有重复列名，解析会丢列：{fieldnames}")
     elif fmt == "jsonl":
@@ -411,6 +415,7 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
     elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
         encodings.append("utf-16")
     texts: list[str] = []
+    scalar_candidate = False
     for name in encodings:
         # 只解码开头一小段做「首字符」嗅探：这里只判断去掉 BOM/空白后的首字符是不是
         # { / [，不该为了看一眼首字符就把整包（可能是几十 MB 的 CSV/ZIP）解码成 str——
@@ -441,6 +446,21 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
                 texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())
             except LookupError:
                 continue
+        elif (
+            stripped
+            and len(data) <= _SNIFF_MAX_BYTES
+            and b"\n" not in data
+            and not any(sep in data for sep in (b",", b"\t", b";", b"|"))
+        ):
+            # \u5355\u884c\u3001\u65e0\u5217\u5206\u9694\u7b26\u3001\u8fd8\u6709\u5185\u5bb9\uff1a\u7591\u4f3c JSON \u6807\u91cf\u9519\u8bef\u4f53\uff08"\u9519\u8bef\u6d88\u606f" / 500 / null\uff09\u3002
+            # \u5f53 CSV \u89e3\u6790\u4f1a\u9759\u9ed8\u4ea7\u51fa 0 \u884c\uff08\u552f\u4e00"\u5217\u540d"\u5c31\u662f\u9519\u8bef\u6d88\u606f\u672c\u8eab\uff09\u3001\u8c03\u5ea6\u6309"\u96f6\u6570\u636e"\u6536\u5c3e\uff1b
+            # \u786e\u5c5e\u5355\u884c\u5355\u5217\u6570\u636e\u7684\u6e90\u6781\u5c11\uff08\u8be5\u8def\u5f84\u672c\u6765\u5c31\u6309\u6587\u4ef6\u6d41\u914d\u7684\uff09\uff0c\u5b81\u5931\u8d25\u52ff\u5199\u9519\u3002
+            # \u5224\u65ad\u8d70 bytes\uff08b"\n"/\u5206\u9694\u7b26\u662f C \u5c42\u626b\u63cf\uff09\u4e14\u9650\u4f53\u79ef\uff1a\u4e0d\u5236\u9020\u6574\u5305\u89e3\u7801\u526f\u672c
+            try:
+                texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())
+            except LookupError:
+                continue
+            scalar_candidate = True
     if not texts:
         return
     fmt = str(parse_cfg.get("format") or "").lower()
@@ -464,6 +484,13 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
                 f"{stripped[:200]!r}"
             )
         return
+    if scalar_candidate and (payload is None or isinstance(payload, (str, int, float, bool))):
+        # 单行无分隔符、又能解析成一个 JSON 标量：不是文件流该有的形态，按错误体拦下——
+        # 静默产出 0 行比报错危险得多
+        raise RuntimeError(
+            f"{label} {where}期望文件流，但响应是一个 JSON 标量（疑似错误体）：{texts[0][:200]!r}；"
+            f"若确认这是数据，请与上游核对响应形态后调整 response_type / parse.format"
+        )
     if not isinstance(payload, (dict, list)):
         return
     hint = ""
