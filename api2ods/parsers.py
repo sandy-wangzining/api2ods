@@ -52,6 +52,8 @@ MAX_ZIP_TOTAL_BYTES = 1024 * 1024 * 1024
 # （多行 JSONL 的典型形态）时不再把整包解码成 str——百 MB 级 JSONL 每行都以 { 开头，
 # 逐编码候选各解一份会让峰值内存翻几倍（见 _reject_json_error_body）
 _SNIFF_MAX_BYTES = 1_000_000
+# 常见二进制魔数：文本嗅探必须放过它们（小 ZIP 的字节里恰好没有换行/分隔符时不能被当成单行文本）
+_BINARY_MAGICS = (b"PK", b"\x1f\x8b", b"%PDF", b"\x89PNG", b"\xd0\xcf\x11\xe0")
 
 
 def _as_int(value, fallback: int, field: str) -> int:
@@ -239,12 +241,13 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
         # 这条要放在冲突检测前面——"文件里有内容"这个前提不成立时，
         # 报"两者冲突"会把方向指错（那是文件本身就是空的/只有前置段）
         return []
-    if skip_until and skip_rows and skip_until not in text:
-        # 标记行本身就在被 skip_rows 跳掉的前几行里时，删完才去找必然找不到，
-        # 而报错文案会指向"文件结构变了"这个错误方向。这里把两种配置的冲突说清楚
+    if skip_until and skip_rows and skip_until not in text and skip_until in before:
+        # 只有"标记确实落在被跳掉的前几行里"才判定为配置冲突（删完必然找不到）。
+        # 原文里根本没有标记 = 结构变了/错误页，要落到下面的 RuntimeError 触发整窗
+        # 重试（可恢复的上游抖动不能被当成"重试无意义"的配置错）
         raise ConfigError(
             f"parse.skip_until={skip_until!r} 在跳过前 {skip_rows} 行之后找不到了："
-            f"标记行可能就在被跳过的那几行里，skip_rows 与 skip_until 不要同时配"
+            f"标记行就在被跳过的前 {skip_rows} 行里，skip_rows 与 skip_until 不要同时配"
         )
     if skip_until:
         # 报表类文件常有前置说明/汇总段：从"包含标记的那一行"开始解析（该行即表头）。
@@ -466,16 +469,24 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
         elif stripped and len(data) <= _SNIFF_MAX_BYTES:
             # 只对小包做 strip：bytes.strip 会新建等长副本，百 MB 的包不能无条件裁
             trimmed = data.strip(b"\r\n\t ")
-            if b"\n" not in trimmed and not any(sep in trimmed for sep in (b",", b"\t", b";", b"|")):
+            if (
+                b"\n" not in trimmed
+                and b"\n" not in trimmed
+                and not any(sep in trimmed for sep in (b",", b"\t", b";", b"|"))
+                and not data.startswith(_BINARY_MAGICS)
+            ):
                 # 去掉首尾空白（含服务器补的尾随换行——nginx/框架很常见）后：单行、无列分隔符、
                 # 还有内容 → 疑似 JSON 标量错误体（"错误消息" / 500 / null）。
                 # 当 CSV 解析会静默产出 0 行（唯一"列名"就是错误消息本身）、调度按"零数据"收尾；
                 # 确属单行单列数据的源极少（该路径本来就按文件流配的），宁失败勿写错。
                 # 判断走 bytes（b"\n"/分隔符是 C 层扫描）且限体积：不制造整包解码副本
+                # 二进制（小 ZIP 的字节里恰好没有换行/逗号）不能被当成单行文本：
+                # 魔数已先挡一道，这里再要求'能严格解码'（解不出就换/跳过该编码候选）
                 try:
-                    texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())
-                except LookupError:
+                    candidate = data.decode(name)
+                except (UnicodeDecodeError, LookupError):
                     continue
+                texts.append(candidate.lstrip("\ufeff").lstrip())
                 scalar_candidate = True
     if not texts:
         return

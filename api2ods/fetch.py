@@ -274,7 +274,9 @@ class Fetcher:
         """
         units = self.build_units(days)
         if not units:
-            raise RuntimeError("没有可执行的请求单元")
+            # 配置错（窗口/分页参数算出 0 个请求单元）走 ConfigError：体检顶层按统一的
+            # 配置错路径报中文提示，而不是裸 RuntimeError traceback（与 window_retries 同口径）
+            raise ConfigError("没有可执行的请求单元：检查 window.days 与 pagination 的起止参数")
         unit = units[0]
         # 页码分页时把页大小压到 1：体检只需要"能连通、能解析"，拉一条就够。
         # 游标分页不动页大小——游标接口常从首页游标里推下一页，改 size 可能改变返回结构，

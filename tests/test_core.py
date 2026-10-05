@@ -2499,6 +2499,14 @@ class TestFetcher(OfflineTestCase):
         units = self._fetcher(job_range).build_units([date(2026, 9, 17), date(2026, 9, 18)])
         self.assertEqual(len(units), 1)
 
+    def test_probe_empty_units_is_config_error(self):
+        """体检时算出 0 个请求单元：按配置错报（ConfigError），不是裸 RuntimeError。"""
+        fetcher = self._fetcher(minimal_job())
+        with mock.patch.object(fetcher, "build_units", return_value=[]):
+            with self.assertRaises(SystemExit) as ctx:
+                fetcher.probe([date(2026, 9, 18)])
+        self.assertIn("请求单元", str(ctx.exception))
+
     def test_probe_limits_page_size(self):
         job = minimal_job(
             pagination={
@@ -6167,6 +6175,31 @@ class TestParserErrorBranches(OfflineTestCase):
         """数组里的空对象（Items: [{}]）与 Items: {} 同义：归一成空列表，不写全 NULL 假记录。"""
         self.assertEqual(parsers.ensure_object_records([{}], "单次请求"), [])
         self.assertEqual(parsers.ensure_object_records([{"a": 1}, {}], "单次请求"), [{"a": 1}])
+
+    def test_small_zip_not_treated_as_text_error_body(self):
+        """二进制（小 ZIP）的字节里恰好没有换行/分隔符时，不能被当成"单行文本错误体"。"""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("a.csv", "id,amount")
+        data = buf.getvalue()
+        self.assertIsNone(parsers._reject_json_error_body(data, {"format": "csv"}, "t"))
+
+    def test_skip_rows_conflict_only_when_marker_in_skipped_part(self):
+        """skip_rows 与 skip_until 同配：标记确实在被跳部分才报配置错；否则按可重试处理。"""
+        NL = chr(10)
+        with self.assertRaises(config_mod.ConfigError):
+            parsers._parse_text(
+                "标题段" + NL + "a,b" + NL + "1,2",
+                {"format": "csv", "skip_rows": 1, "skip_until": "标题段"},
+                "t",
+            )
+        with self.assertRaises(RuntimeError) as ctx:
+            parsers._parse_text(
+                "<html>err</html>" + NL + "x,y",
+                {"format": "csv", "skip_rows": 1, "skip_until": "明细"},
+                "t",
+            )
+        self.assertIn("找不到明细段标记", str(ctx.exception))
 
     def test_plain_text_error_body_rejected_on_csv_path(self):
         """单行纯文本错误体（非 JSON，如 503 Service Unavailable）：同样拦下
