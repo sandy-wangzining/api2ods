@@ -344,9 +344,7 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
             )
         # 同名列会让前面的列被后面的覆盖；空列名的键是 ""、带首尾空白的列名（" amount"）
         # 会原样成为 json 键——下游按精确名 get_json_object 取不到，都等于静默丢列
-        if fieldnames and any(
-            str(name) != str(name).strip() or str(name).strip() == "" for name in fieldnames
-        ):
+        if fieldnames and any(str(name) != str(name).strip() or str(name).strip() == "" for name in fieldnames):
             raise RuntimeError(
                 f"{label or '文件'} 的 CSV 表头有空列名或带首尾空白的列名（导出格式问题？）：{fieldnames}"
             )
