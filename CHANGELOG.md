@@ -6,6 +6,14 @@
 
 ### 修复
 
+- **as_bool 的数字写法只认 0/1（正确性）**：上一轮放开的 int/float 分支过宽——NaN/2.5
+  被 `bool()` 静默当 True（`allow_empty: NaN` 会在 0 行时清空已有分区）；现在只认 0/1、
+  其余数字与 "flase" 同口径报错。
+
+- **JSONL 的 entry_field 合并移到空对象判定之后（正确性）**：ZIP 里 `{}` 行原来被合并
+  成 `{entry_field: ...}` 又变非空、写成只含条目名的假记录；现在先判空再合并（与
+  CSV/JSON 路径对 `{}` 的归一一致）。
+
 - **显式 null 的 maxcompute/profiles/secrets 按"未配置"处理（正确性）**：与 check_block_types
   及运行期口径一致（原来校验拒 null、运行期容忍，把不用的块写成 null 会让作业无法启动）。
 

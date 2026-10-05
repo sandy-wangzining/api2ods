@@ -5597,6 +5597,15 @@ class TestFourthPassParsers(OfflineTestCase):
         body = '{"a": 1}' + chr(10) + "{}" + chr(10)
         self.assertEqual(parsers.parse_bytes(body.encode(), {"format": "jsonl"}, "t"), [{"a": 1}])
 
+    def test_jsonl_empty_object_skipped_before_entry_field(self):
+        """entry_field 合并前先判空：ZIP 里 {} 行不能变成只含条目名的假记录。"""
+        buf = io.BytesIO()
+        line = chr(10)
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("x.jsonl", '{"a": 1}' + line + "{}" + line)
+        got = parsers.parse_bytes(buf.getvalue(), {"format": "jsonl", "unzip": True, "entry_field": "src_file"}, "t")
+        self.assertEqual(got, [{"a": 1, "src_file": "x.jsonl"}])
+
     def test_jsonl_line_with_u2028_kept(self):
         """U+2028 是合法 JSON 字符（工具自己 dump 的记录就有），不能被劈成两行。"""
         first = spool_mod.dump_record({"a": "x y"})
@@ -7901,6 +7910,15 @@ class TestNinthPassReview(OfflineTestCase):
         self.assertEqual(config_mod.collect_warnings(job), [])
 
     # ---------------------------------------------------------------- 布尔笔误
+    def test_as_bool_rejects_non_01_numbers(self):
+        """数字写法只认 0/1：NaN / 2.5 这类笔误报错（allow_empty: NaN 被当 True 会清空分区）。"""
+        for bad in (2, 2.5, -1, float("nan")):
+            with self.assertRaises(SystemExit) as ctx:
+                utils.as_bool(bad, default=False, field="flag")
+            self.assertIn("布尔值", str(ctx.exception))
+        self.assertFalse(utils.as_bool(0, default=True, field="flag"))
+        self.assertTrue(utils.as_bool(1, default=False, field="flag"))
+
     def test_as_bool_rejects_container_types(self):
         """数组/对象不能 bool() 兜底（[] 会被静默当成 False，绕过 fail-closed 约定）。
         0/1 仍按数字真值处理。"""

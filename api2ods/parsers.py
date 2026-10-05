@@ -366,6 +366,11 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
                     f"{label or '文件'} 第 {line_no} 行不是 JSON 对象"
                     f"（是 {type(item).__name__}：{line[:120]!r}）；jsonl 要求每行一个对象"
                 )
+            if not item:
+                # 空对象行（{}）与 Items: {} / [{}] 同义：接口"无数据"的占位。
+                # 必须在合并 entry_field 之前判定——否则 {} 会被合并成 {entry_field: ...}
+                # 又变非空，写进 ODS 成只含条目名的假记录（CSV/JSON 路径都对空对象归零）
+                continue
             # entry 为空 = 非 ZIP 来源（整包 JSONL）：原来无条件写入会把文件里本来就有
             # 同名列的值整列覆盖成空串，而且是"校验全部通过"的假数据
             if entry_field and entry:
@@ -376,10 +381,6 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
                         f"与记录自带字段重名，写入会静默覆盖真实值；请换一个不冲突的字段名"
                     )
                 item = dict(item, **{entry_field: entry})
-            if not item:
-                # 空对象行（{}）与 Items: {} / [{}] 同义：接口"无数据"的占位。
-                # CSV/JSON 路径已归一到空，这里对齐口径——写进 ODS 是全 NULL 假记录
-                continue
             records.append(item)
     else:
         raise ConfigError(f"不支持的文件解析格式：{fmt}（可用 csv / tsv / jsonl）")
