@@ -477,10 +477,12 @@ def validate_job(job: dict) -> None:
         raise SystemExit("作业配置缺少 request.base_url（API 根地址）")
     if not target.get("table"):
         raise SystemExit("作业配置缺少 target.table（MaxCompute 目标表名）")
-    if "secrets" in job and not isinstance(job["secrets"], dict):
+    # 显式 JSON null 按"未配置"处理（与 check_block_types / 运行期口径一致：
+    # 把不用的块写成 null 是常态，校验不该反过来拦下）
+    if "secrets" in job and job["secrets"] is not None and not isinstance(job["secrets"], dict):
         raise SystemExit("作业配置的 secrets 必须是对象（键值对）")
     for block in ("maxcompute", "profiles"):
-        if block in job and not isinstance(job[block], dict):
+        if block in job and job[block] is not None and not isinstance(job[block], dict):
             raise SystemExit(f"作业配置的 {block} 必须是对象")
     # 子项也要查：profiles.prod 写成字符串时，取用它的一刻才抛裸 ValueError
     # （get_mc_profile_meta 里还有一道兜底，这里让报错在"校验配置"阶段就出现）

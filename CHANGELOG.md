@@ -6,6 +6,9 @@
 
 ### 修复
 
+- **显式 null 的 maxcompute/profiles/secrets 按"未配置"处理（正确性）**：与 check_block_types
+  及运行期口径一致（原来校验拒 null、运行期容忍，把不用的块写成 null 会让作业无法启动）。
+
 - **错误体嗅探的 strip 只对小包执行（可靠性）**：`bytes.strip` 会新建等长副本——百 MB 的
   响应体在 `>1MB` 分支永远用不到裁剪结果，却每次多一份全量拷贝（非 utf-8-sig 编码候选与
   ZIP 条目还会各来一份）；现在先判体积、只在 `<=1MB` 才 strip。
