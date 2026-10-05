@@ -175,13 +175,13 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `mode` | per_day | `per_day` 每天一次请求（推荐）/ `range` 整区间一次 |
+| `mode` | per_day | `per_day` 每天一次请求（推荐）/ `range` 整区间一次。会先去掉首尾空白再匹配、只认这两个值——拼错或带空格（`"range "`）直接报错，不会静默按 `per_day` 跑 |
 | `days` | 1 | 回拉天数（含基准日）；`--days` 可覆盖 |
 | `date_tz` | Asia/Shanghai | “最近 N 天”按哪个时区切（写时区名，如 `America/New_York`） |
 | `api_tz` | +08:00 | 传给接口的时间按哪个时区算：固定偏移（`+08:00` / `+0800` / `+08`）或时区名（`America/New_York`，自动处理夏令时） |
-| `pad_hours` | 0 | 窗口前后多拉几小时（防边界丢数），取值 0~24。**只要 >0，相邻两天的窗口就会重合 2×pad_hours 小时**（同一笔数据拉两遍，靠 DWD 按主键去重兜底）。`format` 只到日期时本项**被忽略并告警**：日期参数减 pad 不是多拉一段，而是把日期整体顶到前一天 |
+| `pad_hours` | 0 | 窗口前后多拉几小时（防边界丢数），取值 0~24。**只要 >0，相邻两天的窗口就会重合 2×pad_hours 小时**（同一笔数据拉两遍，靠 DWD 按主键去重兜底）。`format` 只到日期时本项**被忽略并告警**：日期参数减 pad 不是多拉一段，而是把日期整体顶到前一天。写布尔（YAML 里当开关写 `true`）与 NaN/超范围都会报错，不会被当成 1 小时 |
 | `start_param` / `end_param` | startTime / endTime | 起止时间参数名。**两个都不写**才启用默认；自定义了 `start_param` 就不补 `end_param`（只要开始时间只写 `start_param`，不要结束时间写 `"end_param": null`） |
-| `format` | %Y-%m-%d %H:%M:%S | 时间格式；`unix`=秒、`unix_ms`=毫秒；`%s`（epoch 秒）与 `%P`（am/pm）可在格式串任意位置用（自己实现，跨平台一致；`%s` 单用返回纯数字）。**只到日期（无时分秒）时按 `date_tz` 直接输出那一天，不做时区换算** |
+| `format` | %Y-%m-%d %H:%M:%S | 时间格式；`unix`=秒、`unix_ms`=毫秒；`%s`（epoch 秒）与 `%P`（am/pm）可在格式串任意位置用（自己实现，跨平台一致；`%s` 单用返回纯数字）。**只到日期（无时分秒）时按 `date_tz` 直接输出那一天，不做时区换算**。格式串至少要含一个真实时间指令：`"unixtime"`（unix 拼错）、纯 `%%` 转义（`"%%Y-%%m-%%d"`）都会在配置阶段报错——它们会被 strftime 原样输出成参数值、静默查不到任何数据 |
 | `extra_params` | - | 额外派生参数，如 `{"BillingCycle": "%Y-%m"}`（基于窗口日起算） |
 
 > **时区怎么配**（美东源这种最容易错，先看这段）：
@@ -213,7 +213,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `total_pages_path` / `total_items_path` | - | page 分页至少给一个（翻页终点）；两个都给时以条数终点为准（页数说翻完、条数没拉够就继续翻，宁可多翻一页也不静默少拉）。**只认正数**（`-1`/`0` 这类"未知"哨兵会被忽略），且终点值单调不减（某页只回本页条数也不会提前收尾）。cursor 分页也可以用 `total_items_path` 做兜底：游标提前结束但条数没拉够时会报错（防"游标字段写错 → 只拉第一页"） |
 | `stop_when_short` | false | 接口不返回总数时用：**本页条数 < `page_size` 即判末页**（含首屏空页=窗口无数据、整页后空页=没有下一页）。与 `total_*` **互斥**、只对 `type=page` 生效，配置阶段报错兜底。假设接口除末页外按请求的 `page_size` 返回 |
 | `strict` | true | 严格模式：空页但 `TotalCount` 没拉够 → 判失败（防静默截断）。接口总数不准才设 `false`，此时按已拉到的收尾并打警告。终点字段只在第一页返回时会被记住并沿用（末页之后的空页不再误判为"无法确认翻完"） |
-| `cursor_param` / `cursor_path` / `cursor_start` | 游标分页；`cursor_start` 写 `""` 表示首页就带上空的游标参数（默认首页不带）。**建议同时配 `total_items_path`**：没配时游标字段写错会被当成"翻完了"只拉第一页（会告警提示） |
+| `cursor_param` / `cursor_path` / `cursor_start` | 游标分页；`cursor_start` 写 `""` 表示首页就带上空的游标参数（默认首页不带）。**建议同时配 `total_items_path`**：没配时游标字段写错会被当成"翻完了"只拉第一页（会告警提示）。**游标未推进检测**：接口原样回显游标（或 `cursor_path` 指到了恒定字段）时第二页直接报错，不会翻满 `max_pages` 把同一页重复拉爆 |
 | `delay_seconds` / `max_pages` / `window_retries` | 翻页间隔 / 最大页数保护 / 单窗口失败重试次数 |
 
 ### parse（`response_type=bytes` 时的文件解析）
@@ -292,7 +292,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
    exists partition (pt='…')` 这条带超时的 DDL，不再用同步不限时的 pyodps 表 API——后者在云端
    元数据操作卡住时会让任务一直挂起、**占着运行锁**把后续调度顶掉（与 sftp2ods / feishu2ods 同口径）；
 8. 日志与异常里的 token/sign/secret 一律脱敏：形态规则 + 按配置里的密钥值精确遮蔽
-   （凭证的明文与其 URL 编码形态 `quote` / `quote_plus` 都替），接口把凭证写进自由文本报错时也不会漏；
+   （凭证的明文与其 URL 编码形态 `quote` / `quote_plus`、以及把 `-` 也编码的激进编码器形态都替；含中文的密钥同样覆盖），接口把凭证写进自由文本报错时也不会漏；
 9. 429/5xx 按 `Retry-After` 退避重试，4xx 直接失败（参数/密钥问题快速暴露）；
    每次重试都重新鉴权（一次性签名如阿里云 `SignatureNonce` 不会因复用被判 400）；
    连接抖动（ConnectionError / Timeout / SSL 错误）走请求级退避重试；
@@ -319,6 +319,16 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
     快照更新只在写库成功后（与"写后核对"同一口径），失败/中断/`--dry-run` 都不会推进快照，
     保证提醒不丢。快照文件在作业同目录 `.field-state/`（读写失败只记日志，不影响主流程与退出码）。
 
+13. **JSON 标量错误体不会当成"空数据"**：HTTP 200 下返回 `"rate limit exceeded"` / `500` /
+    `null` 这类单行响应（文件流路径）时直接报错——原来会被当"只有表头的 CSV"解析出 0 行、
+    按零数据静默收尾（宁失败勿写错）；
+14. **凭证不全不会静默换身份**：`maxcompute` 的 AK/SK 只填一半（典型：键名拼错成
+    `access_key_secect`）直接报错、不会警告后回退到环境变量/本机 aliyun CLI；显式指定的
+    `--mc-profile` / `maxcompute.profile` 找不到时同样报错、不会改用其它 profile 的 AK；
+    确实想用环境变量/CLI 时把 AK/SK 整对留空即可；
+15. **运行锁按规范化路径计算**：同一作业用相对/绝对/带 `..` 的写法落到同一把锁（否则两份
+    调度各拿一把锁、互斥静默失效、同删同写一个分区）。
+
 ### 退出码（调度侧判断成败）
 
 | 码 | 含义 |
@@ -342,6 +352,11 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `接口返回业务错误：code=...` | 命中 `fail_if`；限流类错误给 `"retry": true` 先重试几次 |
 | 大量“重试”日志 | 撞限流：降 `--workers`、调大 `pagination.delay_seconds` |
 | `本次拉取 0 行...未写库` | 确认接口当天确实无数据；要写空分区加 `--allow-empty` |
+| `--dry-run` 显示 0 行并退出 1 | 有意的：dry-run 与正式跑同一套判定（0 行且未 `--allow-empty` 即非 0），当预检用时能提前发现坏配置 |
+| `游标未推进（接口回显了同一个游标）` | `cursor_path` 指到了恒定字段（如 `total`/`page_size`）：改成真正的下一页游标字段。接口确实原样回显游标时，这个接口不适合游标翻页，改用 page + `total_*` |
+| `指定的 aliyun CLI profile「x」不存在或没有 AK/SK` | 拼写核对 `~/.aliyun/config.json` 里的 profile 名；有意换来源就清空 `--mc-profile`/`profile`——工具不会自动改用别的 profile |
+| `--start-date/--end-date 区间过大` | 上限 3660 天（≈10 年）：日期大概率打错了（如 end 写成下个世纪）；确实要超长补数请分段执行 |
+| `响应是一个 JSON 标量（疑似错误体）` | 接口在 200 状态下返回了 `"错误消息"`/数字/null（常见于限流/网关异常）：先确认接口行为；确属数据再调整 `response_type` / `parse.format` |
 | `补数（--dates / --start-date+--end-date）必须跟着 --bizdate 一起用` | 加 `--bizdate 20260920`，整段数据写进 `pt=20260920`；见上方「一次运行只写一个 pt」 |
 | 配置文件报 `不是合法 JSON` 但内容看着没问题 | 多半是文件存成了「UTF-8 with BOM」；新版已自动兼容，升级后仍报错再查逗号/引号 |
 | `pagination.page_size 必须是数字` / `window.days 必须是整数` | 配置里写成了带引号的字符串或带了单位，改成纯数字 |
@@ -355,7 +370,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 607 个离线用例：不访问网络、不连数仓
+python -m unittest discover -s tests -v    # 726 个离线用例：不访问网络、不连数仓
 pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
 ruff format --check .                      # 格式检查（CI 门禁；需要时先跑 ruff format .）
 ```
