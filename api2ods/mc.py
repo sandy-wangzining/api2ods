@@ -53,6 +53,18 @@ def load_mc_credentials(profile: dict, source_label: str = "作业文件", cli_p
     if ak_id and secret:
         name = str((profile or {}).get("name") or "default")
         return ak_id, secret, f"{source_label}（{name}）"
+    if isinstance(profile, dict):
+        has_id = any(profile.get(k) for k in ("access_key_id", "ak_id", "ak"))
+        has_sk = any(profile.get(k) for k in ("access_key_secret", "ak_secret", "sk"))
+        if has_id != has_sk:
+            # 只填一半（典型：secret 键名拼错）必须报错，不能警告后回退：回退到环境变量/
+            # 本机 aliyun CLI 会用另一个身份写库（审计/计费/归属全错），与「--mc-profile
+            # 找不到不回退」「非映射报错」同口径
+            missing = "access_key_secret（或 ak_secret/sk）" if has_id else "access_key_id（或 ak_id/ak）"
+            raise ConfigError(
+                f"{source_label}的 maxcompute 配置里 AK/SK 只填了一半、缺 {missing}；"
+                f"补齐这对凭证，或整对留空以使用环境变量/本机 aliyun CLI"
+            )
 
     env_id, env_secret = os.environ.get("ALIYUN_ACCESS_KEY_ID"), os.environ.get("ALIYUN_ACCESS_KEY_SECRET")
     if env_id and env_secret:
@@ -87,7 +99,17 @@ def load_mc_credentials(profile: dict, source_label: str = "作业文件", cli_p
                 f"  可以不修它——改用作业文件的 maxcompute.access_key_id/access_key_secret，"
                 f"或设环境变量 ALIYUN_ACCESS_KEY_ID / ALIYUN_ACCESS_KEY_SECRET"
             ) from exc
-        names = [cli_profile] if cli_profile else [cli_config.get("current")]
+        if cli_profile:
+            # 显式指定的 profile 必须自食其力：找不到/没 AK 就直接报错，不能落进下面
+            # "任意 AK profile"的回退——那会用另一个身份写库（与 sftp2ods 同口径）
+            item = profiles.get(cli_profile) or {}
+            if not (item.get("access_key_id") and item.get("access_key_secret")):
+                raise SystemExit(
+                    f"指定的 aliyun CLI profile「{cli_profile}」不存在或没有 AK/SK；"
+                    f"不会自动回退到其它 profile（避免用另一个身份写库），请检查 --mc-profile"
+                )
+            return item["access_key_id"], item["access_key_secret"], f"aliyun CLI profile [{cli_profile}]"
+        names = [cli_config.get("current")]
         names += [
             name
             for name, item in profiles.items()
@@ -126,20 +148,27 @@ def connect_odps(
 def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL"):
     """提交 SQL 并等待完成：成功返回 / 失败抛错 / 超时主动 stop() 取消并抛 TimeoutError。"""
     instance = o.run_sql(sql)
-    started = time.time()
+    # 单调时钟：量"等了多久"不能用墙钟——NTP 校时/手动改时间会让 now - started
+    # 凭空多出/少掉一大截，误判超时并 stop() 掉正在跑的作业
+    started = time.monotonic()
     last_log = started
     while True:
         if instance.is_successful():
             return instance
         if instance.is_terminated():
             instance.wait_for_success(timeout=1)  # 触发一次，抛出带错误信息的异常
+            if not instance.is_successful():
+                # 不能无条件 return：wait_for_success 万一没抛（超时语义/实现差异），
+                # 终止但失败的实例会被当成成功，后续 DDL 在"其实没执行"的前提下继续跑
+                raise RuntimeError(f"{desc} 已终止但未成功（实例 {getattr(instance, 'id', '?')}）")
             return instance
-        now = time.time()
+        now = time.monotonic()
         if timeout and timeout > 0 and now - started > timeout:
             try:
                 instance.stop()
-            except Exception:  # noqa: BLE001 - 取消失败不影响报错
-                pass
+            except Exception as exc:  # noqa: BLE001 - 取消失败不影响报错，但要留痕
+                # 云端可能还有悬挂的昂贵 SQL 在跑：静默 pass 会让超时事故无从回溯
+                log(f"    {desc} 取消失败（{type(exc).__name__}: {exc}），云端实例可能仍在运行")
             raise TimeoutError(f"{desc} 执行超过 {timeout} 秒，已主动停止")
         if timeout and timeout > 0 and now - last_log >= SQL_HEARTBEAT_SECONDS:
             log(f"    {desc} 还在执行（已等待 {int(now - started)} 秒，超时阈值 {timeout} 秒）...")
@@ -234,15 +263,77 @@ def ensure_target_table(
 # =============================================================================
 
 
-def write_partition(
-    table, table_name: str, partition_value: str, batches_factory, total: int | None = None, retries: int = 3
-) -> int:
-    """先删再填一个分区（delete → create → Tunnel 写入），整段失败自动重试。
+def _sql_spec(spec: str) -> str:
+    """把 pyodps 风格分区串（pt=20260918）转成 DDL 里的带引号写法（pt='20260918'）。
 
+    pyodps 的 partition.name 可能已带引号（pt='20260918'），统一先去掉再补引号，
+    避免生成 pt=''20260918'' 这种非法写法；分区字段名同样过标识符白名单。
+
+    边界：本工具的表结构被 verify_target_schema 强制为单级 pt 分区，spec 恒由内部按
+    pt=<值> 构造，多级分区（pt=x,region=y）不可达（会被字段名白名单挡下）。
+    """
+    key, _, value = str(spec).partition("=")
+    key = require_identifier(key.strip(), "分区字段名")
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1]
+    if not value:
+        raise ConfigError(f"分区值不能为空：{spec!r}")
+    escaped = value.replace("\\", "\\\\").replace("'", "''")
+    return f"{key}='{escaped}'"
+
+
+def drop_partition(o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
+    """删除分区（DDL，走超时保护；分区不存在也不报错，与旧口径的 if_exists=True 一致）。
+
+    走 DDL 而不是 pyodps 的 `table.delete_partition`（同步、不限时）：云端分区元数据操作
+    卡住时同样会无限挂起、一直占着运行锁，把后续调度全顶掉。`IF EXISTS` 提供与
+    `delete_partition(if_exists=True)` 一致的幂等语义。
+    """
+    project = require_identifier(project, "target.project")
+    table_name = require_identifier(table_name, "target.table")
+    run_sql_with_timeout(
+        o,
+        f"alter table {project}.{table_name} drop if exists partition ({_sql_spec(spec)})",
+        timeout=timeout,
+        desc=f"删分区 {table_name}",
+    )
+
+
+def add_partition(o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
+    """新增分区（DDL，走超时保护；分区已存在不报错，与旧口径的 if_not_exists=True 一致）。"""
+    project = require_identifier(project, "target.project")
+    table_name = require_identifier(table_name, "target.table")
+    run_sql_with_timeout(
+        o,
+        f"alter table {project}.{table_name} add if not exists partition ({_sql_spec(spec)})",
+        timeout=timeout,
+        desc=f"建分区 {table_name}",
+    )
+
+
+def write_partition(
+    o,
+    table,
+    project: str,
+    table_name: str,
+    partition_value: str,
+    batches_factory,
+    total: int | None = None,
+    retries: int = 3,
+    timeout: int = SQL_TIMEOUT_SECONDS,
+    secrets=(),
+) -> int:
+    """先删再填一个分区（drop DDL → add DDL → Tunnel 写入），整段失败自动重试。
+
+    - o / project / timeout：分区增删走**带超时的 DDL**（pyodps 的 delete_partition /
+      create_partition 是同步不限时的，云端元数据操作卡住会把整轮任务连同运行锁挂死）；
     - batches_factory：一个"可重复调用"的函数，每次返回从头开始的「批次迭代器」；
       用工厂而不是列表，是为了支持失败重试时重新读一遍，同时内存里只留一个批次。
       批次在读取侧切好（见 SpoolWriter.iter_batches）：单条记录很大时按行数攒批会吃内存。
     - total：预期行数；写完后核对，不一致报错（调用方再与 count(*) 二次校验）。
+    - secrets：作业里的密钥值（collect_secret_values 的结果）；重试日志与最终报错除了形态
+      脱敏，再按这些值精确遮蔽——Tunnel/SQL 的报错里可能带着签名后的 URL/token。
     - 单行超过 MAX_ROW_BYTES 直接报错；检查在删分区之前只做一次（数据在写入阶段不变）——
       这类记录永远写不进去，先删后失败等于白丢一天数据（重跑也救不回来，只能重拉 API）。
     """
@@ -274,12 +365,12 @@ def write_partition(
     def _do() -> int:
         """完整的"校验 → 删 → 建 → 写"一趟，交给 retry_call 重试（每趟都从头读数据）。"""
         nonlocal deleted_once
-        # 先置位再删：delete_partition 可能在服务端已经删掉分区后才抛异常（网络超时、
+        # 先置位再删：删分区的 DDL 可能在服务端已经删掉分区后才抛异常（网络超时、
         # 响应丢失），此时 deleted_once=False 会把"分区可能已丢数"的提示吞掉。
         # 即使实际上一个字节都没删，保守提示重跑也只多一次幂等覆盖，不会写错数据。
         deleted_once = True
-        table.delete_partition(spec, if_exists=True)  # 先删：重复跑/补数不会叠加
-        table.create_partition(spec, if_not_exists=True)
+        drop_partition(o, project, table_name, spec, timeout=timeout)  # 先删：重复跑/补数不会叠加
+        add_partition(o, project, table_name, spec, timeout=timeout)
         # 重试要重新读一遍数据，所以 writer 与 written 都在重试时重置。
         # reopen=True：不复用上一次失败留下的 Tunnel 上传会话——复用会把上次已上传的块
         # 与本轮全量一起提交（写到一半失败时，pyodps 的 with 不 close、会话仍留在缓存里），
@@ -294,7 +385,11 @@ def write_partition(
 
     try:
         written = retry_call(
-            _do, attempts=max(1, retries), base_delay=10, desc=f"{table_name} pt={partition_value} 写入"
+            _do,
+            attempts=max(1, retries),
+            base_delay=10,
+            desc=f"{table_name} pt={partition_value} 写入",
+            secrets=secrets,
         )
     except Exception as exc:  # noqa: BLE001 - 重试耗尽后统一改写错误信息
         # 先删后填的代价：写入中途失败（Tunnel 断开、行数对不上后再重试也失败……）时，
@@ -348,4 +443,8 @@ def count_partition(o, project: str, table_name: str, partition_value: str, time
                 return int(row["cnt"])
             except (TypeError, KeyError, IndexError):
                 return int(row[0])
+    # count(*) 必然返回一行：读不到行说明结果集为空（SQL 没真正执行/reader 异常；分区刚建好
+    # 时也出现过）。按 0 行返回保持既有行为（调用方依赖它），但必须留一条警告——
+    # 静默返回会把"没读到结果"和"分区确实 0 行"混为一谈，写后校验会被误导
+    log(f"  警告：分区 {table_name} pt={partition_value} 的 count 校验没读到结果，按 0 行处理")
     return 0

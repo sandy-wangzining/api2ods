@@ -20,6 +20,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -88,9 +89,9 @@ def make_args(**overrides):
         job="jobs/x.json",
         config="",
         check=False,
-        bizdate="",
+        bizdate=None,  # 与 argparse 的默认值一致：None = 没给；空串 = 显式给了但为空（要报错）
         days=None,
-        dates="",
+        dates=None,  # 与 argparse 的默认值一致：None = 没给；空串 = 显式给了但为空（要报错）
         start_date="",
         end_date="",
         pt="",
@@ -148,8 +149,51 @@ class TestPlaceholders(OfflineTestCase):
             config_mod.deep_substitute("${secrets.nope}", {"secrets": {}})
         self.assertIn("secrets", str(ctx.exception))
 
+    def test_credential_field_keeps_literal_placeholder_chars(self):
+        """凭据字段是自由文本：密钥里的 "${" 只是字符，不该让整份配置加载失败。"""
+        value = {"headers": {"Authorization": "Bearer p@ss${word"}, "params": {"password": "a${b}c"}}
+        self.assertEqual(
+            config_mod.deep_substitute(value, {"secrets": {}}),
+            {"headers": {"Authorization": "Bearer p@ss${word"}, "params": {"password": "a${b}c"}},
+        )
+
+    def test_credential_field_keeps_whole_literal_placeholder(self):
+        """整串 ${...} 但键不存在：凭据字段按字面量保留（密钥本身可能就是这个字符串）。"""
+        self.assertEqual(
+            config_mod.deep_substitute({"headers": {"Authorization": "${secrets.old}"}}, {"secrets": {}}),
+            {"headers": {"Authorization": "${secrets.old}"}},
+        )
+
+    def test_credential_field_still_resolves_real_placeholders(self):
+        value = {"headers": {"Authorization": "Bearer ${secrets.t}"}}
+        self.assertEqual(
+            config_mod.deep_substitute(value, {"secrets": {"t": "S"}}),
+            {"headers": {"Authorization": "Bearer S"}},
+        )
+
+    def test_non_credential_field_still_rejects_unclosed(self):
+        with self.assertRaises(SystemExit):
+            config_mod.deep_substitute({"url": "https://x/${bad"}, {"secrets": {}})
+
+    def test_inline_placeholder_null_raises(self):
+        """secrets.x 为 null 时内联解析不能静默变 "None"：与键路径同口径报错。
+
+        普通字段与凭据字段都算——"Bearer ${secrets.t}" 拼出 "Bearer None"
+        只会让请求 401，报错却指不到配置上。
+        """
+        with self.assertRaises(SystemExit) as ctx:
+            config_mod.deep_substitute({"url": "https://x/${secrets.ns}/y"}, {"secrets": {"ns": None}})
+        self.assertIn("不是标量", str(ctx.exception))
+        with self.assertRaises(SystemExit):
+            config_mod.deep_substitute(
+                {"headers": {"Authorization": "Bearer ${secrets.ns}"}}, {"secrets": {"ns": None}}
+            )
+        # 整串占位符解析成 null 同样拒绝（None 到 requests 的 params 会被编码成 "None" 发出去）
+        with self.assertRaises(SystemExit):
+            config_mod.deep_substitute({"params": {"token": "${secrets.ns}"}}, {"secrets": {"ns": None}})
+
     def test_render_job_uses_bizdate(self):
-        got = config_mod.render_job(minimal_job(), {"secrets": {}}, date(2026, 9, 18))
+        got, _ = config_mod.render_job(minimal_job(), {"secrets": {}}, date(2026, 9, 18))
         self.assertEqual(got["target"]["pt"], "20260918")
 
     def test_render_job_inline_secrets(self):
@@ -157,7 +201,7 @@ class TestPlaceholders(OfflineTestCase):
         job["secrets"] = {"onerway_secret_key": "inline-secret"}
         job["maxcompute"] = {"project": "p1", "access_key_id": "a", "access_key_secret": "b"}
         job["request"]["auth"] = {"type": "sha256_concat", "secret_key": "${secrets.onerway_secret_key}"}
-        got = config_mod.render_job(job, {}, date(2026, 9, 18))
+        got, _ = config_mod.render_job(job, {}, date(2026, 9, 18))
         self.assertEqual(got["request"]["auth"]["secret_key"], "inline-secret")
         self.assertEqual(got["secrets"]["onerway_secret_key"], "inline-secret")
         self.assertEqual(got["maxcompute"]["project"], "p1")
@@ -165,10 +209,23 @@ class TestPlaceholders(OfflineTestCase):
         profile = config_mod.get_mc_profile_meta({}, got, make_args())
         self.assertEqual(profile["project"], "p1")
 
+    def test_render_job_twice_with_different_secrets_no_contamination(self):
+        """同一份 --config 用不同 secrets 连渲染两次：第二次不能再拿第一次替换过的字面量。
+
+        原来的实现就地改写 config：第二次替换时 ${...} 已经不见了，第二个作业会静默
+        使用第一个作业的 AK（多实例复用同一份 config 的用法正好踩这一条）。
+        """
+        config = {"secrets": {"ak": "AK_ONE"}, "maxcompute": {"access_key_id": "${secrets.ak}"}}
+        _j1, cfg1 = config_mod.render_job(minimal_job(), config, date(2026, 9, 18))
+        config2 = {"secrets": {"ak": "AK_TWO"}, "maxcompute": {"access_key_id": "${secrets.ak}"}}
+        _j2, cfg2 = config_mod.render_job(minimal_job(), config2, date(2026, 9, 18))
+        self.assertEqual(cfg1["maxcompute"]["access_key_id"], "AK_ONE")
+        self.assertEqual(cfg2["maxcompute"]["access_key_id"], "AK_TWO")
+
     def test_render_job_secret_not_substituted(self):
         job = minimal_job()
         job["secrets"] = {"k": "value-${bizdate}"}  # 密钥里的占位符样式内容不被替换
-        got = config_mod.render_job(job, {}, date(2026, 9, 18))
+        got, _ = config_mod.render_job(job, {}, date(2026, 9, 18))
         self.assertEqual(got["secrets"]["k"], "value-${bizdate}")
 
 
@@ -441,6 +498,21 @@ class TestResolveDays(OfflineTestCase):
                 dates_mod.env_bizdate()
             self.assertIn("2026-09-1", str(ctx.exception))
 
+    def test_blank_env_bizdate_errors_in_strict_mode(self):
+        """只含空白的 bizdate 是"设了但没法用"：严格模式必须报错，不能静默回退昨天。
+
+        （原来 strip 后当"没设置"返回 None → 数据写进错的分区且退出码为 0。）
+        """
+        for blank in ("   ", "	"):
+            with mock.patch.dict(os.environ, {"bizdate": blank}, clear=False):
+                os.environ.pop("SKYNET_BIZDATE", None)
+                with self.assertRaises(SystemExit) as ctx:
+                    dates_mod.env_bizdate()
+                self.assertIn("空白", str(ctx.exception))
+        # 非严格（--check）按"未设置"处理并继续看下一个环境变量
+        with mock.patch.dict(os.environ, {"bizdate": "   ", "SKYNET_BIZDATE": "20260918"}, clear=False):
+            self.assertEqual(dates_mod.env_bizdate(strict=False), date(2026, 9, 18))
+
     def test_malformed_env_bizdate_not_swallowed_by_resolve_days(self):
         with mock.patch.dict(os.environ, {"bizdate": "202609181"}, clear=False):
             os.environ.pop("SKYNET_BIZDATE", None)
@@ -468,6 +540,16 @@ class TestResolveDays(OfflineTestCase):
             days = dates_mod.resolve_days(make_args(check=True), {"window": {"date_tz": "UTC"}})
         self.assertEqual(len(days), 1)
 
+    def test_start_date_without_end_date_is_config_error(self):
+        """精简 namespace（库调用方只传 start_date、没有 end_date 属性）也要给配置错，不抛 AttributeError。"""
+
+        class SlimArgs:
+            start_date = "2026-09-01"
+
+        with self.assertRaises(SystemExit) as ctx:
+            dates_mod.resolve_days(SlimArgs(), {})
+        self.assertIn("成对", str(ctx.exception))
+
     def test_start_end_range(self):
         days = dates_mod.resolve_days(make_args(start_date="2026-09-01", end_date="2026-09-03"), {})
         self.assertEqual(len(days), 3)
@@ -479,6 +561,41 @@ class TestResolveDays(OfflineTestCase):
     def test_pair_required(self):
         with self.assertRaises(SystemExit):
             dates_mod.resolve_days(make_args(start_date="2026-09-01"), {})
+
+    def test_float_days_rejected_not_truncated(self):
+        """window.days=2.5 原来 int() 静默截成 2（少回拉一天）：与 0/非法字符串同口径报错。"""
+        job = minimal_job()
+        job["window"] = {"mode": "per_day", "date_tz": "UTC", "days": 2.5}
+        with self.assertRaises(SystemExit) as ctx:
+            dates_mod.resolve_days(make_args(), job)
+        self.assertIn("整数", str(ctx.exception))
+
+    def test_extra_params_none_uses_default_format(self):
+        """extra_params 值为 None 不能提前 str 成字面量 "None" 发给接口。"""
+        win = {
+            "mode": "per_day",
+            "date_tz": "UTC",
+            "api_tz": "+08:00",
+            "pad_hours": 0,
+            "start_param": "BillingDate",
+            "format": "%Y-%m-%d",
+            "extra_params": {"statDate": None},
+        }
+        got = dates_mod.window_param_sets({"window": win}, [date(2026, 9, 18)])[0]
+        self.assertNotEqual(got["statDate"], "None")
+        self.assertIn("2026-09-18", got["statDate"])
+
+    def test_non_list_warnings_key_does_not_crash_validate(self):
+        """用户误写 "__warnings__": "note"（非 list）时，validate_job 挂告警不能裸崩。"""
+        job = minimal_job(pagination={"type": "none", "size_param": "size", "page_size": 100})
+        job["__warnings__"] = "note"
+        config_mod.validate_job(job)  # 不抛 AttributeError
+
+    def test_explicit_empty_bizdate_errors(self):
+        """显式传空 --bizdate（脚本变量未展开）必须报错，不能按"未指定"静默回退。"""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit):
+                dates_mod.resolve_days(make_args(bizdate=""), {})
 
     def test_default_uses_window_days(self):
         days = dates_mod.resolve_days(make_args(), {"window": {"days": 3, "date_tz": "UTC"}})
@@ -509,6 +626,16 @@ class TestWindowParams(OfflineTestCase):
         win = dict(self.win, mode="range")
         got = dates_mod.window_param_sets({"window": win}, [date(2026, 9, 18), date(2026, 9, 20)])
         self.assertEqual(got, [{"startTime": "2026-09-18 08:00:00", "endTime": "2026-09-21 08:00:00"}])
+
+    def test_mode_is_normalized_and_validated(self):
+        """mode 去空白后仍按 range 走；拼错的 mode 要报错——静默按 per_day 会让
+        range 语义与区间校验（extra_params）一起失效。"""
+        days = [date(2026, 9, 18), date(2026, 9, 20)]
+        got = dates_mod.window_param_sets({"window": dict(self.win, mode="range ")}, days)
+        self.assertEqual(got, dates_mod.window_param_sets({"window": dict(self.win, mode="range")}, days))
+        with self.assertRaises(SystemExit) as ctx:
+            dates_mod.window_param_sets({"window": dict(self.win, mode="rang")}, days)
+        self.assertIn("window.mode", str(ctx.exception))
 
     def test_date_only_format_ignores_pad(self):
         """纯日期格式 + pad_hours：必须忽略 pad，而不是把日期顶到前一天。
@@ -614,6 +741,25 @@ class TestWindowParams(OfflineTestCase):
         }
         got = dates_mod.window_param_sets({"window": win}, [date(2026, 9, 18)])[0]
         self.assertEqual(got, {"BillingDate": "2026-09-18", "BillingCycle": "2026-09"})
+
+    def test_range_extra_params_checked_on_every_day(self):
+        """range 只比首尾会漏掉周期性格式：%d 在 20260101~20260201 首尾都是 01、
+        中间每天都在变——必须逐日求值，任何一天不同就报配置错。"""
+        win = {
+            "mode": "range",
+            "date_tz": "UTC",
+            "api_tz": "+08:00",
+            "pad_hours": 0,
+            "start_param": "BillingDate",
+            "format": "%Y-%m-%d",
+            "extra_params": {"Day": "%d"},
+        }
+        days = [date(2026, 1, 1), date(2026, 1, 15), date(2026, 2, 1)]
+        with self.assertRaises(utils.ConfigError) as ctx:
+            dates_mod.window_param_sets({"window": win}, days)
+        self.assertIn("Day", str(ctx.exception))
+        win["extra_params"] = {"Year": "%Y"}  # 全程一致 → 放行
+        dates_mod.window_param_sets({"window": win}, days)
 
 
 # =============================================================================
@@ -824,17 +970,78 @@ class TestParsers(OfflineTestCase):
         records = parsers.parse_bytes(text.encode("utf-8"), {"format": "csv"}, "t")
         self.assertEqual(records, [{"a": "1", "b": "x"}, {"a": "2", "b": "y"}])
 
+    def test_skip_rows_bool_is_config_error(self):
+        """skip_rows: true（笔误）不能 int(True)=1 静默切掉真表头。"""
+        with self.assertRaises(utils.ConfigError) as ctx:
+            parsers.parse_bytes(b"a,b\n1,2\n", {"format": "csv", "skip_rows": True}, "t")
+        self.assertIn("skip_rows", str(ctx.exception))
+
     def test_csv_skip_rows_and_entry_field(self):
         text = "报表\n生成时间,今天\na,b\n1,x\n"
         records = parsers.parse_bytes(
             text.encode("utf-8"), {"format": "csv", "skip_rows": 2, "entry_field": "__file"}, "t"
         )
-        self.assertEqual(records, [{"a": "1", "b": "x", "__file": ""}])
+        # 非 ZIP 来源没有条目名：不能写入空串——CSV 本来就有同名列时会被整列清空
+        self.assertEqual(records, [{"a": "1", "b": "x"}])
+
+    def test_csv_entry_field_does_not_clobber_same_named_column(self):
+        """CSV 自带 entry_field 同名列（非 ZIP 响应）时保留原值，不被空串覆盖。"""
+        text = "__file,a\ncrash_2026.csv,1\n"
+        records = parsers.parse_bytes(text.encode("utf-8"), {"format": "csv", "entry_field": "__file"}, "t")
+        self.assertEqual(records, [{"__file": "crash_2026.csv", "a": "1"}])
 
     def test_jsonl(self):
         data = b'{"a": 1}\n\n{"a": 2}\n'
         records = parsers.parse_bytes(data, {"format": "jsonl"}, "t")
         self.assertEqual([r["a"] for r in records], [1, 2])
+
+    def test_zip_total_uncompressed_cap(self):
+        """单条目各自合规的"多条目炸弹"要被累计上限拦住（256MB 单条上限可被绕开）。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("a.csv", "user,amount\nu1,5\n")
+            archive.writestr("b.csv", "user,amount\nu2,6\n")
+        with mock.patch.object(parsers, "MAX_ZIP_TOTAL_BYTES", 5):
+            with self.assertRaises(utils.ConfigError) as ctx:
+                parsers.parse_bytes(
+                    buffer.getvalue(),
+                    {"format": "csv", "unzip": True, "allow_multi_entry": True},
+                    "t",
+                )
+        self.assertIn("累计", str(ctx.exception))
+
+    def test_zip_truncated_entry_is_retryable_runtimeerror(self):
+        """压缩流被截断时 zipfile 抛的是 EOFError（不是 BadZipFile）：要按"条目损坏、
+        可能重拉就好"的可重试语义包成 RuntimeError，不能裸异常冒出。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("a.csv", "user,amount\nu1,5\n")
+        boom = EOFError("Compressed file ended before the end-of-stream marker was reached")
+        with mock.patch.object(zipfile.ZipFile, "read", side_effect=boom):
+            with self.assertRaises(RuntimeError) as ctx:
+                parsers.parse_bytes(buffer.getvalue(), {"format": "csv", "unzip": True}, "t")
+        self.assertIn("读取失败", str(ctx.exception))
+
+    def test_small_multiline_json_body_still_rejected(self):
+        """小响应保持原语义：以 { 开头、解不成整包 JSON 的内容在非 jsonl 格式下按错误体拦下。"""
+        data = b'{"code": 500}\n{"x": 1}'
+        with self.assertRaises(RuntimeError):
+            parsers._reject_json_error_body(data, {"format": "csv"}, "t")
+
+    def test_wide_multiline_jsonl_not_whole_decoded(self):
+        """单行宽于嗅探前缀的 JSONL 也要判成多行（扫整包字节，不看前 4KB）：
+        不做整包解码，也就不再走"整包是一个 JSON 值"的错误体拦截。"""
+        wide = '{"a": "' + "x" * 300 + '"}\n'
+        data = (wide * 3).rstrip("\n").encode()  # 以 } 收尾：旧实现会按"截断的 JSON"报错
+        with mock.patch.object(parsers, "_SNIFF_MAX_BYTES", 100):
+            self.assertIsNone(parsers._reject_json_error_body(data, {"format": "csv"}, "t"))
+
+    def test_big_multiline_response_not_whole_decoded(self):
+        """超过嗅探阈值、开头 4KB 就有换行的内容不再整包解码（百 MB 级 JSONL 不该为看首字符
+        付整包 str 的内存）：表现为不走"整包是一个 JSON 值"的判定。"""
+        data = b'{"code": 500}\n{"x": 1}'
+        with mock.patch.object(parsers, "_SNIFF_MAX_BYTES", 4):
+            self.assertIsNone(parsers._reject_json_error_body(data, {"format": "csv"}, "t"))
 
     def _zip_bytes(self) -> bytes:
         buffer = io.BytesIO()
@@ -853,6 +1060,34 @@ class TestParsers(OfflineTestCase):
         self.assertEqual(records[0]["user"], "u1")
         self.assertEqual(records[0]["__file"], "amount-2026.csv")
 
+    def test_zip_duplicate_entry_names_all_parsed(self):
+        """ZIP 允许重名条目：按名字读会读同一条目两遍、另一条静默丢数据——必须按条目分别解析。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("2024-06.csv", "user,amount\nu1,5\n")
+            archive.writestr("2024-06.csv", "user,amount\nu2,6\n")
+        records = parsers.parse_bytes(
+            buffer.getvalue(),
+            {"format": "csv", "unzip": True, "allow_multi_entry": True},
+            "t",
+        )
+        self.assertEqual([(r["user"], r["amount"]) for r in records], [("u1", "5"), ("u2", "6")])
+
+    def test_entry_field_collision_rejected(self):
+        """entry_field 与源文件自带同名列冲突时会静默覆盖真实列值——必须报错（宁失败勿写错）。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("a.csv", "file,amount\nreal-1,5\n")
+        with self.assertRaises(utils.ConfigError) as ctx:
+            parsers.parse_bytes(buffer.getvalue(), {"format": "csv", "unzip": True, "entry_field": "file"}, "t")
+        self.assertIn("重名", str(ctx.exception))
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            # 两行才不会被"整包是单个 JSON = 疑似错误体"的先检拦下（那是另一条防线）
+            archive.writestr("a.jsonl", '{"file": "real-1", "amount": 5}\n{"file": "real-2", "amount": 6}\n')
+        with self.assertRaises(utils.ConfigError):
+            parsers.parse_bytes(buffer.getvalue(), {"format": "jsonl", "unzip": True, "entry_field": "file"}, "t")
+
     def test_zip_no_match_raises(self):
         with self.assertRaises(RuntimeError):
             parsers.parse_bytes(self._zip_bytes(), {"format": "csv", "unzip": True, "entry_contains": "nope"}, "t")
@@ -869,6 +1104,18 @@ class TestParsers(OfflineTestCase):
         with self.assertRaises(RuntimeError) as ctx:
             parsers.parse_bytes(self._zip_bytes(), {"format": "csv", "unzip": True, "allow_multi_entry": True}, "t")
         self.assertIn("表头不一致", str(ctx.exception))
+
+    def test_zip_multi_entry_same_columns_different_order_merges(self):
+        """同构条目（列集合相同、列序不同）要能合并：列序变化不该被当成"表头不一致"。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("a.csv", "user,amount\nu1,5\n")
+            archive.writestr("b.csv", "amount,user\n6,u2\n")
+        records = parsers.parse_bytes(
+            buffer.getvalue(), {"format": "csv", "unzip": True, "allow_multi_entry": True}, "t"
+        )
+        self.assertEqual(records[0]["amount"], "5")
+        self.assertEqual(records[1]["amount"], "6")
 
     def test_zip_multi_entry_same_headers_merge(self):
         """表头一致的多条目才允许合并。"""
@@ -977,15 +1224,51 @@ class FakeResponse:
         # request_once 解析的是 content（bytes）：没显式给就按 JSON 文本编码，
         # 与 requests 的真实行为一致（文本响应也是 bytes 落地）
         self.content = content if content is not None else self.text.encode("utf-8")
+        self.closed = False  # 出错分支会 close()：连接要归还连接池
 
     def json(self):
         if self._payload is None:
             raise ValueError("no json")
         return self._payload
 
+    def close(self):
+        self.closed = True
+
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class TestRetryCallGuards(OfflineTestCase):
+    def test_deterministic_error_is_not_retried(self):
+        import time as _time
+
+        from api2ods import utils as utils_mod
+
+        calls = {"n": 0}
+
+        def broken():
+            calls["n"] += 1
+            raise TypeError("字段名写错")
+
+        started = _time.perf_counter()
+        with self.assertRaises(RuntimeError) as ctx:
+            utils_mod.retry_call(broken, attempts=5, base_delay=30, desc="x")
+        self.assertEqual(calls["n"], 1)
+        self.assertLess(_time.perf_counter() - started, 1.0)
+        self.assertIn("确定性错误", str(ctx.exception))
+
+    def test_headers_must_be_mapping(self):
+        from api2ods import utils as utils_mod
+
+        with self.assertRaises(utils_mod.ConfigError):
+            utils_mod.check_header_values(["X-Api-Key: x"])
+
+    def test_pt_with_surrounding_spaces_is_accepted(self):
+        """--pt " 20260921 " 只多打了空格：按去掉空格后的值校验并使用（换行等仍拒）。"""
+        job, _ = config_mod.render_job(minimal_job(), {"secrets": {}}, date(2026, 9, 18))
+        _p, _t, _c, pt = config_mod.resolve_target(job, {}, make_args(pt=" 20260921 "), date(2026, 9, 18))
+        self.assertEqual(pt, "20260921")
 
 
 class TestHttp(OfflineTestCase):
@@ -1921,6 +2204,37 @@ class TestFetcher(OfflineTestCase):
         # 游标模式同样要带页大小，否则接口用默认值（可能很小）
         self.assertEqual(calls[0]["size"], 100)
 
+    def test_window_retries_infinity_is_config_error(self):
+        """window_retries=1e999（json 解析成 inf）时 int(inf) 抛 OverflowError：
+        要变成"必须是整数"的配置错，而不是裸 traceback。"""
+        job = minimal_job(pagination={"type": "page", "total_pages_path": "d.p", "window_retries": float("inf")})
+        fetcher = self._fetcher(job)
+        with self.assertRaises(SystemExit) as ctx:
+            fetcher.fetch_all([date(2026, 9, 18)], window_retries=float("inf"))
+        self.assertIn("window_retries", str(ctx.exception))
+
+    def test_cursor_missing_path_rejected_before_request(self):
+        """库调用方绕过 validate_job：type=cursor 而 cursor_path 为空时必须在发请求前报错——
+        "取不到游标"会被当成"翻完了"，只拉第一页还报成功（静默截断）。"""
+        job = minimal_job(pagination={"type": "cursor", "cursor_param": "cursor", "delay_seconds": 0})
+        with mock.patch.object(http_mod, "request_once") as request_mock:
+            with self.assertRaises(utils.ConfigError):
+                self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+        request_mock.assert_not_called()
+
+    def test_unknown_pagination_type_rejected(self):
+        """拼错/带空格的 type 原来落到 else 被当成 cursor、只拉第一页还报成功——
+        必须在发请求前白名单拦截（先 strip 再比，大小写/空白归一）。"""
+        for bad in ("pages", "offset", "cursorx", "nonee"):
+            job = minimal_job(pagination={"type": bad, "cursor_path": "data.next", "delay_seconds": 0})
+            with mock.patch.object(http_mod, "request_once") as request_mock:
+                with self.assertRaises(utils.ConfigError):
+                    self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+            request_mock.assert_not_called()
+        job = minimal_job(pagination={"type": " NONE ", "delay_seconds": 0})
+        with mock.patch.object(http_mod, "request_once", return_value={"data": {"list": []}}):
+            self.assertEqual(self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None)), [])
+
     def test_none_pagination_single_call(self):
         job = minimal_job()
         calls = []
@@ -2223,6 +2537,34 @@ class TestFetcher(OfflineTestCase):
         self.assertEqual(count, 1)
         self.assertEqual(len(calls), 1)  # 只请求一次，不跟着 total_pages 翻
 
+    def test_probe_treats_unconfirmed_end_as_connected(self):
+        """接口不给总数、首页又为空：体检按"能连通、当日无数据"处理（0 条），
+        不能因为 strict 的"无法确认已翻完"把好源判成体检失败。"""
+        job = minimal_job(pagination={"type": "page", "page_param": "p", "size_param": "n", "page_size": 100})
+        with mock.patch.object(http_mod, "request_once", side_effect=lambda *a, **k: {"data": {"list": []}}):
+            label, count = self._fetcher(job).probe([date(2026, 9, 18)])
+        self.assertEqual(count, 0)
+
+    def test_fetch_all_sets_stop_on_exit_and_clears_on_next_run(self):
+        """fetch_all 退出（成功/失败/中断）都要置停止信号让在飞 worker 收手；
+        下一轮开头必须清掉，否则串行路径一进来就被拦下。"""
+        job = minimal_job()
+        fetcher = self._fetcher(job)
+        with mock.patch.object(fetcher, "fetch_unit", return_value=[]):
+            fetcher.fetch_all([date(2026, 9, 18)])
+        self.assertTrue(fetcher._stop.is_set())
+        with mock.patch.object(fetcher, "fetch_unit", return_value=[]) as fu:
+            fetcher.fetch_all([date(2026, 9, 18)])
+        self.assertEqual(fu.call_count, 1)
+
+    def test_sleep_is_interruptible(self):
+        """停止信号已置位时 _sleep 立即返回 True（不真等 10s/20s 的退避）。"""
+        fetcher = self._fetcher(minimal_job())
+        fetcher._stop.set()
+        started = time.monotonic()
+        self.assertTrue(fetcher._sleep(10))
+        self.assertLess(time.monotonic() - started, 1.0)
+
 
 class TestFetchAll(OfflineTestCase):
     def test_window_retry_then_success(self):
@@ -2239,7 +2581,10 @@ class TestFetchAll(OfflineTestCase):
                 raise RuntimeError("boom")
             return [{"id": attempts["n"]}]
 
-        with mock.patch.object(fetcher, "fetch_unit", side_effect=flaky), mock.patch.object(fetch_mod.time, "sleep"):
+        with (
+            mock.patch.object(fetcher, "fetch_unit", side_effect=flaky),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
+        ):
             stats, failures = fetcher.fetch_all([date(2026, 9, 18)], window_retries=1, on_records=collected.extend)
         self.assertEqual(failures, [])
         self.assertEqual(len(collected), 1)
@@ -2258,7 +2603,10 @@ class TestFetchAll(OfflineTestCase):
                 raise RuntimeError("bad day")
             return [{"id": 2}]
 
-        with mock.patch.object(fetcher, "fetch_unit", side_effect=flaky), mock.patch.object(fetch_mod.time, "sleep"):
+        with (
+            mock.patch.object(fetcher, "fetch_unit", side_effect=flaky),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
+        ):
             stats, failures = fetcher.fetch_all(days, window_retries=0, on_records=collected.extend)
         self.assertEqual(len(failures), 1)
         self.assertEqual([r["id"] for r in collected], [2])
@@ -2280,7 +2628,7 @@ class TestFetchAll(OfflineTestCase):
 
         with (
             mock.patch.object(fetcher, "fetch_unit", side_effect=unauthorized),
-            mock.patch.object(fetch_mod.time, "sleep"),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
         ):
             with self.assertRaises(utils.FatalApiError):
                 fetcher.fetch_all(days, window_retries=2)
@@ -2298,7 +2646,7 @@ class TestFetchAll(OfflineTestCase):
 
         with (
             mock.patch.object(fetcher, "fetch_unit", side_effect=bad_config),
-            mock.patch.object(fetch_mod.time, "sleep"),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
         ):
             with self.assertRaises(utils.ConfigError):
                 fetcher.fetch_all([date(2026, 9, 16), date(2026, 9, 17)], window_retries=2)
@@ -2316,7 +2664,10 @@ class TestFetchAll(OfflineTestCase):
                 raise ConnectionError("connection reset")
             return [{"id": 1}]
 
-        with mock.patch.object(fetcher, "fetch_unit", side_effect=flaky), mock.patch.object(fetch_mod.time, "sleep"):
+        with (
+            mock.patch.object(fetcher, "fetch_unit", side_effect=flaky),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
+        ):
             stats, failures = fetcher.fetch_all([date(2026, 9, 18)], window_retries=2)
         self.assertEqual(failures, [])
         self.assertEqual(calls["n"], 2)
@@ -2374,6 +2725,17 @@ class TestSpool(OfflineTestCase):
             spool.close(keep=True)
             self.assertTrue(path.exists())
 
+    def test_iter_rows_after_close_raises_readable_error(self):
+        """关闭后读回：原来抛没有上下文的 FileNotFoundError（keep=False 已删文件）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "spool.jsonl"
+            spool = spool_mod.SpoolWriter(path)
+            spool.write_records([{"a": 1}])
+            spool.close()
+            with self.assertRaises(RuntimeError) as ctx:
+                list(spool.iter_rows())
+            self.assertIn("已关闭", str(ctx.exception))
+
 
 class TestInitWizard(OfflineTestCase):
     @staticmethod
@@ -2390,6 +2752,11 @@ class TestInitWizard(OfflineTestCase):
             return ""
 
         return ask
+
+    def test_secret_answers_not_stripped(self):
+        """密钥类输入只去尾部换行：首尾空白可能是凭据的一部分，静默改写会让验签失败难以排查。"""
+        self.assertEqual(init_wizard._ask_secret(lambda prompt="": " myPass \n", "密码"), " myPass ")
+        self.assertEqual(init_wizard._ask_secret(lambda prompt="": "tok ", "Token"), "tok ")
 
     def test_generate_simple_token_page_job(self):
         mapping = {
@@ -2431,6 +2798,109 @@ class TestInitWizard(OfflineTestCase):
         normalized = config_mod.normalize_job(job)
         config_mod.validate_job(normalized)  # 生成的配置（补默认值后）必须能通过校验
 
+    def test_interrupt_during_chmod_after_overwrite_reports_generated(self):
+        """覆盖已存在的作业文件：replace 完成后收尾 chmod 阶段被 Ctrl+C，不能报
+        "未生成任何文件"——旧配置其实已被整体替换。"""
+        mapping = {
+            "作业名": "demo_api",
+            "API 完整地址": "https://api.example.com/v1/items",
+            "请求方法": "",
+            "Token 的值": "tok123",
+            "记录列表在返回": "data.list",
+            "总页数字段路径": "data.totalPages",
+            "总条数字段路径": "",
+            "每次回拉最近几天": "15",
+            "项目名": "",
+            "表名": "",
+            "AccessKeyId": "AKID",
+            "AccessKeySecret": "SECRET",
+            "endpoint": "",
+        }
+        ask = self._answers(mapping, ["1", "1", "1", "0"])
+        echoes: list = []
+        fake_os = mock.Mock(wraps=init_wizard.os)
+        fake_os.name = "posix"
+        # 第一次 chmod 是"写入前收紧旧文件权限"（放行），第二次是写后的收尾（中断）
+        fake_os.chmod.side_effect = [None, KeyboardInterrupt]
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "demo_api.json"
+            out.write_text('{"job": "old"}', encoding="utf-8")
+            with mock.patch.object(init_wizard, "os", fake_os):
+                code = init_wizard.run_init(
+                    out_path=str(out),
+                    ask=ask,
+                    ask_secret=ask,
+                    echo=lambda *a: echoes.append(" ".join(str(x) for x in a)),
+                    workdir=Path(tmp),
+                )
+            self.assertEqual(code, 0)
+            self.assertTrue(any("已生成" in line for line in echoes), echoes[-5:])
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8"))["job"], "demo_api")
+
+    def test_interrupt_at_write_start_with_existing_file_reports_cancelled(self):
+        """旧文件存在、写盘刚开始（replace 未发生）就中断：必须报"已取消、未生成"并保留
+        旧文件——不能把"旧文件还在"误判成"本次已生成"。"""
+        mapping = {
+            "作业名": "demo_api",
+            "API 完整地址": "https://api.example.com/v1/items",
+            "请求方法": "",
+            "Token 的值": "tok123",
+            "记录列表在返回": "data.list",
+            "总页数字段路径": "data.totalPages",
+            "总条数字段路径": "",
+            "每次回拉最近几天": "15",
+            "项目名": "",
+            "表名": "",
+            "AccessKeyId": "AKID",
+            "AccessKeySecret": "SECRET",
+            "endpoint": "",
+        }
+        ask = self._answers(mapping, ["1", "1", "1", "0"])
+        echoes: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "demo_api.json"
+            out.write_text('{"job": "old"}', encoding="utf-8")
+            with mock.patch.object(init_wizard, "_atomic_write_job", side_effect=KeyboardInterrupt):
+                code = init_wizard.run_init(
+                    out_path=str(out),
+                    ask=ask,
+                    ask_secret=ask,
+                    echo=lambda *a: echoes.append(" ".join(str(x) for x in a)),
+                    workdir=Path(tmp),
+                )
+            self.assertEqual(code, 1)
+            self.assertTrue(any("未生成" in line for line in echoes), echoes[-5:])
+            self.assertEqual(out.read_text(encoding="utf-8"), '{"job": "old"}')
+
+    def test_keyboard_interrupt_cleans_tmp_file(self):
+        """Ctrl+C 落在写盘途中（fsync）：含明文密钥的临时文件必须清掉，
+        向导的"已取消，未生成任何文件"才属实（清理原来只接 Exception，中断会留下 .tmp）。"""
+        mapping = {
+            "作业名": "demo_api",
+            "API 完整地址": "https://api.example.com/v1/items",
+            "请求方法": "",
+            "Token 的值": "tok123",
+            "记录列表在返回": "data.list",
+            "总页数字段路径": "data.totalPages",
+            "总条数字段路径": "",
+            "每次回拉最近几天": "15",
+            "项目名": "",
+            "表名": "",
+            "AccessKeyId": "AKID",
+            "AccessKeySecret": "SECRET",
+            "endpoint": "",
+        }
+        ask = self._answers(mapping, ["1", "1", "1", "0"])
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "demo_api.json"
+            with mock.patch.object(init_wizard.os, "fsync", side_effect=KeyboardInterrupt):
+                code = init_wizard.run_init(
+                    out_path=str(out), ask=ask, ask_secret=ask, echo=lambda *a: None, workdir=Path(tmp)
+                )
+            self.assertIn(code, (1, 130))
+            self.assertFalse(out.exists())
+            self.assertEqual(list(Path(tmp).glob(".demo_api.json.*.tmp")), [])
+
     def test_cancel_on_eof(self):
         def ask(_prompt=""):
             raise EOFError
@@ -2457,6 +2927,11 @@ class TestInitWizard(OfflineTestCase):
             )
             content = path.read_text(encoding="utf-8") if path.exists() else None
         return code, content, "\n".join(out)
+
+    def test_split_url_invalid_ipv6_returns_none(self):
+        """方括号不配对的 IPv6 地址（从日志截断粘来）要按"格式不对"返回 None、
+        走重试分支，而不是 urlsplit 的 ValueError 裸崩向导。"""
+        self.assertIsNone(init_wizard._split_url("https://[10.0.0.1:8080/api"))
 
     def test_invalid_url_is_retried(self):
         """地址格式不对要重问，不能拿着坏地址生成配置。"""
@@ -2562,6 +3037,24 @@ class TestInitWizard(OfflineTestCase):
         self.assertEqual(code, 1)
         self.assertIsNone(content)
         self.assertIn("游标路径连续三次为空", output)
+
+    @unittest.skipUnless(os.name == "posix", "符号链接/chmod 语义按 POSIX 断言")
+    def test_atomic_write_job_does_not_chmod_symlink_target(self):
+        """目标是符号链接时跳过 chmod：os.chmod 会跟随链接改到真实文件权限，而 os.replace
+        只替换链接本身——共享目录里的同名链接能让向导改任意文件的权限（且白改）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            real = Path(tmp) / "real.txt"
+            real.write_text("keep", encoding="utf-8")
+            os.chmod(real, 0o644)
+            link = Path(tmp) / "job.json"
+            try:
+                os.symlink(real, link)
+            except OSError:
+                self.skipTest("平台/权限不支持创建符号链接")
+            init_wizard._atomic_write_job(link, {"job": "demo"})
+            self.assertEqual(os.stat(real).st_mode & 0o777, 0o644)  # 真实文件权限未被动过
+            self.assertFalse(link.is_symlink())  # 链接本身被替换成作业文件
+            self.assertEqual(json.loads(link.read_text(encoding="utf-8")), {"job": "demo"})
 
     def test_invalid_choice_numbers_fall_back_with_hint(self):
         """编号填了非法值：提示后按默认走，不静默也不崩。"""
@@ -2692,27 +3185,31 @@ class TestInitWizard(OfflineTestCase):
 
     def test_generated_file_is_chmod_600_on_posix(self):
         """生成的配置里有明文密钥：类 Unix 上收紧到 600（Windows 忽略权限位），
-        且文件先按 0600 创建再写入（write_text 先按 umask 建、再 chmod 的老写法有可读窗口期）。"""
+        且临时文件走 tempfile.mkstemp（随机名 + O_EXCL、默认 0600）后原子替换；
+        原来可预测的 `名字.pid.tmp + O_TRUNC` 会被同目录下的同名符号链接跟随。"""
         mapping = {"API 完整地址": "https://a.example.com/x", "AccessKeyId": "A", "AccessKeySecret": "S"}
         ask = self._answers(mapping, ["0", "0", "0", "0"])
-        # wraps=真 os 模块：os.open/os.fdopen 走真实实现（文件真的写出来），只记录调用；
-        # name 强制成 posix 以覆盖 chmod 分支（Windows 上生产代码会跳过它）；
-        # O_* 常量要显式透传——wraps 对非可调用属性只会给一个 Mock 包装，位运算会炸
+        # wraps=真 os 模块：os.fdopen/os.replace 走真实实现（文件真的写出来），只记录调用；
+        # name 强制成 posix 以覆盖 chmod 分支（Windows 上生产代码会跳过它）
         fake_os = mock.Mock(wraps=init_wizard.os)
         fake_os.name = "posix"
-        fake_os.O_WRONLY, fake_os.O_CREAT, fake_os.O_TRUNC = os.O_WRONLY, os.O_CREAT, os.O_TRUNC
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "w.json"
-            with mock.patch.object(init_wizard, "os", fake_os):
+            real_mkstemp = tempfile.mkstemp
+            with (
+                mock.patch.object(init_wizard, "os", fake_os),
+                mock.patch.object(init_wizard.tempfile, "mkstemp", wraps=real_mkstemp) as mkstemp,
+            ):
                 code = init_wizard.run_init(
                     out_path=str(path), ask=ask, ask_secret=ask, echo=lambda *a: None, workdir=Path(tmp)
                 )
             self.assertEqual(code, 0)
             self.assertTrue(path.is_file())
+            # 临时文件必须建在目标目录旁（保证 os.replace 同盘原子），且不留残渣
+            self.assertEqual(Path(mkstemp.call_args.kwargs["dir"]), Path(tmp))
+            self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
         self.assertTrue(fake_os.chmod.called)
         fake_os.chmod.assert_called_with(path, 0o600)
-        open_modes = [call.args[2] for call in fake_os.open.call_args_list if len(call.args) >= 3]
-        self.assertIn(0o600, open_modes)
 
     def test_relative_out_path_is_resolved_under_workdir(self):
         """--init-out 给相对路径时按工作目录解析（否则会落到进程的当前目录）。"""
@@ -2893,6 +3390,44 @@ class FakeWriter:
         self.closed = True
 
 
+class DdlOdps:
+    """假 ODPS 客户端：分区增删的 DDL 直接落到 FakeTable 上（生产已改走带超时的 DDL）。
+
+    - run_sql 收到 `alter table ... drop/add ... partition (pt='X')` 时，按 pyodps 表 API 的
+      语义更新 table.deleted / table.created（既有断言"确实先删过"继续有意义）；
+    - 其余 SQL 返回"立即成功"的假实例（这些用例不校验 count/verify）。
+    """
+
+    def __init__(self, table=None):
+        self.table = table
+        self.sqls: list[str] = []
+
+    def run_sql(self, sql):
+        self.sqls.append(sql)
+        match = re.search(
+            r"(drop\s+if\s+exists|add\s+if\s+not\s+exists)\s+partition\s*\(\s*pt\s*=\s*'([^']*)'\s*\)",
+            sql,
+            re.I,
+        )
+        if match is not None and self.table is not None:
+            spec = f"pt={match.group(2)}"
+            if match.group(1).lower().startswith("drop"):
+                self.table.deleted.append((spec, True))
+            else:
+                self.table.created.append((spec, True))
+        return OkInstance()
+
+
+class OkInstance:
+    """立即成功、未终止的假 SQL 实例（run_sql_with_timeout 直接取用）。"""
+
+    def is_successful(self):
+        return True
+
+    def is_terminated(self):
+        return False
+
+
 class TestNormalizeJob(OfflineTestCase):
     """配置瘦身：缺省字段自动补齐 / 推断（让新源配置尽量短）。"""
 
@@ -2981,7 +3516,9 @@ class TestTargetTable(OfflineTestCase):
             return iter([rows[0:2], rows[2:4], rows[4:5]])
 
         with mock.patch.object(utils.time, "sleep"):
-            written = mc_mod.write_partition(table, "ods_x", "20260918", batches, total=5)
+            written = mc_mod.write_partition(
+                DdlOdps(table), table, "demo_project", "ods_x", "20260918", batches, total=5
+            )
         self.assertEqual(written, 5)
         self.assertEqual(table.deleted, [("pt=20260918", True)])
         self.assertEqual(table.created, [("pt=20260918", True)])
@@ -2993,7 +3530,9 @@ class TestTargetTable(OfflineTestCase):
         table2 = FakeTable()
         table2.fail_next_write = True
         with mock.patch.object(utils.time, "sleep"):
-            written = mc_mod.write_partition(table2, "ods_x", "20260918", batches, total=5, retries=2)
+            written = mc_mod.write_partition(
+                DdlOdps(table2), table2, "demo_project", "ods_x", "20260918", batches, total=5, retries=2
+            )
         self.assertEqual(written, 5)
         self.assertEqual(len(table2.deleted), 2)
         self.assertEqual([batch[0] for batch in table2._writer.records], rows)
@@ -3006,7 +3545,7 @@ class TestTargetTable(OfflineTestCase):
             return iter([["x" * (mc_mod.MAX_ROW_BYTES + 1)]])
 
         with self.assertRaises(SystemExit):
-            mc_mod.write_partition(table, "ods_x", "20260918", batches, total=1)
+            mc_mod.write_partition(DdlOdps(table), table, "demo_project", "ods_x", "20260918", batches, total=1)
         self.assertEqual(table.deleted, [])
         self.assertEqual(table.created, [])
 
@@ -3015,8 +3554,20 @@ class TestTargetTable(OfflineTestCase):
         table = FakeTable()
         batches = lambda: iter([['{"a":1}']])  # noqa: E731
         with mock.patch.object(utils.time, "sleep"):
-            mc_mod.write_partition(table, "ods_x", "20260918", batches, total=1, retries=1)
+            mc_mod.write_partition(
+                DdlOdps(table), table, "demo_project", "ods_x", "20260918", batches, total=1, retries=1
+            )
         self.assertEqual(table.writer_kwargs[0].get("reopen"), True)
+
+    def test_write_partition_forwards_secrets_to_retry_call(self):
+        """写库重试的日志/报错要带上作业的密钥值（Tunnel/SQL 报错里可能带签名 URL）。"""
+        table = FakeTable()
+        batches = lambda: iter([['{"a":1}']])  # noqa: E731
+        with mock.patch.object(mc_mod, "retry_call", return_value=1) as retry:
+            mc_mod.write_partition(
+                DdlOdps(table), table, "demo_project", "ods_x", "20260918", batches, total=1, secrets=["sk-LIVE-XYZ"]
+            )
+        self.assertEqual(retry.call_args.kwargs["secrets"], ["sk-LIVE-XYZ"])
 
     def test_write_partition_count_mismatch(self):
         table = FakeTable()
@@ -3026,7 +3577,48 @@ class TestTargetTable(OfflineTestCase):
 
         with mock.patch.object(utils.time, "sleep"):
             with self.assertRaises(RuntimeError):
-                mc_mod.write_partition(table, "ods_x", "20260918", batches, total=99, retries=1)
+                mc_mod.write_partition(
+                    DdlOdps(table), table, "demo_project", "ods_x", "20260918", batches, total=99, retries=1
+                )
+
+    def test_partition_ops_use_timeout_protected_ddl(self):
+        """分区增删必须走带超时的 DDL（run_sql），不再调 pyodps 的 delete/create_partition。"""
+
+        class NoPyodpsApiTable(FakeTable):
+            def delete_partition(self, spec, if_exists=False):
+                raise AssertionError("分区删除不该再走 pyodps API（同步、不受 --sql-timeout 保护）")
+
+            def create_partition(self, spec, if_not_exists=False):
+                raise AssertionError("分区创建不该再走 pyodps API（同步、不受 --sql-timeout 保护）")
+
+        table = NoPyodpsApiTable()
+        odps = DdlOdps(table)
+        with mock.patch.object(utils.time, "sleep"):
+            written = mc_mod.write_partition(
+                odps, table, "demo_project", "ods_x", "20260918", lambda: iter([['{"a":1}']]), total=1, timeout=7
+            )
+        self.assertEqual(written, 1)
+        sqls = "\n".join(odps.sqls)
+        self.assertIn("drop if exists partition (pt='20260918')", sqls)
+        self.assertIn("add if not exists partition (pt='20260918')", sqls)
+
+    def test_drop_and_add_partition_sql_and_timeout(self):
+        """删/建分区的 SQL 形态与 timeout 透传（README 承诺分区增删受 --sql-timeout 保护）。"""
+        with mock.patch.object(mc_mod, "run_sql_with_timeout") as run:
+            mc_mod.drop_partition(mock.Mock(), "p", "t", "pt=20260918", timeout=7)
+            mc_mod.add_partition(mock.Mock(), "p", "t", "pt='20260918'", timeout=7)
+        sqls = [call.args[1] for call in run.call_args_list]
+        self.assertEqual(sqls[0], "alter table p.t drop if exists partition (pt='20260918')")
+        self.assertEqual(sqls[1], "alter table p.t add if not exists partition (pt='20260918')")
+        self.assertTrue(all(call.kwargs["timeout"] == 7 for call in run.call_args_list))
+
+    def test_sql_spec_normalizes_quotes_and_rejects_bad_input(self):
+        self.assertEqual(mc_mod._sql_spec("pt=20260918"), "pt='20260918'")
+        self.assertEqual(mc_mod._sql_spec("pt='20260918'"), "pt='20260918'")
+        self.assertEqual(mc_mod._sql_spec('pt="20260918"'), "pt='20260918'")
+        for bad in ("pt=", "=20260918", "pt;drop=20260918"):
+            with self.assertRaises(SystemExit):
+                mc_mod._sql_spec(bad)
 
 
 class TestRunSqlWithTimeout(OfflineTestCase):
@@ -3069,6 +3661,9 @@ class TestRunSqlWithTimeout(OfflineTestCase):
             def time(self):
                 self.now += 1.0
                 return self.now
+
+            def monotonic(self):  # 生产代码量经过时间用单调时钟
+                return self.time()
 
             def sleep(self, _seconds):
                 pass
@@ -3212,8 +3807,25 @@ class TestMcCredentialFallback(OfflineTestCase):
         for hint in ("作业文件", "环境变量", "aliyun CLI"):
             self.assertIn(hint, message)
 
-    def test_partial_credentials_fall_through(self):
-        """只填了 AK 没填 SK：不能当成"已配置"用，要继续往后找。"""
+    def test_partial_credentials_is_config_error(self):
+        """只填了 AK 没填 SK（典型：键名拼错）：报错、不回退——回退到 env/本机 CLI
+        会用另一个身份写库（审计/计费全错），即使别的来源有完整凭证也不许用。"""
+        env = {k: v for k, v in os.environ.items() if k not in ("ALIYUN_ACCESS_KEY_ID", "ALIYUN_ACCESS_KEY_SECRET")}
+        with mock.patch.dict(os.environ, env, clear=True):
+            with self.assertRaises(SystemExit) as ctx:
+                mc_mod.load_mc_credentials({"access_key_id": "half"}, "作业文件")
+        message = str(ctx.exception)
+        self.assertIn("只填了一半", message)
+        self.assertIn("access_key_secret", message)
+        self.assertNotIn("half", message)  # 半对里的值也不回显
+
+    def test_short_aliases_are_accepted(self):
+        self.assertEqual(mc_mod._pick_aksk({"ak": "a", "sk": "b"}), ("a", "b"))
+        self.assertEqual(mc_mod._pick_aksk({"ak_id": "a", "ak_secret": "b"}), ("a", "b"))
+        self.assertEqual(mc_mod._pick_aksk({"access_key_id": "a"}), ("", ""))
+
+    def test_named_cli_profile_missing_does_not_fall_back(self):
+        """--mc-profile 指定了但不存在：报错，不许改用其它 profile 的 AK（换身份写库）。"""
         with tempfile.TemporaryDirectory() as tmp:
             home = self._fake_cli_config(
                 tmp,
@@ -3229,13 +3841,11 @@ class TestMcCredentialFallback(OfflineTestCase):
                 mock.patch.dict(os.environ, env, clear=True),
                 mock.patch.object(Path, "home", staticmethod(lambda: home)),
             ):
-                ak, sk, _ = mc_mod.load_mc_credentials({"access_key_id": "half"}, "作业文件")
-        self.assertEqual((ak, sk), ("cli_id", "cli_sk"))
-
-    def test_short_aliases_are_accepted(self):
-        self.assertEqual(mc_mod._pick_aksk({"ak": "a", "sk": "b"}), ("a", "b"))
-        self.assertEqual(mc_mod._pick_aksk({"ak_id": "a", "ak_secret": "b"}), ("a", "b"))
-        self.assertEqual(mc_mod._pick_aksk({"access_key_id": "a"}), ("", ""))
+                with self.assertRaises(SystemExit) as ctx:
+                    mc_mod.load_mc_credentials({}, "作业文件", cli_profile="prod")
+        message = str(ctx.exception)
+        self.assertIn("prod", message)
+        self.assertNotIn("cli_id", message)  # 不回显别的 profile 的 AK
 
     def test_broken_cli_config_gives_readable_error(self):
         """本机 aliyun 配置坏掉（空文件 / profiles 类型不对）不该抛裸 traceback。"""
@@ -3268,26 +3878,36 @@ class TestMcCredentialFallback(OfflineTestCase):
 
 class TestResolveTarget(OfflineTestCase):
     def test_defaults(self):
-        job = config_mod.render_job(minimal_job(), {"secrets": {}}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(), {"secrets": {}}, date(2026, 9, 18))
         project, table, column, pt = config_mod.resolve_target(job, {}, make_args(), date(2026, 9, 18))
         self.assertEqual((project, table, column, pt), ("demo_project", "ods_demo_json_df", "json", "20260918"))
 
+    def test_resolve_target_rechecks_table_and_column(self):
+        """resolve_target 也是对外入口（库调用方不经 validate_job）：table/column 会拼进
+        DDL/SQL，必须与 project 同口径过标识符白名单。"""
+        job = minimal_job(target={"project": "p", "table": "t; drop table x"})
+        with self.assertRaises(SystemExit):
+            config_mod.resolve_target(job, {}, make_args(), date(2026, 9, 18))
+        job = minimal_job(target={"project": "p", "table": "t", "column": "c'; drop"})
+        with self.assertRaises(SystemExit):
+            config_mod.resolve_target(job, {}, make_args(), date(2026, 9, 18))
+
     def test_project_from_profile(self):
-        job = config_mod.render_job(minimal_job(target={"table": "t"}), {"secrets": {}}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(target={"table": "t"}), {"secrets": {}}, date(2026, 9, 18))
         project, _t, _c, _pt = config_mod.resolve_target(
             job, {"profiles": {"default": {"project": "p1"}}}, make_args(), date(2026, 9, 18)
         )
         self.assertEqual(project, "p1")
 
     def test_legacy_maxcompute_block(self):
-        job = config_mod.render_job(minimal_job(target={"table": "t"}), {"secrets": {}}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(target={"table": "t"}), {"secrets": {}}, date(2026, 9, 18))
         project, _t, _c, _pt = config_mod.resolve_target(
             job, {"maxcompute": {"project": "legacy"}}, make_args(), date(2026, 9, 18)
         )
         self.assertEqual(project, "legacy")
 
     def test_pt_override_and_validation(self):
-        job = config_mod.render_job(minimal_job(), {"secrets": {}}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(), {"secrets": {}}, date(2026, 9, 18))
         _p, _t, _c, pt = config_mod.resolve_target(job, {}, make_args(pt="20260918"), date(2026, 9, 18))
         self.assertEqual(pt, "20260918")
         # --pt 显式指定：允许测试/对比/补数用的特殊分区（默认的 target.pt 仍强制 8 位业务日）
@@ -3300,23 +3920,39 @@ class TestResolveTarget(OfflineTestCase):
 
     def test_profile_value_wrong_type_reports_field(self):
         """profiles.<名> 写成字符串：给字段名报错，不是 dict.update 的裸 ValueError。"""
-        job = config_mod.render_job(minimal_job(target={"table": "t"}), {}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(target={"table": "t"}), {}, date(2026, 9, 18))
         with self.assertRaises(SystemExit) as ctx:
             config_mod.resolve_target(job, {"profiles": {"default": "my-project"}}, make_args(), date(2026, 9, 18))
         self.assertIn("profiles.default", str(ctx.exception))
 
     def test_profiles_not_object_reports_field(self):
         """--config 的 profiles 整体写成字符串：不能靠 `"default" in "oops"` 的子串判断静默当没配。"""
-        job = config_mod.render_job(minimal_job(target={"table": "t"}), {}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(target={"table": "t"}), {}, date(2026, 9, 18))
         with self.assertRaises(SystemExit) as ctx:
             config_mod.resolve_target(job, {"profiles": "oops"}, make_args(), date(2026, 9, 18))
         self.assertIn("profiles 必须是对象", str(ctx.exception))
 
     def test_maxcompute_block_wrong_type_reports_field(self):
-        job = config_mod.render_job(minimal_job(target={"table": "t"}), {}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(target={"table": "t"}), {}, date(2026, 9, 18))
         with self.assertRaises(SystemExit) as ctx:
             config_mod.resolve_target(job, {"maxcompute": ["ak", "sk"]}, make_args(), date(2026, 9, 18))
         self.assertIn("maxcompute 必须是对象", str(ctx.exception))
+
+    def test_project_from_profile_is_still_whitelisted(self):
+        """project 来自 profiles/<maxcompute> 时同样要过标识符白名单（它一样会拼进 DDL/SQL）。"""
+        job, _ = config_mod.render_job(minimal_job(target={"table": "t"}), {}, date(2026, 9, 18))
+        for config in (
+            {"profiles": {"default": {"project": "bad-name;drop"}}},
+            {"maxcompute": {"project": "has space"}},
+        ):
+            with self.assertRaises(SystemExit) as ctx:
+                config_mod.resolve_target(job, config, make_args(), date(2026, 9, 18))
+            self.assertIn("标识符", str(ctx.exception))
+
+    def test_full_width_pt_rejected(self):
+        """_PT_RE 只认 ASCII 数字：全角数字不能当业务日蒙混过关。"""
+        self.assertIsNone(config_mod._PT_RE.match("２０２６０９２０"))
+        self.assertIsNotNone(config_mod._PT_RE.match("20260920"))
 
 
 class TestRunLock(OfflineTestCase):
@@ -3327,6 +3963,15 @@ class TestRunLock(OfflineTestCase):
         second = _lock_path(Path("jobs/aliyun.json"))
         self.assertNotEqual(first, second)
         self.assertTrue(first.name.startswith("onerway-") and first.suffix == ".lock")
+
+    def test_lock_path_normalizes_path_spelling(self):
+        """同一作业的相对/绝对/带 .. 写法必须落到同一把锁：否则两个实例互斥静默失效
+        （同删同写一个分区）。"""
+        from api2ods.cli import _lock_path
+
+        rel = Path("jobs/demo.json")
+        self.assertEqual(_lock_path(rel), _lock_path(Path(os.path.abspath("jobs/demo.json"))))
+        self.assertEqual(_lock_path(rel), _lock_path(Path("jobs/../jobs/demo.json")))
 
     def test_lock_path_is_redirected_to_temp_in_tests(self):
         """单测把运行锁根目录重定向到临时目录：跑测试不会在仓库 .run-locks/ 里
@@ -3342,6 +3987,26 @@ class TestRunLock(OfflineTestCase):
 
         self.assertNotEqual(_lock_path(Path("jobs/a/api.json")), _lock_path(Path("jobs/b/api.json")))
         self.assertEqual(_lock_path(Path("jobs/a/api.json")), _lock_path(Path("jobs/a/api.json")))
+
+    def test_lock_dir_env_override_pins_location(self):
+        """API2ODS_LOCK_DIR 把锁钉在固定目录：不同身份/TMPDIR 跑同一作业也互斥。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            pinned = Path(tmp) / "shared-locks"
+            with mock.patch.dict(os.environ, {"API2ODS_LOCK_DIR": str(pinned)}):
+                path = cli_mod._lock_path(Path("jobs/demo.json"))
+            self.assertEqual(path.parent, pinned)
+            self.assertTrue(path.name.endswith(".lock"))
+            # 同一作业两次调用必须落到同一个锁文件（不因身份/临时目录差异漂移）
+            with mock.patch.dict(os.environ, {"API2ODS_LOCK_DIR": str(pinned)}):
+                self.assertEqual(path, cli_mod._lock_path(Path("jobs/demo.json")))
+
+    def test_lock_dir_env_override_unusable_fails_loudly(self):
+        """显式指定的锁目录不可用要立刻报错：静默换目录就等于互斥失效。"""
+        with mock.patch.dict(os.environ, {"API2ODS_LOCK_DIR": "/nonexistent-root-only/locks"}):
+            with mock.patch.object(Path, "mkdir", side_effect=OSError("只读")):
+                with self.assertRaises(SystemExit) as ctx:
+                    cli_mod._lock_path(Path("jobs/demo.json"))
+        self.assertIn("API2ODS_LOCK_DIR", str(ctx.exception))
 
     @unittest.skipIf(utils.fcntl is None and utils.msvcrt is None, "本平台没有可用的文件锁")
     def test_same_lock_blocks_second_instance(self):
@@ -3447,21 +4112,30 @@ class TestLogging(OfflineTestCase):
         utils.remove_log_sink(None)  # 没挂日志文件时传 None
 
     def test_broken_sink_does_not_break_logging(self):
-        """日志文件写失败（磁盘满/句柄被关）不能影响主流程。"""
+        """日志文件写失败（磁盘满/句柄被关）不能影响主流程，且要能被看见一次。"""
 
         class BrokenSink:
+            def __init__(self):
+                self.closed = False
+
             def write(self, _text):
                 raise OSError("disk full")
 
             def flush(self):
                 pass
 
+            def close(self):
+                self.closed = True
+
         sink = BrokenSink()
         utils.add_log_sink(sink)
-        try:
+        buf = io.StringIO()
+        with mock.patch.object(sys, "stderr", buf):
             utils.log("照常输出")
-        finally:
-            utils._sinks.remove(sink)
+        # 写失败的 sink 被摘掉并关闭（句柄不再泄漏），stderr 上留一条可见的警告
+        self.assertNotIn(sink, utils._sinks)
+        self.assertTrue(sink.closed)
+        self.assertIn("--log-file 写入失败", buf.getvalue())
 
     def test_progress_log_is_throttled(self):
         """进度日志每 1000 条才打一次，否则百万条作业会刷爆日志。"""
@@ -3507,6 +4181,12 @@ class TestRedact(OfflineTestCase):
         self.assertEqual(utils.redact("?token=abc123&page=1"), "?token=***&page=1")
         self.assertEqual(utils.redact("?AccessKeyId=x&Signature=y"), "?AccessKeyId=***&Signature=***")
 
+    def test_json_numeric_secret_is_masked(self):
+        """{"password": 12345} 这类不带引号的数字/布尔值只有 query 规则能遮（JSON 规则只吃字符串）。"""
+        out = utils.redact('{"password": 12345, "page": 2}')
+        self.assertNotIn("12345", out)
+        self.assertIn("***", out)
+
     def test_ordinary_params_are_untouched(self):
         """task/monkey/keywords 这类普通参数不能被误伤（按词判断而不是子串）。"""
         self.assertEqual(utils.redact("?task=1&monkey=2&keywords=3"), "?task=1&monkey=2&keywords=3")
@@ -3537,6 +4217,17 @@ class TestRedact(OfflineTestCase):
         self.assertNotIn("abc123def", utils.redact("header: 'Authorization=Bearer abc123def'"))
         self.assertNotIn("abc123", utils.redact("url=https://h/api?access_token=abc123&x=1"))
         self.assertNotIn("abc 123", utils.redact("access_token='abc 123'"))
+
+    def test_deeply_nested_equals_does_not_recursion_error(self):
+        """构造性文本（上千个等号连写）不能把脱敏本身打成 RecursionError。
+
+        各回调会把匹配到的值再交给 redact 递归；`a=b=c=…` 每层只剥一个等号，
+        没有深度上限时第三方响应体里的这种文本会直接打挂日志路径。
+        """
+        text = "a=" + "b=" * 5000 + "c"
+        out = utils.redact(text)
+        self.assertIsInstance(out, str)
+        self.assertIn("***", out)  # 到上限按「宁可多脱敏」整段遮掉
 
     def test_nested_values_are_redacted(self):
         """键名不敏感时值里也可能藏着密钥：配置片段 / 头行 / 查询串都要递归脱一层。"""
@@ -3591,7 +4282,7 @@ class TestBackfillRequiresBizdate(OfflineTestCase):
 
     def _resolve(self, biz_date, **args):
         """按真实流程走一遍：先 render_job（替换 ${bizdate}）再解析目标。"""
-        job = config_mod.render_job(minimal_job(), {}, biz_date)
+        job, _ = config_mod.render_job(minimal_job(), {}, biz_date)
         return config_mod.resolve_target(job, {}, make_args(**args), biz_date)
 
     def test_backfill_without_bizdate_raises(self):
@@ -3695,6 +4386,80 @@ class TestNumericConfigGuards(OfflineTestCase):
                 dates_mod.window_param_sets({"window": {"pad_hours": value}}, [date(2026, 9, 18)])
             self.assertIn(must_have, str(ctx.exception))
 
+    def test_huge_integer_reports_config_error_not_traceback(self):
+        """JSON 里的超长整数字面量：float() 抛 OverflowError，必须是明确报错而不是裸 traceback。"""
+        with self.assertRaises(SystemExit) as ctx:
+            config_mod._require_number(10**400, "window.days", exclusive_min=0, integer=True)
+        self.assertIn("window.days", str(ctx.exception))
+
+    def test_negative_retry_delay_reports_config_error(self):
+        """retry_delay 配成负数会在退避 sleep 时抛裸 ValueError，配置阶段就要拦下。"""
+        job = minimal_job(
+            request={
+                "base_url": "https://api.example.com",
+                "path": "/v1/items",
+                "method": "GET",
+                "records_path": "data.list",
+                "retry_delay": -5,
+            }
+        )
+        with self.assertRaises(SystemExit) as ctx:
+            fetch_mod.Fetcher(job, Path("."))
+        self.assertIn("retry_delay", str(ctx.exception))
+
+    def _job_with(self, **request_overrides):
+        request = {
+            "base_url": "https://api.example.com",
+            "path": "/v1/items",
+            "method": "GET",
+            "records_path": "data.list",
+        }
+        request.update(request_overrides)
+        return minimal_job(request=request)
+
+    def test_negative_retry_times_reports_config_error(self):
+        with self.assertRaises(SystemExit) as ctx:
+            fetch_mod.Fetcher(self._job_with(retry_times=-1), Path("."))
+        self.assertIn("retry_times", str(ctx.exception))
+
+    def test_invalid_method_reports_config_error(self):
+        """任意字符串会原样写进 request.method（含换行还会拼进请求行）：按 RFC token 形态先挡住。"""
+        for bad in ("GET\nPOST", "GE T"):
+            with self.assertRaises(SystemExit) as ctx:
+                fetch_mod.Fetcher(self._job_with(method=bad), Path("."))
+            self.assertIn("method", str(ctx.exception))
+        # 空串仍按未配置处理（默认 GET）
+        self.assertEqual(fetch_mod.Fetcher(self._job_with(method=""), Path(".")).method, "GET")
+
+    def test_window_format_is_stripped_and_written_back(self):
+        """ " %Y-%m-%d" 这类带空白的写法校验通过后要写回剥离值，运行时不能按含空白的字面量格式化。"""
+        job = minimal_job(window={"mode": "per_day", "days": 1, "format": " %Y-%m-%d "})
+        config_mod.validate_job(job)
+        self.assertEqual(job["window"]["format"], "%Y-%m-%d")
+
+    def test_placeholder_key_resolving_to_list_is_an_error(self):
+        """整串占位符解析成列表后当键：str() 会静默产出 "['a', 'b']" 这种没人认得的键。"""
+        with self.assertRaises(SystemExit) as ctx:
+            config_mod.deep_substitute({"${secrets.lst}": 1}, {"secrets": {"lst": ["a", "b"]}})
+        self.assertIn("无法作为 JSON 键", str(ctx.exception))
+
+    def test_zero_count_does_not_underflow(self):
+        """float("1e-400") 会下溢成 0.0：极小但非零的计数不能被当成"明确的 0 条"。"""
+        self.assertFalse(fetch_mod._is_zero_count("1e-400"))
+        self.assertTrue(fetch_mod._is_zero_count("0"))
+        self.assertTrue(fetch_mod._is_zero_count(0))
+        self.assertTrue(fetch_mod._is_zero_count("0.0"))
+
+    def test_oversized_zip_entry_is_rejected(self):
+        """条目解压上限：超限条目在解压前就报错（zip bomb / 源侧导出事故）。"""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("a.csv", "user,amount\nu1,5\n")
+        with mock.patch.object(parsers, "MAX_ZIP_ENTRY_BYTES", 4):
+            with self.assertRaises(utils.ConfigError) as ctx:
+                parsers.parse_bytes(buffer.getvalue(), {"format": "csv", "unzip": True}, "t")
+        self.assertIn("超过上限", str(ctx.exception))
+
 
 class TestProbePageSize(OfflineTestCase):
     def _fetcher(self, job):
@@ -3773,8 +4538,17 @@ class TestRetryAfterDate(OfflineTestCase):
 
 
 class TestPendingWarningsArePerJob(OfflineTestCase):
+    def test_string_warnings_key_falls_through_to_unknown_warning(self):
+        """用户误写的 "__warnings__"（非 list）不能被 extend 按字符拆成假告警，
+        也不能被静默吞掉——要落到"不是已知配置项"的扫描。"""
+        job = minimal_job()
+        job["__warnings__"] = "oops"
+        ws = config_mod.collect_warnings(job)
+        self.assertTrue(any("__warnings__" in w and "未知" in w or "__warnings__" in w for w in ws), ws)
+        self.assertNotIn("o", ws)
+
     def test_warnings_do_not_leak_between_jobs(self):
-        """模块级缓存会让告警串到下一次调用；现在挂在 job 上、由 collect_warnings 取走。"""
+        """模块级缓存会让告警串到下一次调用；现在挂在 job 上、由 collect_warnings 读取。"""
         first = config_mod.normalize_job(
             minimal_job(pagination={"type": "none", "size_param": "size", "page_size": 100})
         )
@@ -3784,8 +4558,10 @@ class TestPendingWarningsArePerJob(OfflineTestCase):
         second = minimal_job()
         config_mod.validate_job(second)
         self.assertEqual([w for w in config_mod.collect_warnings(second) if "size_param" in w], [])
-        # 同一个 job 再收集一次也不该重复（已取走）
-        self.assertEqual([w for w in config_mod.collect_warnings(first) if "size_param" in w], [])
+        # 同一份 job 反复收集要读到同样的告警（只读不取走）：第一次取走后第二次返回空，
+        # 会让第二次调用者看不到"只会请求一次"这类关键告警
+        again = [w for w in config_mod.collect_warnings(first) if "size_param" in w]
+        self.assertEqual(len(again), 1, again)
 
 
 class TestFourthPassReview(OfflineTestCase):
@@ -3952,10 +4728,17 @@ class TestFourthPassReview(OfflineTestCase):
         self.assertFalse(fetch_mod._looks_like_size_error("HTTP 400：Invalid page param"))
         self.assertFalse(fetch_mod._looks_like_size_error("HTTP 400：invalid count of parameters"))
 
+    def test_job_summary_redacts_description(self):
+        """作业名/description 是自由文本（常粘联调样例）：进日志前必须过 _redact_job。"""
+        job = minimal_job()
+        job["description"] = "样例 curl 'https://a.example.com/x?ak=AKLT123456&sk=SECRET987654' 已联调"
+        text = "\n".join(cli_mod._job_summary(job))
+        self.assertNotIn("SECRET987654", text)
+
     def test_check_is_not_blocked_by_backfill_guard(self):
         """--check 是只读体检，补数前先看连不连通是正常用法。"""
         args = argparse.Namespace(
-            check=True, pt="", bizdate="", dates="", start_date="2026-07-01", end_date="2026-09-20"
+            check=True, pt="", bizdate=None, dates=None, start_date="2026-07-01", end_date="2026-09-20"
         )
         self.assertFalse(config_mod._backfill_without_bizdate(args))
         args.check = False
@@ -3995,8 +4778,9 @@ class TestFourthPassReview(OfflineTestCase):
             self.assertEqual(code, 0)
             self.assertTrue(any("不是有效选项" in line for line in output))
         finally:
-            path.unlink(missing_ok=True)
-            path.parent.rmdir()
+            # mkdtemp 建的是独立目录，用 shutil 递归清理：目录非空时 rmdir 会抛 OSError，
+            # 掩盖真实的断言失败（残渣清理失败不该变成第二个错误）
+            shutil.rmtree(path.parent, ignore_errors=True)
 
 
 class TestThirdPassReview(OfflineTestCase):
@@ -4064,8 +4848,9 @@ class TestThirdPassReview(OfflineTestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["window"]["days"], 30)
             self.assertTrue(any("不是整数" in line for line in output))
         finally:
-            path.unlink(missing_ok=True)
-            path.parent.rmdir()
+            # mkdtemp 建的是独立目录，用 shutil 递归清理：目录非空时 rmdir 会抛 OSError，
+            # 掩盖真实的断言失败（残渣清理失败不该变成第二个错误）
+            shutil.rmtree(path.parent, ignore_errors=True)
 
     def test_wizard_repeats_on_zero_or_negative_days(self):
         """window.days 必须是正整数：向导填 0/-3 不能生成 --check 都过不了的配置。"""
@@ -4106,8 +4891,9 @@ class TestThirdPassReview(OfflineTestCase):
             config_mod.validate_job(config_mod.normalize_job(job))
             self.assertGreaterEqual(sum("必须不小于 1" in line for line in output), 2)
         finally:
-            path.unlink(missing_ok=True)
-            path.parent.rmdir()
+            # mkdtemp 建的是独立目录，用 shutil 递归清理：目录非空时 rmdir 会抛 OSError，
+            # 掩盖真实的断言失败（残渣清理失败不该变成第二个错误）
+            shutil.rmtree(path.parent, ignore_errors=True)
 
 
 class TestSkipRowsKeepsLineEndings(OfflineTestCase):
@@ -4159,7 +4945,7 @@ class SyncFlowTestCase(OfflineTestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         # 走和 main 一样的顺序：先替换 ${bizdate} 之类占位符，再补默认值
-        self.job = config_mod.normalize_job(config_mod.render_job(minimal_job(), {}, date(2026, 9, 20)))
+        self.job = config_mod.normalize_job(config_mod.render_job(minimal_job(), {}, date(2026, 9, 20))[0])
         config_mod.validate_job(self.job)
         # 每用例一个独立目录：字段快照（.field-state/）会落在 job_path 旁边，
         # 用系统 temp 共享路径会让快照串到别的用例（还要人工清理）
@@ -4406,7 +5192,7 @@ class TestRunCheck(SyncFlowTestCase):
             self.job,
             {},
             self.config_path,
-            make_args(check=True, bizdate="", start_date="2026-07-01", end_date="2026-09-20"),
+            make_args(check=True, bizdate=None, start_date="2026-07-01", end_date="2026-09-20"),
             date(2026, 9, 20),
             self.job_path,
         )
@@ -4430,16 +5216,16 @@ class TestRunSyncBackfillGuard(SyncFlowTestCase):
         self.written.assert_not_called()
 
     def test_backfill_guard_does_not_block_dry_run(self):
-        """--dry-run 同样不写库，补数前先试跑看条数正是它的用途。"""
-        rc = self.cli.run_sync(
-            self.job,
-            {},
-            self.config_path,
-            make_args(start_date="2026-07-01", end_date="2026-09-20", dry_run=True),
-            date(2026, 9, 20),
-            self.job_path,
-        )
+        """--dry-run 同样不写库，补数前先试跑看条数正是它的用途（有数据时返回 0）。"""
+        rc = self.run_sync(records=[{"id": 1}], start_date="2026-07-01", end_date="2026-09-20", dry_run=True)
         self.assertEqual(rc, 0)
+        self.odps.assert_not_called()
+        self.written.assert_not_called()
+
+    def test_dry_run_zero_rows_returns_nonzero(self):
+        """dry-run 因 0 行同样退出非 0：当预检用时能提前发现坏配置，与 main 的退出码承诺一致。"""
+        rc = self.run_sync(records=[], dry_run=True)
+        self.assertEqual(rc, 1)
         self.odps.assert_not_called()
         self.written.assert_not_called()
 
@@ -4737,6 +5523,30 @@ class TestUtilsDefensiveBranches(OfflineTestCase):
         self.assertEqual(len(logged), 2)  # 每轮失败打一条
         self.assertTrue(all("abc123" not in line for line in logged))
 
+    def test_retry_call_masks_configured_secret_values(self):
+        """secrets 给定时按值精确遮蔽：底层 SDK 把凭证写进自由文本报错时形态规则盖不住。"""
+        logged: list = []
+
+        def fn():
+            raise RuntimeError("tunnel failed: signature=ZmFrZTpub3RhcmVhbHNpZ25hdHVyZQ== raw sk-LIVE-XYZ")
+
+        with (
+            mock.patch.object(utils.time, "sleep"),
+            mock.patch.object(utils, "log", side_effect=logged.append),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                utils.retry_call(
+                    fn,
+                    attempts=2,
+                    base_delay=0,
+                    desc="写入 t",
+                    secrets=["sk-LIVE-XYZ"],
+                )
+        message = str(ctx.exception)
+        self.assertNotIn("sk-LIVE-XYZ", message)
+        self.assertIn("***", message)
+        self.assertTrue(all("sk-LIVE-XYZ" not in line for line in logged))
+
 
 # =============================================================================
 # 第四轮复审（v2.1.4）修复的回归用例
@@ -4866,7 +5676,14 @@ class TestFourthPassFetchHttp(OfflineTestCase):
 
         def on_records(records):
             gc.collect()
-            still_alive.append(sum(1 for w in refs if w() is not None and len(w()) > 0))
+            alive = 0
+            for w in refs:
+                # 只解引用一次：w() 的临时强引用在表达式结束后消失，第二次 w() 可能是 None，
+                # 原写法 len(w()) 会随机 TypeError（用例时好时坏）
+                obj = w()
+                if obj is not None and len(obj) > 0:
+                    alive += 1
+            still_alive.append(alive)
             refs.append(weakref.ref(records))
 
         with mock.patch.object(fetch_mod.Fetcher, "fetch_unit", fake_fetch_unit):
@@ -4885,6 +5702,23 @@ class TestFourthPassConfigDates(OfflineTestCase):
             config_mod.validate_job(job)
         self.assertIn("request.auth", str(ctx.exception))
 
+    def test_number_error_redacts_secret_value(self):
+        """_require_number 的报错回显要走 _show（值可能来自 ${secrets.x} 替换后的密钥字面量，
+        形态脱敏要能把它遮掉——直接 {value!r} 会原样进日志）。"""
+        job = minimal_job()
+        job["pagination"] = {"type": "page", "page_size": "access_token=SECRETVALUE123456"}
+        with self.assertRaises(SystemExit) as ctx:
+            config_mod.validate_job(job)
+        self.assertNotIn("SECRETVALUE123456", str(ctx.exception))
+
+    def test_validate_job_infers_pagination_type_without_normalize(self):
+        """validate_job 单独调用（不先 normalize）也要能推断分页类型：cursor 的
+        「没配 total_items_path」告警不能因误判 none 而跳过。"""
+        job = minimal_job(pagination={"cursor_path": "data.next"})
+        config_mod.validate_job(job)
+        warnings = [w for w in config_mod.collect_warnings(job) if "total_items_path" in w]
+        self.assertTrue(warnings, warnings)
+
     def test_extra_params_type_checked(self):
         job = minimal_job()
         job["window"] = {"extra_params": "BillingCycle"}
@@ -4893,6 +5727,13 @@ class TestFourthPassConfigDates(OfflineTestCase):
         job["window"] = {"extra_params": {"BillingCycle": None}}
         with self.assertRaises(SystemExit):
             config_mod.validate_job(job)
+
+    def test_extra_params_value_written_back_stripped(self):
+        """校验的是 strip 后的值就该写回：否则运行时仍按带空白的字面量格式化（参数带空格）。"""
+        job = minimal_job()
+        job["window"] = {"extra_params": {"BillingCycle": " %Y-%m "}}
+        config_mod.validate_job(job)
+        self.assertEqual(job["window"]["extra_params"]["BillingCycle"], "%Y-%m")
 
     def test_window_format_typo_rejected(self):
         """format 写错（unixms）不能把字面量发给接口：立即报错并列出可用写法。"""
@@ -4921,8 +5762,10 @@ class TestFourthPassConfigDates(OfflineTestCase):
     def test_config_file_maxcompute_rendered(self):
         """--config 文件自己的 maxcompute 也支持 ${secrets.*}（secrets 就在同一份文件里）。"""
         config = {"secrets": {"ak": "REAL_AK"}, "maxcompute": {"access_key_id": "${secrets.ak}"}}
-        config_mod.render_job(minimal_job(), config, date(2026, 9, 20))
-        self.assertEqual(config["maxcompute"]["access_key_id"], "REAL_AK")
+        _job, rendered_config = config_mod.render_job(minimal_job(), config, date(2026, 9, 20))
+        self.assertEqual(rendered_config["maxcompute"]["access_key_id"], "REAL_AK")
+        # 不改写入参：同一份 config 在同一进程里第二次渲染时，不会拿着上一次已替换的密钥
+        self.assertEqual(config["maxcompute"]["access_key_id"], "${secrets.ak}")
 
     def test_percent_r_counts_as_time_format(self):
         """%R = %H:%M：不能被当成纯日期格式（窗口会塌成 00:00~00:00）。"""
@@ -5159,13 +6002,13 @@ class TestConfigErrorBranches(OfflineTestCase):
 
     def test_no_project_anywhere_reports_where_to_put_it(self):
         """project 缺失时要说清三个可写位置，而不是让运行到一半崩在别处。"""
-        job = config_mod.render_job(minimal_job(target={"table": "t"}), {}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(target={"table": "t"}), {}, date(2026, 9, 18))
         with self.assertRaises(SystemExit) as ctx:
             config_mod.resolve_target(job, {}, make_args(), date(2026, 9, 18))
         self.assertIn("maxcompute.project", str(ctx.exception))
 
     def test_unknown_profile_lists_available_profiles(self):
-        job = config_mod.render_job(minimal_job(), {}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(), {}, date(2026, 9, 18))
         config = {"profiles": {"prod": {"project": "p1"}}}
         with self.assertRaises(SystemExit) as ctx:
             config_mod.get_mc_profile_meta(config, job, make_args(mc_profile="staging"))
@@ -5223,6 +6066,19 @@ class TestDatesErrorBranches(OfflineTestCase):
         value = datetime(2026, 9, 18, 12, 0, 0, tzinfo=timezone.utc)
         self.assertEqual(dates_mod.format_time(value, "unix_ms"), dates_mod.format_time(value, "unix") * 1000)
 
+    def test_unix_ms_has_no_float_truncation(self):
+        """亚秒边界不少 1ms：int(timestamp()*1000) 对 +0.36s 会截成 359（end 偏小 = 丢数据）。"""
+        tz = timezone(timedelta(hours=8))
+        base = datetime(2026, 9, 20, tzinfo=tz)
+        value = datetime(2026, 9, 20, 0, 0, 0, 360000, tzinfo=tz)
+        self.assertEqual(dates_mod.format_time(value, "unix_ms") - dates_mod.format_time(base, "unix_ms"), 360)
+
+    def test_unix_seconds_floors_before_epoch(self):
+        """1970 前的时刻按 floor 取整：int(timestamp()) 是向零截断，会大 1 秒。"""
+        value = datetime(1969, 12, 31, 23, 59, 59, 999000, tzinfo=timezone.utc)
+        self.assertEqual(dates_mod.format_time(value, "unix"), -1)
+        self.assertEqual(dates_mod.format_time(value, "unix_ms"), -1)
+
 
 class TestParserErrorBranches(OfflineTestCase):
     """parsers 的解析报错分支：坏路径、坏表头、坏 JSONL、坏 ZIP。"""
@@ -5238,6 +6094,11 @@ class TestParserErrorBranches(OfflineTestCase):
         message = str(ctx.exception)
         self.assertIn("不是数组/对象", message)
         self.assertIn("int", message)
+
+    def test_empty_object_inside_array_is_normalized(self):
+        """数组里的空对象（Items: [{}]）与 Items: {} 同义：归一成空列表，不写全 NULL 假记录。"""
+        self.assertEqual(parsers.ensure_object_records([{}], "单次请求"), [])
+        self.assertEqual(parsers.ensure_object_records([{"a": 1}, {}], "单次请求"), [{"a": 1}])
 
     def test_oversized_header_reports_csv_error(self):
         """表头行超过 csv 字段上限（解析层把上限调到 7MB，这里压小来模拟）：给可读报错。"""
@@ -5562,7 +6423,7 @@ class TestFetchDefensiveBranches(OfflineTestCase):
         ]
         with (
             mock.patch.object(http_mod, "request_once", side_effect=lambda *a, **k: responses.pop(0)),
-            mock.patch.object(fetch_mod.time, "sleep") as sleep,
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False) as sleep,
         ):
             records = self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
         self.assertEqual([r["id"] for r in records], [1, 2])
@@ -5611,7 +6472,10 @@ class TestFetchAllConcurrent(OfflineTestCase):
                 raise ConnectionError("connection reset")
             return [{"id": 1}]
 
-        with mock.patch.object(fetcher, "fetch_unit", side_effect=fake), mock.patch.object(fetch_mod.time, "sleep"):
+        with (
+            mock.patch.object(fetcher, "fetch_unit", side_effect=fake),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
+        ):
             stats, failures = fetcher.fetch_all(days, workers=2, window_retries=0)
         self.assertEqual([label for label, _ in failures], ["2026-09-17"])
         self.assertIn("connection reset", failures[0][1])
@@ -5633,7 +6497,11 @@ class TestMcDefensiveBranches(OfflineTestCase):
     """mc 的边角：建表封装、SQL 心跳、取消失败、空结果计数。"""
 
     class Clock:
-        """可编程时钟：按给定序列前进，用尽后停在最后一个值上。"""
+        """可编程时钟：按给定序列前进，用尽后停在最后一个值上。
+
+        生产代码用 time.monotonic() 量经过时间（墙钟会被 NTP 校时拨动），
+        假钟两个入口（time/monotonic）走同一序列。
+        """
 
         def __init__(self, values):
             self.values = list(values)
@@ -5643,6 +6511,9 @@ class TestMcDefensiveBranches(OfflineTestCase):
             if self.values:
                 self.last = self.values.pop(0)
             return self.last
+
+        def monotonic(self):
+            return self.time()
 
         def sleep(self, _seconds):
             pass
@@ -5685,20 +6556,31 @@ class TestMcDefensiveBranches(OfflineTestCase):
         self.assertIn("拒绝写入", str(ctx.exception))
 
     def test_count_partition_with_no_rows_returns_zero(self):
-        """reader 一行都没读到（分区刚建好就查 count）：返回 0，不能抛 StopIteration。"""
+        """reader 一行都没读到（分区刚建好就查 count）：返回 0，不能抛 StopIteration，
+        但要留一条警告——静默返回会把"没读到结果"与"分区确实 0 行"混为一谈。"""
         reader = mock.MagicMock()
         reader.__enter__.return_value = iter([])
         instance = mock.Mock()
         instance.is_successful.return_value = True
         instance.open_reader.return_value = reader
-        self.assertEqual(mc_mod.count_partition(self._odps(instance), "p", "t", "20260918"), 0)
+        logged: list = []
+        with mock.patch.object(mc_mod, "log", logged.append):
+            got = mc_mod.count_partition(self._odps(instance), "p", "t", "20260918")
+        self.assertEqual(got, 0)
+        self.assertTrue(any("没读到结果" in str(line) for line in logged), logged)
 
-    def test_terminated_instance_returns_after_one_wait(self):
-        """已结束但不是成功态：先 wait 一次（真实环境会带出 SQL 错误信息），再返回实例。"""
+    def test_terminated_but_failed_raises_even_if_wait_does_not(self):
+        """已结束但不是成功态：先 wait 一次（真实环境会带出 SQL 错误信息），再显式判一次成功性。
+
+        不能只依赖 wait_for_success 抛错：它万一没抛（超时语义/实现差异），终止但失败的
+        实例会被当成成功，后续 DDL 就在"其实没执行"的前提下继续跑（与 sftp2ods 同口径）。
+        """
         instance = mock.Mock()
         instance.is_successful.return_value = False
         instance.is_terminated.return_value = True
-        self.assertIs(mc_mod.run_sql_with_timeout(self._odps(instance), "select 1", timeout=5), instance)
+        with self.assertRaises(RuntimeError) as ctx:
+            mc_mod.run_sql_with_timeout(self._odps(instance), "select 1", timeout=5, desc="建表 t")
+        self.assertIn("已终止但未成功", str(ctx.exception))
         instance.wait_for_success.assert_called_once_with(timeout=1)
 
     def test_timeout_reports_even_when_stop_fails(self):
@@ -5921,6 +6803,38 @@ class TestMainBranches(OfflineTestCase):
         self.assertNotIn("demo", logged)  # 回答不进日志：答案里可能是密钥
         self.assertNotIn(handle, utils._sinks)  # 句柄已摘掉，同一进程重复调用不串
 
+    def test_init_stdin_closed_is_cancelled_not_traceback(self):
+        """stdin 关闭（`--init < /dev/null`）时提问回调把 EOFError 翻译成取消，不冒裸 traceback
+        ——与 sftp2ods / feishu2ods 的向导同口径。"""
+        seen = {}
+
+        def fake_run_init(out, ask=None, echo=None, ask_secret=None):
+            try:
+                ask("① 作业名")
+            except EOFError as exc:
+                seen["cancelled_by"] = str(exc)
+                return 1
+            return 0
+
+        class Recorder:
+            def write(self, text):
+                pass
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        with (
+            mock.patch.object(cli_mod, "_open_log_file", lambda p: Recorder()),
+            mock.patch.object(init_wizard, "run_init", side_effect=fake_run_init),
+            mock.patch("builtins.input", side_effect=EOFError),
+        ):
+            rc = cli_mod.main(["--init", "--init-out", "jobs/demo.json"])
+        self.assertEqual(rc, 1)
+        self.assertIn("标准输入", seen["cancelled_by"])
+
     def test_init_secret_prompt_goes_through_getpass(self):
         """--init 的密钥提问走 getpass（不回显）：回答不落日志，问题仍留痕。"""
         captured = {}
@@ -6063,7 +6977,7 @@ class TestSeventhPassDataPath(OfflineTestCase):
         it = iter(responses)
         with (
             mock.patch.object(http_mod, "request_once", side_effect=lambda *a, **k: next(it)),
-            mock.patch.object(fetch_mod.time, "sleep"),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
         ):
             return self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
 
@@ -6194,7 +7108,10 @@ class TestSeventhPassDataPath(OfflineTestCase):
             calls.append(1)
             return b"a,b\n1,2\n"
 
-        with mock.patch.object(http_mod, "request_once", side_effect=fake), mock.patch.object(fetch_mod.time, "sleep"):
+        with (
+            mock.patch.object(http_mod, "request_once", side_effect=fake),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
+        ):
             with self.assertRaises(utils.ConfigError) as ctx:
                 self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
         self.assertIn("encoding", str(ctx.exception))
@@ -6229,7 +7146,7 @@ class TestSeventhPassGuardrails(OfflineTestCase):
     def test_pt_must_be_business_day(self):
         """默认路径（target.pt / 业务日）只认 yyyyMMdd：别的形态写进去调度与 DWD 都读不到
         （等于静默丢数）；--pt 显式指定时放宽为合法分区名，测试/对比/补数用。"""
-        job = config_mod.render_job(minimal_job(), {"secrets": {}}, date(2026, 9, 18))
+        job, _ = config_mod.render_job(minimal_job(), {"secrets": {}}, date(2026, 9, 18))
         for good in ("20260918", "test_20260921", "cmp_20260920", "backfill_20260101"):
             _p, _t, _c, pt = config_mod.resolve_target(job, {}, make_args(pt=good), date(2026, 9, 18))
             self.assertEqual(pt, good)
@@ -6239,7 +7156,7 @@ class TestSeventhPassGuardrails(OfflineTestCase):
                 config_mod.resolve_target(job, {}, make_args(pt=bad), date(2026, 9, 18))
         # 不显式给 --pt 时，target.pt 写死成别的形态（含 ${bizdate_iso} 渲染结果）必须拒绝
         for bad_pt in ("2026-09-18", "2026-W36-1", "${bizdate_iso}"):
-            bad_job = config_mod.render_job(
+            bad_job, _ = config_mod.render_job(
                 minimal_job(target={"project": "demo_project", "table": "t", "pt": bad_pt}),
                 {"secrets": {}},
                 date(2026, 9, 18),
@@ -6299,6 +7216,40 @@ class TestSeventhPassRedaction(OfflineTestCase):
     def test_short_secret_param_names(self):
         for text in ("?pwd=SUPERSECRET", "?pw=SUPERSECRET", "?pass=SUPERSECRET", "bearer: SUPERSECRET"):
             self.assertNotIn("SUPERSECRET", utils.redact(text), text)
+
+    def test_spaced_sensitive_value_masked_to_eol(self):
+        """口令短语含空格（password=my secret）不能被第一个词截断：敏感键的值遮到行尾。"""
+        out = utils.redact("login failed: password=my secret and more")
+        self.assertNotIn("secret", out)
+        self.assertNotIn("more", out)
+        self.assertEqual(utils.redact("Invalid token: *** / ***"), "Invalid token: *** / ***")
+        # 未闭合引号（日志截断）：KV/JSON 要收尾引号、常规 QUERY 不吃引号，必须走
+        # 这条兜底，否则三套规则全绕过、明文泄露
+        out = utils.redact('password="abc123456')
+        self.assertNotIn("abc123456", out)
+        out = utils.redact("password='abc123456")
+        self.assertNotIn("abc123456", out)
+        # 「带引号的键」+ 不带引号的值：KV/JSON 都不收，必须走 SPACE 兜底
+        out = utils.redact('"password": my secret')
+        self.assertNotIn("secret", out)
+
+    def test_url_userinfo_password_with_at_sign(self):
+        """userinfo 口令含 @（proxy 场景）要按最后一个 @ 切分：余段不能明文留下。"""
+        out = utils.redact("HTTPS_PROXY=https://user:p@ss@proxy:8080")
+        self.assertNotIn("p@ss", out)
+        self.assertNotIn("ss@proxy", out)
+        self.assertIn("user:***@", out)
+
+    def test_quoted_value_after_key_redacted(self):
+        """!r 插值/repr 形态（access_token='xxx'，行中）必须遮：query 规则的值部分不吃引号。"""
+        out = utils.redact("请求失败 access_token='t-g1045SUPERSECRET' url=https://x")
+        self.assertNotIn("t-g1045SUPERSECRET", out)
+        self.assertIn("access_token='***'", out)
+        out = utils.redact('fail: code=1, token: "SUPERSECRET123"')
+        self.assertNotIn("SUPERSECRET123", out)
+        # 键名不敏感、值里再嵌 k=v 的也要递归兜住
+        out = utils.redact("note: 'access_token=SUPERSECRET123'")
+        self.assertNotIn("SUPERSECRET123", out)
 
     def test_normal_content_still_untouched(self):
         for text in (
@@ -6375,6 +7326,26 @@ class TestSeventhPassRetryAndPlatform(OfflineTestCase):
         for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d/%b/%Y", "%e", "%%Y"):
             self.assertIsInstance(dates_mod.format_time(value, fmt), str)
 
+    def test_empty_extra_param_format_falls_back_like_format_time(self):
+        """空格式串在 _moment 判定"只到日"、在 format_time 却回退成带时刻的默认格式：
+        两边口径必须一致，否则跳过 api_tz 换算却输出完整时间戳（窗口整体错时差）。"""
+        api_tz = dates_mod.parse_offset("+08:00")
+        value = datetime(2026, 9, 18, 0, 0, tzinfo=dates_mod.load_zone("UTC"))
+        got = dates_mod._moment(value, "", api_tz, field="window.extra_params['t']")
+        self.assertEqual(got, "2026-09-18 08:00:00")  # 换算过：UTC 00:00 -> +08:00 08:00
+
+    def test_is_date_only_format_handles_percent_escape(self):
+        """%%H 是字面量不是时刻指令：不能被当成"带时刻格式"而多走一次时区换算。"""
+        self.assertTrue(dates_mod.is_date_only_format("%Y-%m-%d%%H"))
+        self.assertFalse(dates_mod.is_date_only_format("%Y-%m-%d %H:%M"))
+
+    def test_literal_time_format_is_not_date_only(self):
+        """把时间写成字面量（%Y-%m-%d 00:00:00）也要算"带时刻"：否则 pad_hours 被静默
+        忽略、也不做 api_tz 换算。"""
+        self.assertFalse(dates_mod.is_date_only_format("%Y-%m-%d 00:00:00"))
+        self.assertTrue(dates_mod.is_date_only_format("%Y-%m-%d"))
+        self.assertTrue(dates_mod.is_date_only_format("%Y-%m-%d-%H".replace("%H", "H")))
+
     def test_percent_s_and_P_work_cross_platform(self):
         """%s / %P 是 glibc 扩展，MSVC 不认：自己实现，跨平台一致。"""
         value = datetime(2026, 9, 18, 15, 30, 0)
@@ -6386,6 +7357,11 @@ class TestSeventhPassRetryAndPlatform(OfflineTestCase):
         # 剩下 "%\x01" 让 strftime 抛 ValueError）
         self.assertEqual(dates_mod.format_time(value, "%Y-%%P-%P"), "2026-%P-pm")
         self.assertEqual(dates_mod.format_time(value, "%%P-%P"), "%P-pm")
+
+    def test_h_is_locale_free_like_b(self):
+        """%h 与 %b 同义：平台 strftime 会按 LC_TIME 展开（"9月" vs "Sep"），必须自己接管。"""
+        value = datetime(2026, 9, 18, 15, 30, 0)
+        self.assertEqual(dates_mod.format_time(value, "%d-%h-%Y"), "18-Sep-2026")
 
     @unittest.skipUnless(_REQUESTS_AVAILABLE, "未安装 requests")
     def test_json_encoding_latin1_rejected(self):
@@ -6512,7 +7488,7 @@ class TestEighthPassReview(OfflineTestCase):
                 fetcher, "fetch_unit", return_value=[{"access_token": "SECRET-abc123", "amount": float("inf")}]
             ),
             mock.patch.object(fetch_mod, "log", lines.append),
-            mock.patch.object(fetch_mod.time, "sleep"),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
         ):
             stats, failures = fetcher.fetch_all([date(2026, 9, 18)], window_retries=0, on_records=spill)
         self.assertEqual(stats, [])
@@ -6654,6 +7630,12 @@ class TestEighthPassReview(OfflineTestCase):
         # 既没遮住又搅乱报错信息；收集入口也会先滤掉
         self.assertEqual(utils.redact_secrets(["SEC"], "dup SECRET-abc123"), "dup SECRET-abc123")
 
+    def test_redact_secrets_accepts_plain_string_and_non_str_values(self):
+        """宽容度契约：values 传单个字符串不能被拆成单字符，传数字不能抛 TypeError。"""
+        out = utils.redact_secrets("SECRET-abc123", "Invalid token: SECRET-abc123")
+        self.assertNotIn("SECRET-abc123", out)
+        self.assertTrue(utils.redact_secrets([123456789], "code=123456789").endswith("***"))
+
     def test_redact_secrets_masks_url_encoded_forms(self):
         """凭证以 URL 编码形态落进自由文本时也要遮：明文 / quote / quote_plus 三种形态一起替。
 
@@ -6673,6 +7655,27 @@ class TestEighthPassReview(OfflineTestCase):
         self.assertNotIn(encoded_plus, out)
         self.assertEqual(out.count("***"), 3)
 
+    def test_redact_secrets_masks_aggressively_encoded_form(self):
+        """部分编码器把 "-" 这类字符也编码成 %2D：该形态（旧注释里的例子）同样要遮。"""
+        out = utils.redact_secrets(["t-abc123"], "url?data=t%2Dabc123 end")
+        self.assertNotIn("t%2Dabc123", out)
+        self.assertIn("***", out)
+
+    def test_redact_secrets_masks_aggressively_encoded_non_ascii(self):
+        """含中文的口令：激进编码变体按字节编码（%E5%AF%86，而不是 Latin-1 的 å…）。"""
+        secret = "p@ss-密码"
+        encoded = "p%40ss%2D%E5%AF%86%E7%A0%81"
+        out = utils.redact_secrets([secret], f"url?data={encoded} end")
+        self.assertNotIn(encoded, out)
+        self.assertIn("***", out)
+
+    def test_redact_secrets_tolerates_non_str_values(self):
+        """数字密钥能遮；None/bool 跳过（str 化会把文本里的 None/True 误替成 ***）。"""
+        out = utils.redact_secrets([12345, None, True], "count=None flag=True id=12345")
+        self.assertIn("id=***", out)
+        self.assertIn("count=None", out)
+        self.assertIn("flag=True", out)
+
     def test_cli_job_redaction_masks_free_text_secret(self):
         """CLI 出口（run_check / run_sync / 外层 SystemExit）用作业上下文脱敏。"""
         job = {"secrets": {"tok": "SECRET-abc123"}}
@@ -6687,7 +7690,7 @@ class TestEighthPassReview(OfflineTestCase):
         with (
             mock.patch.object(fetcher, "fetch_unit", side_effect=RuntimeError("接口回显 bad token SECRET-abc123")),
             mock.patch.object(fetch_mod, "log", lines.append),
-            mock.patch.object(fetch_mod.time, "sleep"),
+            mock.patch.object(fetch_mod.Fetcher, "_sleep", return_value=False),
         ):
             stats, failures = fetcher.fetch_all([date(2026, 9, 18)], window_retries=0)
         self.assertEqual(stats, [])
@@ -7053,23 +8056,26 @@ class TestNinthPassReview(OfflineTestCase):
         table.fail_next_write = True  # 删/建成功，Tunnel 写入失败
         rows = [json.dumps({"i": 0})]
         with self.assertRaises(RuntimeError) as ctx:
-            mc_mod.write_partition(table, "ods_x", "20260918", lambda: iter([rows]), total=1, retries=1)
+            mc_mod.write_partition(
+                DdlOdps(table), table, "demo_project", "ods_x", "20260918", lambda: iter([rows]), total=1, retries=1
+            )
         message = str(ctx.exception)
         self.assertIn("可能已被清空", message)
         self.assertIn("重跑", message)
         self.assertEqual(table.deleted, [("pt=20260918", True)])  # 确实先删过
 
     def test_delete_partition_error_still_warns_partition_may_be_gone(self):
-        """delete_partition 自己抛异常时，服务端可能已经删了：不能吞掉缺数提示。"""
-
-        class DeleteBoomTable(FakeTable):
-            def delete_partition(self, spec, if_exists=False):
-                raise RuntimeError("delete timeout")
-
-        table = DeleteBoomTable()
+        """删分区自己抛异常时，服务端可能已经删了：不能吞掉缺数提示。"""
+        table = FakeTable()
         rows = [json.dumps({"i": 0})]
-        with self.assertRaises(RuntimeError) as ctx:
-            mc_mod.write_partition(table, "ods_x", "20260918", lambda: iter([rows]), total=1, retries=1)
+        with (
+            mock.patch.object(mc_mod, "drop_partition", side_effect=RuntimeError("delete timeout")),
+            mock.patch.object(utils.time, "sleep"),
+            self.assertRaises(RuntimeError) as ctx,
+        ):
+            mc_mod.write_partition(
+                DdlOdps(table), table, "demo_project", "ods_x", "20260918", lambda: iter([rows]), total=1, retries=1
+            )
         message = str(ctx.exception)
         self.assertIn("可能已被清空", message)
         self.assertIn("delete timeout", message)
@@ -7124,7 +8130,9 @@ class TestTenthPassReview(OfflineTestCase):
         而 http/parsers 拼错误信息都会先截断到 300 字符——里面能装 ~290 个反斜杠，
         等于永不返回，且纯 Python 正则期间 Ctrl+C 也打断不了。
         """
-        text = '{"key":"' + "\\" * 80 + "tail"
+        # 键名用非敏感词（"key" 在敏感词表里，未闭合值会被 SPACE 规则遮掉，与本用例
+        # 要测的"反斜杠不爆炸"无关）
+        text = '{"note":"' + "\\" * 80 + "tail"
         started = time.perf_counter()
         out = utils.redact(text)
         elapsed = time.perf_counter() - started
@@ -7454,7 +8462,9 @@ class TestEleventhPassReview(OfflineTestCase):
             calls["n"] += 1
             return iter([["{}"]])
 
-        written = mc_mod.write_partition(table, "t", "20260918", factory, total=1, retries=3)
+        written = mc_mod.write_partition(
+            DdlOdps(table), table, "demo_project", "t", "20260918", factory, total=1, retries=3
+        )
         self.assertEqual(written, 1)
         self.assertEqual(calls["n"], 2)  # 1 次写前校验 + 1 次写入（不再每轮重试各通读一遍）
         self.assertEqual(table.deleted, [("pt=20260918", True)])
@@ -7620,6 +8630,14 @@ class TestNotifyModule(OfflineTestCase):
         self.assertIn("标题", card["card"]["header"]["title"]["content"])
         self.assertIn("行1", card["card"]["elements"][0]["text"]["content"])
 
+    def test_false_and_float_zero_are_not_success_codes(self):
+        """`False == 0`、`0.0 == 0` 都是真：布尔 false / 浮点 0 的失败响应不能当成功码。"""
+        for payload in ({"code": False, "message": "invalid token"}, {"code": 0.0}):
+            resp = mock.Mock(status_code=200)
+            resp.json.return_value = payload
+            with mock.patch.object(notify_mod.requests, "post", return_value=resp):
+                self.assertFalse(notify_mod.notify("https://x/hook/abc", "t", ["x"]), payload)
+
     def test_failure_does_not_raise_and_redacts_hook_id(self):
         messages: list[str] = []
         hook = "https://open.feishu.cn/open-apis/bot/v2/hook/deadbeef00cafe"
@@ -7631,6 +8649,19 @@ class TestNotifyModule(OfflineTestCase):
         joined = "\n".join(messages)
         self.assertIn("飞书通知发送失败", joined)
         self.assertNotIn("deadbeef00cafe", joined)
+
+    def test_missing_code_is_failure(self):
+        """缺 code/StatusCode 的 200 响应不能算「已发送」：webhook 误填成其它接口
+        （回 {"msg": "ok"} 这类）时会静默失效；仅空 {} 保留按 HTTP 200 判定的宽容。"""
+        for payload, expected in (({"msg": "ok"}, False), ({}, True), ({"code": "0"}, True)):
+            resp = mock.Mock(status_code=200)
+            resp.json.return_value = payload
+            with mock.patch.object(notify_mod.requests, "post", return_value=resp):
+                self.assertEqual(
+                    notify_mod.notify("https://open.feishu.cn/open-apis/bot/v2/hook/abc1234", "t", ["x"]),
+                    expected,
+                    payload,
+                )
 
 
 class TestFieldWatch(OfflineTestCase):
@@ -7682,6 +8713,22 @@ class TestRunSyncFieldDrift(SyncFlowTestCase):
         with mock.patch.object(self.cli, "notify") as notifier:
             code = self.run_sync(records=records, **overrides)
         return code, notifier
+
+    def test_snapshot_save_failure_keeps_success(self):
+        """写库已校验通过、字段快照写不进去（目录只读/磁盘满）只警告：不能把成功报成失败。"""
+        with mock.patch.object(cli_mod.fieldwatch, "save_snapshot", side_effect=OSError("read-only")):
+            code, _notifier = self._sync([{"record_id": "r1", "amount": "$1"}])
+        self.assertEqual(code, 0)
+
+    def test_new_fields_card_does_not_claim_written_in_dry_run(self):
+        """--dry-run 的新字段卡片不能声称"数据已照常写入 ODS"：本次没写库，下游会误判分区就绪。"""
+        base = {"record_id": "r1"}
+        self._sync([base])
+        code, notifier = self._sync([{**base, "extra": "1"}], dry_run=True)
+        self.assertEqual(code, 0)
+        text = "\n".join(notifier.call_args.args[2])
+        self.assertIn("未写库", text)
+        self.assertNotIn("已照常写入", text)
 
     def test_new_fields_notify_and_snapshot_update(self):
         base = {"record_id": "r1", "amount": "$1"}
@@ -7742,7 +8789,7 @@ class TestHarnessReviewFixes(OfflineTestCase):
     """harness 复审点：空 days、Cookie 脱敏、Retry-After 0、鉴权 ConfigError、Spool 关闭。"""
 
     def test_run_sync_empty_days_returns_1(self):
-        job = config_mod.normalize_job(config_mod.render_job(minimal_job(), {}, date(2026, 9, 20)))
+        job = config_mod.normalize_job(config_mod.render_job(minimal_job(), {}, date(2026, 9, 20))[0])
         logs = []
         with (
             mock.patch.object(cli_mod, "resolve_days", return_value=[]),
@@ -7817,7 +8864,9 @@ class TestHarnessReviewFixes(OfflineTestCase):
     def test_write_partition_rejects_illegal_partition_value(self):
         table = FakeTable()
         with self.assertRaises(utils.ConfigError) as ctx:
-            mc_mod.write_partition(table, "ods_x", "pt'; drop table x", lambda: iter([]), total=0)
+            mc_mod.write_partition(
+                DdlOdps(table), table, "demo_project", "ods_x", "pt'; drop table x", lambda: iter([]), total=0
+            )
         self.assertIn("分区值", str(ctx.exception))
         self.assertEqual(table.deleted, [])
 
@@ -7842,14 +8891,24 @@ class TestRemainingProductBugs(OfflineTestCase):
                 config_mod.validate_job(job)
             self.assertIn("必须是数组", str(ctx.exception))
 
-    def test_try_lock_unsupported_continues_without_mutex(self):
+    def test_try_lock_unsupported_fails_closed_by_default(self):
+        """文件系统不支持锁时默认拒绝执行（fail-closed）；显式 API2ODS_ALLOW_NO_LOCK=1
+        才接受无互斥风险继续。"""
         fake_fcntl = mock.Mock()
         fake_fcntl.LOCK_EX, fake_fcntl.LOCK_NB = 2, 4
         if not utils._LOCK_UNSUPPORTED:
             self.skipTest("platform has no ENOLCK/ENOTSUP")
         code = next(iter(utils._LOCK_UNSUPPORTED))
         fake_fcntl.flock.side_effect = OSError(code, "Operation not supported")
-        with mock.patch.object(utils, "fcntl", fake_fcntl), mock.patch.object(utils, "log"):
+        with mock.patch.object(utils, "fcntl", fake_fcntl), mock.patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(SystemExit) as ctx:
+                utils._try_lock("fh")
+        self.assertIn("ALLOW_NO_LOCK", str(ctx.exception))
+        with (
+            mock.patch.object(utils, "fcntl", fake_fcntl),
+            mock.patch.dict(os.environ, {"API2ODS_ALLOW_NO_LOCK": "1"}, clear=True),
+            mock.patch.object(utils, "log"),
+        ):
             self.assertTrue(utils._try_lock("fh"))
 
     def test_try_lock_other_oserror_raises(self):
@@ -7911,14 +8970,21 @@ class TestRemainingProductBugs(OfflineTestCase):
             dates_mod.window_param_sets({"window": {"start_param": "s", "end_param": "e"}}, [])
         self.assertIn("日期列表为空", str(ctx.exception))
 
-    def test_notify_string_zero_and_null_code_are_success(self):
+    def test_notify_explicit_zero_code_is_success_null_is_not(self):
+        """显式成功码（0 / "0" / StatusCode=0）才算成功；code 缺失或为 null 不能当成功——
+        webhook 误填成其它接口（回 {"msg": "ok"}）时会「已发送」而告警静默失效。"""
         if not _REQUESTS_AVAILABLE:
             self.skipTest("没装 requests")
-        for payload in ({"code": "0"}, {"code": None, "msg": "ok"}, {"StatusCode": 0}):
+        for payload in ({"code": "0"}, {"StatusCode": 0}):
             resp = mock.Mock(status_code=200)
             resp.json.return_value = payload
             with mock.patch.object(notify_mod.requests, "post", return_value=resp):
                 self.assertTrue(notify_mod.notify("https://hook", "t", ["x"]), msg=payload)
+        for payload in ({"code": None, "msg": "ok"}, {"msg": "ok"}):
+            resp = mock.Mock(status_code=200)
+            resp.json.return_value = payload
+            with mock.patch.object(notify_mod.requests, "post", return_value=resp):
+                self.assertFalse(notify_mod.notify("https://hook", "t", ["x"]), msg=payload)
 
     def test_wizard_value_error_from_dumps_is_not_cancel(self):
         mapping = {"API 完整地址": "https://a.example.com/x", "AccessKeyId": "A", "AccessKeySecret": "S"}

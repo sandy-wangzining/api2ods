@@ -118,11 +118,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--init-out", default="", help="--init 的输出路径（默认 jobs/<作业名>.json）")
     parser.add_argument("--config", default="", help=f"可选的共享凭证文件（默认 {DEFAULT_CONFIG_PATH}，没有就不读）")
     parser.add_argument("--check", action="store_true", help="只体检：配置 + API 连通 + 目标表结构")
-    parser.add_argument("--bizdate", default="", help="业务日期 yyyyMMdd 或 yyyy-MM-dd（默认时区昨天）")
+    parser.add_argument(
+        "--bizdate",
+        default=None,
+        # 默认必须是 None 而不是 ""：空串无法区分"没传 --bizdate"与"显式传了空值"
+        # （调度脚本 `--bizdate "$pt"` 且 $pt 未定义）——后者要报错，不能静默回退昨天
+        help="业务日期 yyyyMMdd 或 yyyy-MM-dd（默认时区昨天）",
+    )
     parser.add_argument("--days", type=int, default=None, help="回拉天数（含基准日），覆盖作业配置 window.days")
     parser.add_argument(
         "--dates",
-        default="",
+        default=None,
         help="逗号分隔的日期列表（补零散几天）：指定后 --days 不生效，写入哪个分区仍由 --bizdate/--pt 决定",
     )
     parser.add_argument("--start-date", default="", help="补数起始日期（含），与 --end-date 成对使用")
@@ -168,14 +174,18 @@ def _as_count(value, fallback: int, field: str) -> int:
         # int(True) == 1：window_retries: true 曾被静默当成 1，与实际预期不符
         raise SystemExit(f"{field} 必须是整数，实际 {value!r}")
     if isinstance(value, int):
-        return value
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        raise SystemExit(f"{field} 必须是整数，实际 {value!r}")
-    # NaN/Infinity 与小数都要拦：原来是 int(value) 静默截断（2.9 → 2）
-    if not math.isfinite(number) or number != int(number):
-        raise SystemExit(f"{field} 必须是整数，实际 {value!r}")
+        number = value
+    else:
+        try:
+            number = float(value)
+        except (TypeError, ValueError, OverflowError):
+            raise SystemExit(f"{field} 必须是整数，实际 {value!r}")
+        # NaN/Infinity 与小数都要拦：原来是 int(value) 静默截断（2.9 → 2）
+        if not math.isfinite(number) or number != int(number):
+            raise SystemExit(f"{field} 必须是整数，实际 {value!r}")
+    if number < 0:
+        # 负数会被 max(1, ...) 吞成"不重试"，与 timeout/retry_delay 的校验口径对齐
+        raise SystemExit(f"{field} 不能为负数，实际 {value!r}")
     return int(number)
 
 
@@ -215,12 +225,29 @@ def _detach_log_sink(handle) -> None:
 def _lock_path(job_path: Path) -> Path:
     """每个作业一把运行锁（不同作业可并行，同一作业不会重复跑）。
 
-    优先放工具目录下 .run-locks/；工具目录不可写（如 pip 装在只读位置）时退回系统临时目录。
+    锁目录优先级：环境变量 API2ODS_LOCK_DIR > 工具目录下 .run-locks/ > 系统临时目录
+    （工具目录不可写，如 pip 装在只读位置时）。用 API2ODS_LOCK_DIR 可以把锁钉在与运行者
+    身份/环境无关的同一目录上——否则"root 能写工具目录、普通用户退回 TMPDIR"这类差异会让
+    同一作业的两个实例锁在不同文件上，互斥静默失效；指到共享存储（如 NFS）时多机也能互斥
+    （文件系统不支持锁会告警并降级）。
     锁名带路径哈希：jobs/a/api.json 与 jobs/b/api.json 同名不同作业，只按文件名会互相阻塞。
     """
     stem = job_path.stem or "job"
-    digest = hashlib.sha1(str(job_path).encode("utf-8")).hexdigest()[:8]
+    # sha256 截 16 位十六进制：sha1 只取 8 位（32 位）时不同作业有可观的碰撞概率，
+    # 撞了会互相阻塞（解锁时还可能删错对方的锁）；与 sftp2ods 的锁同口径。
+    # 摘要先 resolve（绝对化/展开 ~/消解 .. 与软链接）：同一作业用相对/绝对路径两种写法
+    # 原来会落到两把锁上、互斥静默失效（两个进程同删同写一个分区）
+    digest = hashlib.sha256(str(Path(job_path).expanduser().resolve()).encode("utf-8")).hexdigest()[:16]
     name = f"{stem}-{digest}"
+    override = os.environ.get("API2ODS_LOCK_DIR", "").strip()
+    if override:
+        base = Path(override).expanduser()
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            # 显式指定的目录不可用要立刻失败：静默换目录等于互斥失效，正是这个开关要防的事
+            raise SystemExit(f"API2ODS_LOCK_DIR 指定的锁目录不可用（{exc}）：{base}") from exc
+        return base / f"{name}.lock"
     candidates = [ROOT / ".run-locks", Path(tempfile.gettempdir()) / "api2ods-locks"]
     for base in candidates:
         try:
@@ -283,8 +310,13 @@ def _job_summary(job: dict) -> list[str]:
         else f" / parse={parse.get('format')}{'+zip' if parse.get('unzip') else ''}"
     )
     return [
-        f"  作业      : {job.get('job') or '(未命名)'}"
-        + (f" —— {job['description']}" if job.get("description") else ""),
+        # 作业名/description 是自由文本（description 常粘联调样例，可能带 ak/sk 明文）：
+        # 与下一行的 endpoint 同口径过 _redact_job（本项目的 log() 不做全局脱敏）
+        _redact_job(
+            job,
+            f"  作业      : {job.get('job') or '(未命名)'}"
+            + (f" —— {job['description']}" if job.get("description") else ""),
+        ),
         # path 允许带查询串（--init 就是这么把签名类 URL 存下来的），
         # 概要会落进 --check 日志和 --log-file，必须过一遍脱敏
         "  接口      : " + _redact_job(job, endpoint),
@@ -311,7 +343,8 @@ def run_check(job: dict, config: dict, config_path: Path, args, bizdate, job_pat
     try:
         fetcher = Fetcher(job, job_dir)
         label, count = fetcher.probe([bizdate])
-        log(f"  ✅ {label} 请求成功，拿到 {count:,} 条记录")
+        # label 里可能带 URL/签名（与下面失败分支、run_sync 的失败列表同口径脱敏）
+        log(f"  ✅ {_redact_job(job, label)} 请求成功，拿到 {count:,} 条记录")
     except Exception as exc:  # noqa: BLE001
         # 统一走 redact：接口的错误体常回显 token/签名（fail_if 的 message_path
         # 往往是整段错误消息），run_sync 的同类分支一直是脱敏的，这里不能搞两套标准
@@ -362,7 +395,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     pagination = job.get("pagination") or {}
     job_name = job.get("job") or job_path.stem
     notifier = _notifier(job, args)
-    footer = f"作业 {job_name} · 目标 {project}.{table_name} · pt={pt}"
+    footer = _redact_job(job, f"作业 {job_name} · 目标 {project}.{table_name} · pt={pt}")
 
     # 构造 Fetcher 会读 signers.py（自定义签名）：文件缺失/写错时抛 SystemExit，
     # 不要让它变成裸 traceback（--check 走的是同一条路，所以那边一直是干净的）
@@ -373,8 +406,11 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         return 1
     unit_count = fetcher.unit_count(days)
     log(
-        f"{job.get('job') or '作业'} 启动：{days[0]} ~ {days[-1]}（{len(days)} 天，{unit_count} 次请求计划），"
-        f"目标 {project}.{table_name} pt={pt}"
+        _redact_job(
+            job,
+            f"{job.get('job') or '作业'} 启动：{days[0]} ~ {days[-1]}（{len(days)} 天，{unit_count} 次请求计划），"
+            f"目标 {project}.{table_name} pt={pt}",
+        )
     )
     if len(days) > 30:
         log("提示：回补天数较多，耗时较长（受接口限速影响）；可 Ctrl+C 中断后重跑（先删再填，重复跑幂等）。")
@@ -426,28 +462,52 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         snapshot = fieldwatch.load_snapshot(job_path)
         new_fields = sorted(observer.fields - snapshot) if snapshot is not None else []
         if new_fields:
-            shown = "、".join(f"`{name}`" for name in new_fields)
-            log(f"⚠️ 接口记录出现 {len(new_fields)} 个新增字段：{shown}（已照常入库，如需使用请更新 DWD 提取口径）")
+            # 字段名来自接口键名（外部、数量不受控）：展示截断，避免日志行/飞书卡片超长被拒
+            # （完整清单不影响入库，json 列原样保留）
+            limit = 50
+            shown = "、".join(f"`{name}`" for name in new_fields[:limit])
+            if len(new_fields) > limit:
+                shown += f"…（共 {len(new_fields)} 个，仅显示前 {limit} 个）"
+            log(
+                f"⚠️ 接口记录出现 {len(new_fields)} 个新增字段：{shown}"
+                + (
+                    "（已照常入库，如需使用请更新 DWD 提取口径）"
+                    if not args.dry_run
+                    else "（本次为 --dry-run，未写库；正式运行会自动入库）"
+                )
+            )
             notifier(
-                f"{job_name}：接口出现新增字段",
+                # 标题同样过 _redact_job：job 名是自由文本（可能含联调样例的 ak/sk），
+                # 卡片会发到外部 webhook，泄露面比日志更大
+                _redact_job(job, f"{job_name}：接口出现新增字段"),
                 [
                     f"**新增字段**：{shown}（共 {len(new_fields)} 个）",
                     f"**本次窗口**：{days[0]} ~ {days[-1]}",
-                    "数据已照常写入 ODS（json 原样保留、新字段自动包含，无需改表）。请人工确认：",
+                    # dry-run 未写库：不能照抄"数据已写入"的结论，否则下游按卡片以为分区已就绪
+                    (
+                        "数据已照常写入 ODS（json 原样保留、新字段自动包含，无需改表）。请人工确认："
+                        if not args.dry_run
+                        else "（试跑）本次未写库；正式运行时新字段会自动入库（json 原样保留、无需改表）。请人工确认："
+                    ),
                     "① 需要的话更新 DWD 的 `get_json_object` 提取逻辑；",
                     "② 若字段来自接口异常/拼写变化，核对上游或调整作业配置。",
                 ],
                 footer,
             )
 
-        if args.dry_run:
-            log(f"--dry-run：不写库。将写入 {project}.{table_name} pt={pt}（{spool.count:,} 行）")
-            return 0
-
-        # ② 0 行保护：默认不写空分区（避免接口异常时把已有数据清掉）
         allow_empty = bool(args.allow_empty) or as_bool(
             target_cfg.get("allow_empty"), default=False, field="target.allow_empty"
         )
+        if args.dry_run:
+            log(f"--dry-run：不写库。将写入 {project}.{table_name} pt={pt}（{spool.count:,} 行）")
+            if not spool.count and not allow_empty:
+                # dry-run 常被当调度/CI 预检（epilog 就这么推荐）：0 行时静默返回 0 会让
+                # 坏配置一路"正常"到正式跑才暴露；退出码语义与 main 文档承诺对齐
+                log("❌ 本次拉取 0 行（--dry-run 不写库；正式运行会因 0 行保护退出非 0）")
+                return 1
+            return 0
+
+        # ② 0 行保护：默认不写空分区（避免接口异常时把已有数据清掉）
         if not spool.count and not allow_empty:
             keep_spool = args.keep_spool
             log(
@@ -498,11 +558,16 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
 
             started_write = time.time()
             write_partition(
+                o,
                 table,
+                project,
                 table_name,
                 pt,
                 lambda: spool.iter_batches(WRITE_BATCH_SIZE, MAX_BATCH_BYTES),
                 total=spool.count,
+                timeout=args.sql_timeout,
+                # 写库重试的报错也要按配置里的密钥值遮一道（Tunnel/SQL 报错里可能带签名 URL）
+                secrets=collect_secret_values(job),
             )
             log(f"已写入 pt={pt}：{spool.count:,} 行，耗时 {(time.time() - started_write) / 60:.1f} 分钟")
 
@@ -520,8 +585,13 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             log(f"❌ 写库失败：{_redact_job(job, exc)}")
             return 1
 
-        # 写库成功后才更新字段快照（与"台账只在写成功后记账"一致；失败/中断不更新，下次重报）
-        fieldwatch.save_snapshot(job_path, observer.fields, job_name)
+        # 写库成功后才更新字段快照（与"台账只在写成功后记账"一致；失败/中断不更新，下次重报）。
+        # 快照只是"少提醒一次"的辅助文件：写不进去（目录只读/磁盘满）不能把已经校验通过的
+        # 写库结果报成失败——最坏是下次运行再提醒一次新字段
+        try:
+            fieldwatch.save_snapshot(job_path, observer.fields, job_name)
+        except OSError as exc:
+            log(f"  警告：字段快照未更新（{exc}），不影响本次入库；下次运行会重复提醒新增字段")
 
         log(f"校验通过：pt={pt} 共 {actual:,} 行")
         log(f"全部完成（总耗时 {(time.time() - started) / 60:.1f} 分钟）。")
@@ -574,7 +644,12 @@ def main(argv: list[str] | None = None) -> int:
             只记问题、不记回答：向导要填 token / AK / SK，记进日志等于把密钥抄一份到磁盘。
             """
             log(prompt)
-            return input()
+            try:
+                return input()
+            except (EOFError, ValueError, RuntimeError) as exc:
+                # stdin 关闭/无输入源：统一翻译成 EOFError（run_init 顶层按"取消"处理），
+                # 别让裸 traceback 打断向导——与 sftp2ods 的 _wizard_ask/prompt_secret 同口径
+                raise EOFError("标准输入不可用") from exc
 
         def _wizard_ask_secret(prompt: str = "") -> str:
             """密钥类提问：问题同样走 log（留痕），回答走 getpass 不回显。
@@ -616,6 +691,8 @@ def main(argv: list[str] | None = None) -> int:
         _detach_log_sink(log_handle)
         return 2
 
+    job_raw: dict = {}  # 供统一异常出口做值级脱敏（读到作业文件后就有内容）
+    config: dict = {}  # 同上：--config 里的密钥值（如 maxcompute.secrets）也要参与脱敏
     try:
         # 凭证来源：作业文件自带；--config/默认 config.json 只在存在时作为补充（可选）
         if args.config:
@@ -637,17 +714,19 @@ def main(argv: list[str] | None = None) -> int:
         # 环境变量畸形本身必须报错（静默回退昨天会写错分区还显示成功）——
         # 唯一的例外是只读体检 --check：它不写库，脏环境变量不该连"看一眼"都挡掉
         tz = date_tz_of(job_raw)
-        if args.bizdate:
+        if args.bizdate is not None:
             bizdate = parse_day_arg(args.bizdate)
         else:
             from_env = env_bizdate(strict=not args.check)
             bizdate = from_env if from_env is not None else datetime.now(tz).date() - timedelta(days=1)
 
-        job = render_job(job_raw, config, bizdate)  # 替换 ${secrets.x}/${bizdate} 等占位符
+        # 替换 ${secrets.x}/${bizdate} 等占位符；--config 的 maxcompute/profiles 用返回的副本
+        # （render_job 不改写入参，同一进程复用同一份 config 时不会串上一次替换过的密钥）
+        job, config = render_job(job_raw, config, bizdate)
         job = normalize_job(job)  # 补齐默认值（翻页方式/参数名等），让配置尽量短
         validate_job(job)
         for warning in collect_warnings(job):  # 未知字段告警（拼写错误提示）
-            log(f"⚠️ {warning}")
+            log(f"⚠️ {_redact_job(job, warning)}")  # job 已渲染：与其它日志同口径值级脱敏
 
         # notify 合并进 job（作业优先、--config 兜底）：共享 --config 文件里的 webhook
         # 也要被 collect_secret_values 的值级脱敏收集（它按 job 收集），否则 webhook 裸
@@ -677,6 +756,13 @@ def main(argv: list[str] | None = None) -> int:
             真实运行时这一行不会返回。
             """
             _detach_log_sink(log_handle)
+            # 显式 flush：os._exit 不跑解释器退出流程，没 flush 的 stdout/stderr 缓冲
+            # （重定向到文件时是块缓冲）会丢——日志每条自行 flush，但非 log() 的输出未必
+            for stream in (sys.stdout, sys.stderr):
+                try:
+                    stream.flush()
+                except (OSError, ValueError):
+                    pass
             os._exit(code)
             return code
 
@@ -706,8 +792,14 @@ def main(argv: list[str] | None = None) -> int:
         # 准备阶段的配置错（bizdate 畸形、缺 request.base_url、占位符写错、validate_job
         # 的各类报错、运行锁拿不到）原来直接冒泡出 main：退出码虽然是对的，但控制台那句
         # 没有时间戳、--log-file 里一个字都没有，调度侧翻日志文件看不到任何原因。
-        # 这里统一按运行期错误的格式记一笔，并且同样过脱敏
-        log(f"❌ {redact(str(exc))}")
+        # 这里统一按运行期错误的格式记一笔，并且同样过脱敏——按**作业文件 + --config
+        # 两份配置**里的密钥值做值级脱敏（只收 job_raw 的话，凭证写在 --config 的
+        # maxcompute/secrets 里时该值漏遮），拿不到任何配置时退回形态级
+        if job_raw or config:
+            secrets = collect_secret_values(job_raw) + collect_secret_values(config)
+            log(f"❌ {redact_secrets(secrets, str(exc))}")
+        else:
+            log(f"❌ {redact(str(exc))}")
         return 1
     finally:
         _detach_log_sink(log_handle)

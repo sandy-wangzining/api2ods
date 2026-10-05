@@ -1,0 +1,20 @@
+{
+  "//说明": "代码审查抑制名单：这里只放「已人工实证为误报」的条目，命中后不进报告主清单、不进飞书、不进裁判。每条都必须写明实证结论与日期；真实缺陷不要放进来。",
+  "suppress": [
+    {
+      "file": "api2ods/cli.py",
+      "title": "从不关闭",
+      "reason": "误报（2026-10-05 对照 pyodps 0.13.2 源码）：ODPS 对象没有 close()（生产上调用会 AttributeError）；其 requests 会话是 RestClient 的进程级共享缓存，不是按连接持有的资源——「每次 main() 新建连接会泄漏 socket/连接池」不成立；与 feishu2ods 同款结论。"
+    },
+    {
+      "file": "api2ods/cli.py",
+      "title": "没有 close()",
+      "reason": "误报（同上，模型换词重复报的同一处）：ODPS 对象无 close()，不存在可调用的释放 API；会话为进程级共享，不随 main() 调用累积。"
+    },
+    {
+      "file": "api2ods/cli.py",
+      "title": "进程退出回收",
+      "reason": "误报（同上，同一话题的第三种措辞）：依赖 GC/进程退出不是缺陷——对象无 close()，且底层不持有按连接的独占资源。"
+    }
+  ]
+}

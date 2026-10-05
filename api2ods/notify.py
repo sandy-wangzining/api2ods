@@ -48,12 +48,17 @@ def notify(
         return False
     # isinstance 判断不能省：非对象响应（JSON 数组/字符串/null，网关错误页等）没有 .get，
     # 直接调用会抛 AttributeError 打断主流程（告警失败不影响业务是函数的约定）
-    # code 缺省或显式 null：按 HTTP 200 视为成功（部分网关只回 {} / {"msg":"success","code":null}）；
-    # 数字 0 与字符串 "0" 都算成功，避免网关把状态码序列化成字符串时误报失败。
+    # 只有显式的成功码才算成功（int 0 与字符串 "0" 都认，避免网关把状态码序列化成字符串
+    # 时误报失败）；缺 code/StatusCode 的 200 响应不能当成功——webhook 误填成其它接口
+    # （回 {"msg":"ok"} 这类）时会「已发送」而告警静默失效。仅空 {} 保留按 HTTP 200 判定的宽容。
+    # `False == 0`、`0.0 == 0` 都是真：布尔 false / 浮点 0 的"失败"响应不能被当成成功码。
     if resp.status_code == 200 and isinstance(data, dict):
-        code = data.get("code", data.get("StatusCode", 0))
-        if code in (0, "0", None):
+        code = data.get("code", data.get("StatusCode", None))
+        if (type(code) is int and code == 0) or code == "0":
             log("飞书通知已发送")
+            return True
+        if not data:
+            log("飞书通知已发送（响应为空，按 HTTP 200 判定）")
             return True
     log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {redact(str(data)[:200])}")
     return False

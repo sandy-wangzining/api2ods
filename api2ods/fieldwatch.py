@@ -83,7 +83,16 @@ def save_snapshot(job_path: Path, fields, job_name: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         handle, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
         try:
-            with os.fdopen(handle, "w", encoding="utf-8") as tmp:
+            try:
+                tmp = os.fdopen(handle, "w", encoding="utf-8")
+            except Exception:
+                # fdopen 失败时 fd 还没被接管：显式关闭，否则文件描述符泄漏到进程退出
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+                raise
+            with tmp:
                 tmp.write(json.dumps(payload, ensure_ascii=False, indent=2))
             os.replace(tmp_name, path)
         except Exception:

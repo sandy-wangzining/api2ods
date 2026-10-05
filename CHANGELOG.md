@@ -6,6 +6,340 @@
 
 ### 修复
 
+- **值级脱敏补一个口子（安全）**：密钥值的 URL 编码形态原来只替 quote/quote_plus 两种
+  （`+`/`/`/`=` 被覆盖），部分编码器把 `-` 也编码成 `%2D` 时仍会漏——补"非字母数字全编码"
+  变体（按 UTF-8 **字节**判断，含中文的口令也生成正确编码形态）；非字符串密钥值的 str 化
+  同步收紧（None/bool 跳过，避免把文本里的 "None"/"True" 误替）。
+
+- **--dry-run 因 0 行同样退出非 0（正确性）**：dry-run 分支原来无条件 `return 0`、写在
+  0 行保护之前——把它当调度预检时（epilog 就这么推荐），records_path 写错/参数不对的作业
+  会被"正常"放行到正式跑才暴露；现在与正式跑同一口径（0 行且未 allow_empty → 1），
+  与 main 文档的退出码承诺一致。
+
+- **内联占位符解析成 null/容器时直接报错（正确性）**：`"url": "https://x/${secrets.ns}/y"`
+  且 secrets.ns 为 null 时，原来 str(None) 静默拼出 "/None/"、请求带着它发出去——现在与
+  字典键路径同口径报 ConfigError（凭据字段的内联也一样，不再拼出 "Bearer None"）；
+  整串占位符解析成 null 同样拒绝（None 到 requests 的 params 会被编码成字面量 "None"
+  发出去），容器/数字仍是合法的整串结果。
+
+- **数组里的空对象（`Items: [{}]`）与 `Items: {}` 同义归一（正确性）**：原来 `[{}]` 会写一条
+  全 NULL 的假记录，分页时还会让"零数据日"豁免失效、一路空翻到 max_pages；现在与空对象
+  同口径归一成空列表。
+
+- **向导的普通提问也接 stdin 关闭（可用性）**：`api2ods --init < /dev/null`（CI 里误当模板
+  生成器用）原来在普通提问的 input() 处冒裸 traceback、--log-file 里看不到原因；现在与
+  sftp2ods / feishu2ods 的向导同口径，翻译成"已取消，未生成任何文件"的取消出口。
+
+- **--dry-run 的新字段卡片不再声称"已写入 ODS"（正确性）**：新增字段的飞书卡片与日志原来
+  硬编码"数据已照常写入 ODS"，dry-run 时与事实矛盾、下游可能据此以为分区已就绪而不补跑；
+  现在按 --dry-run 分措辞（"本次未写库；正式运行会自动入库"）。
+
+- **stop_when_short 与 total_*_path 的互斥在 fetch 也兜底（正确性）**：原来只在 validate_job
+  拦；库调用方绕过校验时会同时挂上两条终点逻辑——短页判定先 break，总数终点永远走不到，
+  只拉第一页还"自洽"。现在 fetch 里也拒绝这对组合（与 cursor_path 的兜底同口径）。
+
+- **AK/SK 只填一半改为报错、不再静默回退（正确性）**：maxcompute 块里只写一半（典型：secret
+  键名拼错）原来只警告然后回退到环境变量/本机 aliyun CLI——那会用另一个身份写库（审计/计费/
+  归属全错）；现在与「--mc-profile 找不到不回退」「非映射报错」同口径直接拒绝，并给出缺失
+  键名与两种修复方式（与 sftp2ods 同口径）。
+
+- **unix 时间戳不再经浮点（正确性）**：`int(value.timestamp() * 1000)` 对亚秒边界会少 1ms
+  （`end` 偏小 = 按 [start, end) 过滤时丢那一毫秒的记录）；`int(value.timestamp())` 对
+  1970 前的时刻是向零截断、会大 1 秒。现在由 `(value - epoch)` 的整数域推导，两者都精确。
+
+- **凭据字段不再被 `${...}` 字面量卡住加载（可用性）**：凭据（键名含 token/secret/password 等，
+  如 `Authorization` 头、签名参数）的值是自由文本，里面出现畸形或未知的 `${...}`（如
+  `Bearer p@ss${word`、整串就是 `${secrets.old}` 而 secrets 里没有这个键）原来会报
+  "占位符写法不对/引用了不存在的占位符"、整份作业加载失败；现在这类字段能解析的占位符照常解析、
+  其余按字面量保留，非凭据字段的写法错误仍然报错（与 sftp2ods 同口径）。
+
+- **分区增删改走带超时的 DDL（可靠性）**：`write_partition` 原来用 pyodps 的 `delete_partition` /
+  `create_partition`（同步、不限时），云端元数据操作卡住会把整轮任务连同运行锁一起挂死——README
+  只把它写成"已知限制"。现在改成 `alter table … drop/add if [not] exists partition (pt='…')`
+  走 `run_sql_with_timeout`（与 sftp2ods / feishu2ods 同口径），`--sql-timeout` 覆盖到分区增删。
+
+- **锁目录可用 `API2ODS_LOCK_DIR` 固定（可靠性）**：工具目录不可写时会退回系统临时目录，
+  同一作业的 root 实例与普通用户实例会锁在不同文件上、互斥静默失效；现在可用环境变量把锁目录
+  钉在固定位置（指定的目录不可用直接报错、不静默换；指到共享存储时多机也能互斥）。
+
+- **SQL 已终止但未成功时不再当成成功（正确性）**：`run_sql_with_timeout` 在 `is_terminated()`
+  后只调用一次 `wait_for_success` 就返回实例；若该调用没抛错（超时语义/实现差异），终止但失败的
+  实例会被当成成功，后续 DDL 在"其实没执行"的前提下继续跑。现在与 sftp2ods 同口径：wait 之后再
+  显式判一次成功性，未成功直接报"已终止但未成功"。
+
+- **写库重试的日志/报错也按配置里的密钥值脱敏（安全）**：`retry_call` 新增 `secrets` 参数，
+  `mc.write_partition` 把 `collect_secret_values(job)` 传下去——Tunnel/SQL 的报错里可能带着
+  签名后的 URL/token，只靠形态规则会漏遮（与 sftp2ods 同口径）。
+
+- **显式传空 --bizdate 改为报错（正确性）**：`--bizdate` 的 argparse 默认值原来是空串，
+  与"显式传了空值"无法区分——调度脚本 `--bizdate "$pt"` 且 `$pt` 未定义时会被当成
+  "未指定"、静默回退成"昨天"写错窗口/分区。现在默认值是 None，显式空值走日期格式校验
+  直接报错（与 --dates 既有口径一致）。
+
+- **向导中断时清理含密钥的临时文件（安全）**：写盘途中 Ctrl+C（fsync 慢盘时的高发窗口）
+  原来不会被清理逻辑接住（`except Exception` 漏掉 BaseException），在 jobs/ 里留下
+  含明文密钥的 `.<作业名>.json.XXXX.tmp`，而向导还提示"未生成任何文件"；现在清理覆盖
+  BaseException，中断前先删临时文件。
+
+- **三处边角（正确性/可用性）**：ZIP 增加多条目解压累计上限（单条 256MB 各自合规的
+  "多条目炸弹"原来可绕开、总解压量能到几十 GB）；错误体嗅探的"多行判断"改为扫整包字节
+  （只看前 4KB 时，宽表单行 >4KB 的 JSONL 会被误判成单行 JSON、照样整包解码 OOM）；
+  向导的中断上报用 write_started + 提前读取的 exists 门控（原来 net盘 mkdir 期间的中断
+  会把"旧文件还在"误报成"本次已生成"、退出码 0）。
+
+- **两处脱敏加固（安全）**：敏感键 + 无引号的值改为遮到行尾/`&`——`password=my secret`
+  原来只遮第一个词、`secret` 明文留下（口令短语很常见）；URL userinfo 的口令按"最后一个
+  `@`"切分——`https://user:p@ss@proxy:8080` 原来在第一个 @ 截断、口令余段明文留下。
+  已是 `***` 形态的文本不重复吞（负向先行断言），非敏感键不吞后续键（扫描器实现）；
+  未闭合引号（`password="abc` 被日志截断）与「带引号的键」+ 不带引号的值
+  （`"password": my secret`）不再绕过三套规则。
+
+- **五处边角（正确性/可用性）**：截断 ZIP 条目抛的 EOFError 与 BadZipFile 同口径包成
+  可重试 RuntimeError（原来裸异常冒出、"重拉一次可能就好"的语义失效）；向导密钥类输入
+  只去尾部换行、不再 strip（首尾空白可能是凭据的一部分，getpass 不回显、改写无法当场
+  察觉）；覆盖已存在作业文件时收尾 chmod 阶段的中断改为按"已生成"上报（on_replaced
+  回调在 replace 完成即置位，原来会谎称"未生成任何文件"而旧配置已被替换）；
+  `parse.skip_rows: true` 这类布尔笔误不再 int(True)=1 静默切掉真表头；
+  `is_date_only_format` 兼容把时间写成字面量的格式（`%Y-%m-%d 00:00:00` 不再被误判为
+  "只到日期"而静默忽略 pad_hours、跳过 api_tz 换算）。
+
+- **五处边角收紧（正确性/可用性）**：CSV 字段上限的 OverflowError 兜底值原来比主值更大、
+  必然再抛（模块 import 期直接崩），改为退回系统默认；`extra_params` 值为 null 不再被
+  str 成字面量 "None" 发给接口（绕过空值回退、静默查不到数据）；`window.days` 为浮点
+  （2.5）不再被 int() 静默截断（与 0/非法字符串同口径报错）；校验告警通道遇到用户误写的
+  非 list 同名键不再裸 AttributeError（四处 setdefault 统一走 _append_warning）；
+  retry_call 的"确定性错误不重试"白名单补上 requests 的 MissingSchema/InvalidURL/
+  InvalidHeader（都是 ValueError 子类，原来会退避重试 5 次白等几分钟）——与 sftp2ods 同款。
+
+- **告警卡片标题脱敏、快照失败不掩成功、空格式串口径统一（正确性/安全）**：新增字段告警
+  的卡片标题原来直接用未脱敏的作业名（自由文本，可能含 ak/sk；卡片发到外部 webhook，
+  泄露面比日志更大），现在与 footer/启动日志同口径过 `_redact_job`；写库成功后的
+  `save_snapshot` 失败（目录只读/磁盘满）只警告，不再把已校验通过的入库报成裸 traceback
+  失败；`window.extra_params` 的空格式串在 `_moment` 里与 `format_time` 同口径回退成默认
+  带时刻格式（原来跳过 api_tz 换算却输出完整时间戳，窗口参数整体错时差）。
+
+- **log() 的 stdout 写入补异常兜底（可用性）**：原来只把 UnicodeEncodeError 单独处理、
+  其余异常（管道断管 BrokenPipeError、句柄被关、sys.stdout 属性缺失）会穿出 log()——
+  第一次写日志就把业务打挂，与"日志函数不能反过来把业务打挂"的约定相反（与
+  sftp2ods / feishu2ods 同口径）。
+
+- **向导写盘成功后的中断不再谎称「未生成任何文件」（可用性）**：os.replace 已完成、
+  收尾阶段（chmod/echo）被 Ctrl+C 时，含明文密钥的文件其实已在磁盘上，原来会报"已取消，
+  未生成任何文件"并返回 1；现在如实打印已生成的路径并返回 0（回调脚本按退出码重跑）。—— 与
+  sftp2ods / feishu2ods 同款修复。
+
+- **配置校验与向导的四处修正（正确性/安全）**：`resolve_target` 对 table/column 与
+  project 同口径过标识符白名单（这两个值同样拼进 DDL/SQL）；`_job_summary` 的作业名/
+  description、启动日志与告警 footer 统一走 `_redact_job`（description 常粘带 ak/sk 的
+  联调样例，本项目的 log() 无全局脱敏）；`_require_number`/lifecycle_days 的报错回显
+  改走 `_show`（值可能是替换后的密钥字面量）；未知键扫描与内部告警通道 `__warnings__`
+  解耦（用户误写的非 list 同名键不再被按字符拆成假告警、也不再静默吞掉；
+  反复 collect_warnings 能拿到同样的告警）。
+
+- **分页类型推断抽成 `_infer_pagination_type`（正确性）**：validate_job 单独调用
+  （库调用方不经 normalize_job）时不再把 cursor/page 误判成 none、跳过相关校验。
+
+- **三处小修正（正确性/可用性）**：`window_retries=1e999`（inf）时 int(inf) 的
+  OverflowError 变成"必须是整数"的配置错；向导对括号不配对的 IPv6 地址按"格式不对"
+  重问而不是 urlsplit 的 ValueError 裸崩；`is_date_only_format` 识别 `%%` 转义
+  （`%Y-%%H` 里的 %H 是字面量，不再误判成带时刻格式、多走一次时区换算导致日期错一天）。
+
+- **文件系统不支持运行锁时改为 fail-closed（数据安全）**：原来在 NFS/只读挂载
+  （ENOLCK/ENOTSUP）上"告警一次后无锁继续"——两个实例会并发写同一作业/表
+  （purge/rename 互拆、数据被静默覆盖）。现在默认直接拒绝执行并给出指引；确认无人并发
+  时可用 `API2ODS_ALLOW_NO_LOCK=1` 显式接受无互斥风险（此时保留告警后继续）。
+
+- **响应解析与分页的五处收紧（正确性/数据安全）**：
+  `pagination.type` 非法值（拼错 pages/offset、尾随空格）原来会落到 else 被当成 cursor，
+  取不到游标 = "翻完了"，只拉第一页还报成功——现在先 strip 再按白名单校验，三处取值点统一；
+  `pagination.type=cursor` 缺 `cursor_path` 在 fetch 入口兜底报错（validate_job 之外的
+  库调用方同样受保护）；ZIP 内同名条目原来按名字读会读同一条目两遍、另一条静默丢数据——
+  改为按 ZipInfo 逐条解析；`parse.entry_field` 与源文件自带同名列冲突时会静默覆盖真实列值——
+  现在直接报配置错；`window.extra_params` 校验值写回（原来校验 strip 后的值、运行时却用
+  带空白的原值）；range 模式的 extra_params 改为对区间内每一天求值（只比首尾会漏掉
+  `%d`/`%m` 这类周期性格式，整段只按首日值过滤、静默少拉数据）。
+
+- **大响应的错误体嗅探不再整包解码（内存安全）**：百 MB 级 JSONL 每行都以 { 开头，
+  原来会把整包解码成 str（编码候选不止一个时解好几份），内存受限时直接 OOM；现在只在
+  「包小」或「开头 4KB 没有换行（单行 JSON）」时才做整包解码。
+
+- **向导对符号链接不再 chmod（安全）**：`_atomic_write_job` 对已存在的目标路径 chmod 会
+  跟随符号链接、改到链接指向的真实文件权限（共享目录里的同名链接能把任意文件改成 0600，
+  而随后的 os.replace 只替换链接本身）；现在目标是符号链接时跳过这一步。
+
+- **notify 的成功码判定收紧（可靠性）**：`False == 0`、`0.0 == 0` 都是真，布尔 false /
+  浮点 0 的"失败"响应不能被当成成功码。
+
+- **`%h` 纳入 locale 无关取值（跨平台一致）**：`%h` 与 `%b` 同义，平台 strftime 会按
+  LC_TIME 展开（"9月" vs "Sep"），现在与 %b 一样由自己接管。
+
+- **示例作业 onerway_settlement_details 的 sign_in 修正（正确性）**：该接口参数走 Header
+  （params_in=headers），签名却配成 sign_in=body——GET 没有请求体，服务端在 Header 里拿到
+  参数却找不到匹配签名；已改为 sign_in=header。
+
+- **飞书通知不再把「没有 code 的 200 响应」当成功（可靠性）**：webhook 误填成其它接口
+  （回 `{"msg": "ok"}` 这类）时原来会打印「已发送」、告警通道静默失效；现在要求显式
+  `code`/`StatusCode` 为 0 或 "0"（仅空 `{}` 保留按 HTTP 200 判定的宽容，措辞注明依据）；
+  `{"code": null}` 不再算成功（旧行为见下条脱敏说明的同期用例，已随本次收紧调整）。
+
+- **`key='value'` 形态的密钥不再漏进日志（安全）**：query 规则的值部分不吃引号，
+  `access_token='t-xxx'`（f-string 的 `!r` 插值 / repr 输出就是这种形态）在行中会整段
+  漏遮；新增「键无引号 + 值带引号」规则，命中密钥词即遮值，键不敏感时递归兜底
+  （值里嵌的 `token=…` 也认）。与 sftp2ods / feishu2ods 同款修复。
+
+- **webhook 脱敏正则的可选前缀限长 256（性能/可用性）**：`(?i)((?:https?://[^\s"']*?)?/hook/)`
+  在「超长、无空白、又不含 /hook/」的文本上二次回溯（50KB 实测 19.7s，且 redact 在
+  log() 的锁内执行，会拖住所有线程）；限长后同一输入 0.29s，正常 webhook 照常遮蔽。
+
+- **`iter_rows` 不再在 yield 期间持锁（并发安全）**：重试路径会把上一趟失败的 traceback
+  留在引用里，被 traceback 引用住的生成器不会关闭——它在 yield 时持锁的话，下一趟
+  `iter_rows` 会永远等在这把锁上（写库重试直接死锁）。flush 仍在锁内做，读出本身要求
+  调用方遵守"读回发生在写入结束之后"的契约。
+
+- **脱敏覆盖不带引号的数字/布尔值（安全）**：`{"password": 12345}` 这类值 JSON 规则
+  吃不到（只认字符串值）、query 规则也认不出（只认 `=` 且键后不能有引号）；现在 query
+  规则同时认 `:`、允许键后收尾引号与分隔符后空白（原格式原样保留）。
+
+- **`pagination.type` 加白名单校验（可用性）**：未知取值原来会一路带到 fetch 的
+  if/elif 之外、行为不可预期；现在配置阶段直接报错。
+
+- **`%f` 加进 strftime 白名单（可用性）**：合法的微秒/毫秒级 format 原来被误拒。
+
+- **测试的临时目录清理由 rmdir 改为 shutil.rmtree（测试健壮性）**：目录非空时
+  `rmdir` 抛 OSError 会掩盖真实的断言失败。
+
+- **注释里的字面 U+2028/U+2029 改成转义写法（可维护性）**：按 str.splitlines() 分行的
+  工具会把该注释显示成多行、看起来像语法被破坏（Python 本身不受影响）。
+
+- **空白的环境变量 bizdate 在严格模式下报错（正确性/数据安全）**：`env_bizdate` 对只含
+  空白的值（`"   "`）原来 strip 后当"没设置"返回 None，严格模式静默回退"昨天"——数据写进
+  错的分区（先删再填，覆盖掉对的那天），退出码还是 0。现在与"值非法"分支同口径：严格模式
+  直接报错、`--check` 按未设置继续；bizdate/SKYNET_BIZDATE 改为逐个检查（空白值不再用 `or`
+  短路挡住合法的 SKYNET_BIZDATE）。
+
+- **`retry_call` 不再重试确定性错误 + 首退避受 max_delay 约束（可用性）**：
+  TypeError/AttributeError/KeyError 等编程错误立即报错（原来退避 5 次白等几分钟、还把
+  原始错误类型包成 RuntimeError）；首次退避也从 `min(base_delay, max_delay)` 起算。
+
+- **准备阶段的异常出口按"作业文件 + --config"两份配置做值级脱敏（安全）**：原来只用
+  job_raw，凭证写在 `--config` 的 `maxcompute`/`secrets` 里时该值漏遮、可能明文进
+  `--log-file`。
+
+- **未闭合占位符的报错先过脱敏（安全）**：与 sftp2ods 同口径（回显的配置值本身可能就是密钥）。
+
+- **`_as_count` 拒绝负数（可用性）**：负数会被 `max(1, ...)` 吞成"不重试"，与 timeout/
+  retry_delay 的校验口径对齐；同时 `_as_number` 捕获 `float()` 的 `OverflowError`
+  （超长整数字面量不再漏出裸 traceback）。
+
+- **`check_header_values` 对非对象 headers 给配置错（可用性）**：写成列表/字符串时原来
+  是裸 `AttributeError`。
+
+- **`--pt` 去掉首尾空格后校验并使用（可用性）**：原来判空用 strip、取值用原串，
+  `--pt " 20260921 "` 这类只多打空格的写法会被误判为非法分区名（换行等仍拒）。
+
+- **超时取消失败留日志（可用性）**：云端可能仍有悬挂的 SQL 在跑，静默 pass 会让超时事故
+  无从回溯。
+
+- **`render_job` 不再就地改写调用方的 config（正确性/安全）**：改为返回
+  `(job, 渲染后的 config)`（与 sftp2ods 同口径）。原来直接在调用方 config 上就地替换，
+  同一份 `--config` 用不同 secrets 连渲染两次时，第二次已找不到 `${...}`——第二个作业会
+  静默使用第一个作业的 AK/日期（多实例复用同一份 config 的用法正好踩这一条）。
+
+- **`collect_warnings` 的告警过值级脱敏（安全）**：此时 job 已渲染、明文密钥就在里面，
+  与其它来自 job 的日志同口径走 `_redact_job`。
+
+- **`--log-file` 写失败不再无声（可用性）**：日志文件写失败原来 `except Exception: pass`
+  完全静默，--log-file 会无声失效；现在写失败的 sink 被摘掉并关闭，stderr 上留一条
+  可见的警告（同一次运行只提示一次）。
+
+- **ZIP 条目加解压上限（可用性/健壮性）**：条目整条解压进内存且无上限，超高压缩比/
+  异常大条目（zip bomb、源侧导出事故）会把进程内存打爆；现在按 central directory
+  声明的解压后大小先挡一道（上限 256MB，超出给可读报错）。
+
+- **ZIP 多条目的"表头一致"按列集合比，不再受键序影响（正确性）**：记录是
+  `{列名: 值}` 的 dict，键序随 CSV/JSONL 原文变化——同构的两份文件列序不同时原来会被
+  误判成"表头不一致"整批失败；现在按排序后的键集合比较。
+
+- **`request.method` 按 RFC token 形态校验（安全）**：任意字符串原来会原样写进
+  request.method（含换行还会拼进请求行，或者让 requests 报难以归类的底层错误）。
+
+- **`request.retry_times` 非负校验（可用性）**：负数会被 max(1, ...) 吞成"不重试"，
+  与 timeout/retry_delay 的校验口径对齐。
+
+- **`_is_zero_count` 用 Decimal 判定（正确性）**：`float("1e-400")` 会下溢成 0.0，
+  把"极小但非零"的计数误判成"接口明确回 0 条"的收尾信号（会少拉数据）。
+
+- **`--dates` 显式给空串不再静默回落（可用性）**：原来 `--dates ""` 被真值判断短路成
+  "没给这个参数"，静默按默认业务日（昨天）跑；现在按"给了就要能解析出日期"处理
+  （`--dates` 的 argparse 默认值改为 None 以区分"没给"与"给了空值"）。
+
+- **`count 校验没读到行`留一条警告（可用性）**：`count_partition` 读不到任何行时按既有
+  行为返回 0（调用方依赖），但会记一条警告——静默返回会把"没读到结果"与"分区确实
+  0 行"混为一谈，写后行数校验会被误导。
+
+- **落盘每批 flush 一次（可用性）**：日志说"已落盘"而数据还在文件缓冲里时，进程被
+  kill 会让日志行数与磁盘实际内容对不上（逐条 flush 又太贵）。
+
+- **临时文件 fd 不再泄漏（资源）**：`mkstemp` 之后 `os.fdopen` 抛异常时 fd 无人关闭
+  （`init_wizard._atomic_write_job`、`fieldwatch.save_snapshot` 两处）；现在失败路径
+  显式关闭。
+
+- **占位符解析成非字符串的键报错（可用性）**：`{"${secrets.lst}": ...}` 解析成列表后
+  原来被 `str()` 静默变成 `"['a', 'b']"` 这种没人认得的 JSON 键；现在报配置错。
+
+- **`window.format` 校验通过后写回剥离值（可用性）**：`" %Y-%m-%d"` 这类带首尾空白的
+  写法过了校验，运行时却按含空白的字面量格式化；与 target/fields 的"校验通过的值
+  写回"口径对齐。
+
+- **`redact_secrets` 的宽容度补齐（安全/可用性）**：values 传单个字符串会被 `set()`
+  拆成单字符（全部短于最小长度被跳过，值级脱敏静默失效）；非字符串值会在 `len()` 上抛
+  `TypeError`。现在按"单个密钥"处理并对值先 `str()`。
+
+- **没有文件锁模块的平台留一次告警（可用性）**：与"文件系统不支持锁"同口径，不再静默
+  退化成"无锁"。
+
+- **`_exit_now` 先 flush 再退出（可用性）**：`os._exit` 不跑解释器退出流程，未 flush 的
+  stdout/stderr 缓冲会丢。
+
+- **准备阶段的异常出口也做值级脱敏（安全）**：作业文件已读到时改用 `_redact_job`
+  （按配置里的密钥值遮），拿不到时退回形态级 `redact`。
+
+- **`entry_field` 不再用空串覆盖 CSV/JSONL 的同名列（正确性）**：非 ZIP 来源（整包文件流）
+  没有"条目名"，原来仍无条件执行 `record[entry_field] = ""`——文件里本来就有同名列时会被
+  整列清空，而且是"行数校验通过"的假数据。现在只在有真实条目名（ZIP 里）时写入。
+
+- **超时/心跳计时改用单调时钟（正确性）**：`run_sql_with_timeout` 原来用 `time.time()`
+  量"等了多久"——NTP 校时/手动改时间会让等待时长凭空跳变，误判超时并 `stop()` 掉正在跑的
+  作业。改为 `time.monotonic()`（同口径：日志显示用的耗时仍可用墙钟）。
+
+- **失败分支关闭响应，及时归还连接池（资源）**：`request_once` 的重定向/4xx/429/5xx 分支
+  原来直接抛错、不消费也不关闭 `response`，重试场景下连接只能等 GC 回收。现在读所需信息
+  （Location / 错误体 / Retry-After）后先 `response.close()` 再抛。
+
+- **`iter_rows` 在关闭后给出明确报错（可用性）**：`close(keep=False)` 会删掉落盘文件，
+  之后读回原来抛没有上下文的 `FileNotFoundError`；现在与 `write_records` 同口径抛
+  `RuntimeError`（"落盘文件已关闭，不能再读回"）。
+
+- **小配置错不再变成裸 traceback（可用性）**：`_require_number` 捕获 `float()` 的
+  `OverflowError`（JSON 里的超长整数字面量）；`request.retry_delay` 增加非负校验；
+  `--start-date`/`--end-date` 的判断统一走 `getattr`（精简 namespace 不再抛
+  `AttributeError`）；`_PT_RE` 用 `[0-9]` 而不是 `\d`（全角数字不能当业务日）。
+
+- **作业里 AK/SK 只填一半时给出警告（可用性）**：原来静默忽略这半对、继续往后找，最终
+  报错只说"找不到 AccessKey"，用户看不出是配置写漏了。现在与"环境变量只设一半"同口径
+  留一条日志（行为不变：仍继续查找其它凭证来源）。
+
+- **JSON 错误体探测只解码开头一小段（性能）**：`_reject_json_error_body` 原来为看首字符
+  就把整包（几十 MB 的 CSV/ZIP 也在内）按候选编码整体解码；现在只解码前 4KB 做嗅探，
+  只有确实像 JSON 时才整包解码。
+
+- **新增字段的展示截断到 50 个（可用性）**：字段名来自接口键名、数量不受控，极多时日志行
+  与飞书卡片会超长被拒；完整清单仍以 json 列原样入库。
+
+- **`--init` 生成的 window 块显式写入 date_tz/api_tz**：向导提示"要改就编辑文件里的
+  date_tz/api_tz"，但生成的配置里根本没有这两个字段（靠下游隐式默认值）——现在 per_day /
+  range 两种窗口都写入默认值（`Asia/Shanghai`、`+08:00`），提示与实际一致。
+
 - **`--init` 向导抛出的配置错也进日志**：`--init-out` 指向目录等由向导抛出的 `SystemExit`
   原来直接冒泡出 `main`——控制台那行没有时间戳、`--log-file` 里一个字都没有，与 2.1.5
   「准备阶段的配置错也要留痕」的口径不一致。现在按运行期错误的格式记一笔并过 `redact`，
@@ -108,6 +442,23 @@
 
 ### 安全
 
+- **运行锁加固**：锁名哈希从 `sha1[:8]`（32 位）换成 `sha256[:16]`（不同作业碰撞后互相
+  阻塞的概率大幅下降，与 sftp2ods / feishu2ods 同口径）；POSIX 上打开锁文件加
+  `O_NOFOLLOW`（路径若是符号链接就拒绝跟随）、新建按 0600。
+- **project 标识符校验覆盖 profiles / maxcompute 来源**：`validate_job` 只校验了
+  `target.project`，而 `resolve_target` 允许 project 来自 `profiles.<名>.project` 或
+  `maxcompute.project`——这条路径同样直接拼进 DDL/SQL，却没有过白名单。现在在
+  `resolve_target` 里对"最终解析出来的 project"统一调用 `require_identifier`。
+- **脱敏递归加上深度上限**：`redact()` 的 query/JSON/头行回调会把匹配值再交给 `redact`
+  递归；形如 `a=b=c=…`（上千个等号）的构造性文本（第三方响应体不可控）每层只剥一个等号，
+  能把递归喂到 Python 上限、把日志脱敏本身打成 `RecursionError`。现在深度超过 10 层按
+  "宁可多脱敏"整段遮成 `***`。
+- **临时作业文件的写入加固**：`_atomic_write_job` 原来用 `名字.pid.tmp` 这种可预测文件名
+  + `O_TRUNC`，同目录下的同名符号链接会被跟随、截断任意文件。改用 `tempfile.mkstemp`
+  （随机名 + `O_EXCL`、默认 0600）写临时文件再 `os.replace`，同时补 `fsync`；最后一次
+  `chmod` 失败（不支持权限位的文件系统）只跳过，不再把"已生成成功"误报成"写文件失败"。
+- **`--check` 成功分支的 label 也过脱敏**：与失败分支/`run_sync` 的失败列表同口径
+  （label 理论上可能带 URL/签名）。
 - **值级脱敏同时覆盖 URL 编码形态的凭证**：值级替换原来只做明文 `str.replace`。若接口/工具把
   凭证以 URL 编码形态写进**没有可识别键名**的自由文本（如 `t%2Dabc123...` 对应 `t-abc123...`），
   形态规则挡不住，编码后的凭证会原样进日志。现在除明文外同时替换其 `quote` / `quote_plus`

@@ -26,13 +26,13 @@ _UNIX_FORMATS = ("unix", "unix_s", "unix_ms", "unix_millis")
 # 实测 MSVC 不认的：k l N P q s v 与所有修饰符（%-d/%_d/%0d/%^B）；glibc 则是不认的
 # 原样输出。取交集才能保证"同一份配置在 Linux 与 Windows 上行为一致"，
 # 而不是一边崩、一边把 "%Q" 当参数值发给接口
-_STRFTIME_CODES = set("aAbBcCdDeFgGhHIjmMnprRStTuUVWwWxXyYzZ%") | {"s", "P"}
+_STRFTIME_CODES = set("aAbBcCdDeFgGhHIjmMnprRStTuUVWwWxXyYzZ%") | {"s", "P", "f"}
 # 下面这些指令的输出由 C 库的 locale / 平台时区库决定，同一份配置在不同机器上可能不一样：
 # 中文/法语 Windows 上 %b 给「9月」「sept.」，英文 Linux 给 "Sep"；%c/%x/%X 是整体 locale
 # 格式；%Z 取平台时区缩写（"CST"/"China Standard Time"）。同一个作业在开发机与调度机
 # 拼出的参数值不同，接口按值匹配（如按日期字符串查账）时会静默查不到数据。
 # 与 %s / %P 同样处理：由 format_time 自己实现，固定成 C locale 的英文写法。
-_LOCALE_DEPENDENT_CODES = ("a", "A", "b", "B", "p", "c", "x", "X", "r", "Z")
+_LOCALE_DEPENDENT_CODES = ("a", "A", "b", "B", "h", "p", "c", "x", "X", "r", "Z")
 _WEEKDAY_ABBR = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 _WEEKDAY_FULL = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 _MONTH_ABBR = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -66,6 +66,7 @@ def _locale_free_values(value: datetime) -> dict:
         "a": weekday_abbr,
         "A": _WEEKDAY_FULL[value.weekday()],
         "b": month_abbr,
+        "h": month_abbr,  # %h 与 %b 同义（平台 strftime 会按 LC_TIME 展开，必须一并接管）
         "B": _MONTH_FULL[value.month - 1],
         "p": ampm,
         "c": (
@@ -87,12 +88,31 @@ _DAY_COMPACT_RE = re.compile(r"\A[0-9]{8}\Z")
 _DAY_ISO_RE = re.compile(r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}\Z")
 
 
+_DATE_ONLY_PROBE_TIME = datetime(2001, 2, 3, 13, 37, 59)
+_TIME_SHAPE_RE = re.compile(r"\d{1,2}:\d{2}")
+
+
 def is_date_only_format(fmt: str) -> bool:
-    """格式是否只到"日"（没有时分秒），如 %Y-%m-%d / %Y%m%d / %Y-%m。"""
+    """格式是否只到"日"（没有时分秒），如 %Y-%m-%d / %Y%m%d / %Y-%m。
+
+    先把 %% 转义消掉再找时刻指令：`%Y-%%H` 里的 %H 是字面量（不是时刻指令），
+    子串匹配会把它误判成"带时刻格式"、多走一次时区换算（跨日线时日期整体错一天）。
+    指令都没有时再看渲染结果里有没有时刻样式：`%Y-%m-%d 00:00:00`（时间写成字面量）
+    同样算"带时刻"——否则 pad_hours 被静默忽略、也不做 api_tz 换算。
+    """
     fmt = str(fmt or "")
     if fmt.lower() in _UNIX_FORMATS:
         return False
-    return not any(token in fmt for token in _TIME_TOKENS)
+    unescaped = fmt.replace("%%", "")
+    if any(token in unescaped for token in _TIME_TOKENS):
+        return False
+    try:
+        rendered = format_time(_DATE_ONLY_PROBE_TIME, fmt)
+    except (Exception, SystemExit):
+        # ConfigError 继承 SystemExit（不是 Exception）：这个探测用的 format_time 报错
+        # 会带默认字段名（window.format），必须吞掉——真正的报错留给下面带正确 field 的调用
+        return False
+    return not _TIME_SHAPE_RE.search(str(rendered))
 
 
 def parse_offset(text: str) -> timezone:
@@ -177,23 +197,30 @@ def env_bizdate(strict: bool = True) -> date | None:
     调用方只在**没有显式 --bizdate** 时才该读环境变量——显式参数优先，
     否则运维无法用 --bizdate 强制指定业务日重跑。
     """
-    raw = os.environ.get("bizdate") or os.environ.get("SKYNET_BIZDATE") or ""
-    text = raw.strip()
-    if not text:
-        return None
-    try:
-        return parse_day_arg(text)
-    except SystemExit as exc:
-        if not strict:
-            log(
-                f"  警告：环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}；"
-                f"只读体检（--check）不写库，按默认业务日继续"
-            )
-            return None
-        raise SystemExit(
-            f"环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期：{raw!r}"
-            f"（应为 YYYYMMDD 或 YYYY-MM-DD）；不打算用它请先 unset，或用 --bizdate 显式指定业务日"
-        ) from exc
+    for name in ("bizdate", "SKYNET_BIZDATE"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            # 空白值（"   "）必须按"设了但没法用"处理：原来 strip 后当"没设置"返回 None，
+            # 严格模式下会静默回退"昨天"——数据写进错的分区（先删再填，覆盖掉对的那天），
+            # 退出码还是 0。与"值非法"分支同口径，strict 直接报错。
+            if strict:
+                raise SystemExit(f"环境变量 {name} 的值为空白，无法作为业务日；请 unset 或用 --bizdate 指定")
+            log(f"  警告：环境变量 {name} 的值为空白；只读体检（--check）不写库，继续看下一个环境变量/默认业务日")
+            continue
+        try:
+            return parse_day_arg(text)
+        except SystemExit as exc:
+            if not strict:
+                log(f"  警告：环境变量 {name} 的值不是合法日期：{raw!r}；只读体检（--check）不写库，按未设置处理")
+                continue
+            raise SystemExit(
+                f"环境变量 {name} 的值不是合法日期：{raw!r}"
+                f"（应为 YYYYMMDD 或 YYYY-MM-DD）；不打算用它请先 unset，或用 --bizdate 显式指定业务日"
+            ) from exc
+    return None
 
 
 def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
@@ -216,14 +243,21 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
         # 静默忽略会让"--start-date X --end-date Y --days 1"看起来像只拉一天
         log_once("  提示：补数模式（--dates / --start-date+--end-date）下 --days 不生效")
 
-    if getattr(args, "dates", ""):
-        days = [parse_day_arg(x) for x in args.dates.split(",") if x.strip()]
+    dates_arg = getattr(args, "dates", None)
+    if dates_arg is not None:
+        # None = 没给这个参数；给了（哪怕是空串/顿号）就必须能解析出日期——
+        # 原来空串被当真值判断短路成"没给"，`--dates ""` 会静默回落到默认业务日（昨天）
+        days = [parse_day_arg(x) for x in str(dates_arg).split(",") if x.strip()]
         if not days:
-            raise SystemExit("--dates 为空")
+            raise SystemExit("--dates 为空（给逗号分隔的日期列表，或者不要传这个参数）")
     elif getattr(args, "start_date", "") or getattr(args, "end_date", ""):
-        if not (args.start_date and args.end_date):
+        # 统一走 getattr：库调用方传精简 namespace（只有其中一个字段）时，
+        # 直接属性访问会抛 AttributeError 而不是下面这句配置错
+        start_arg = getattr(args, "start_date", "") or ""
+        end_arg = getattr(args, "end_date", "") or ""
+        if not (start_arg and end_arg):
             raise SystemExit("--start-date 与 --end-date 必须成对出现")
-        start, end = parse_day_arg(args.start_date), parse_day_arg(args.end_date)
+        start, end = parse_day_arg(start_arg), parse_day_arg(end_arg)
         if end < start:
             raise SystemExit("--end-date 不能早于 --start-date")
         days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
@@ -231,7 +265,7 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
         # 顺序要紧：先看显式 --bizdate，没有才读环境变量。反过来写的话，
         # env 畸形会在这里二次抛错——即使调用方已经用 --bizdate 拿到了正确业务日
         # （--check 用 strict=False 时这里就真的会二次抛），显式参数优先这条规则必须一致
-        if getattr(args, "bizdate", ""):
+        if getattr(args, "bizdate", None) is not None:
             base = parse_day_arg(args.bizdate)
         elif bizdate is not None:
             # 调用方已经算过业务日（--bizdate / 环境变量 / 默认昨天），直接用——
@@ -247,7 +281,15 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
             else:
                 configured = window.get("days")
                 # 不用 `or 1`：0 会被静默当成默认值 1（window.days=0 是笔误，该报错）
-                count = 1 if configured is None or configured == "" else int(configured)
+                if configured is None or configured == "":
+                    count = 1
+                elif isinstance(configured, bool):
+                    raise SystemExit(f"window.days 必须是整数，实际 {configured!r}")
+                elif isinstance(configured, float) and not configured.is_integer():
+                    # int(2.5)=2 会静默少回拉一天（与 0/非法字符串都报错的口径一致）
+                    raise SystemExit(f"window.days 必须是整数，实际 {configured!r}")
+                else:
+                    count = int(configured)
         except (TypeError, ValueError):
             # 报错要指向真正的来源：--days 传了非法值时，原来固定说 window.days 并打印 None，
             # 用户会以为是配置问题
@@ -317,6 +359,25 @@ def _protect_extension(fmt: str, code: str, sentinel: str) -> str:
     return "".join(out)
 
 
+_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _epoch_seconds(value: datetime) -> int:
+    """epoch 秒（向下取整）：不用 int(timestamp())——那是向零截断，1970 前的时刻会大 1 秒。"""
+    if value.tzinfo is None:
+        value = value.astimezone()  # naive 按本机时区解释（与原 timestamp() 行为一致）
+    delta = value - _EPOCH_UTC
+    return delta.days * 86400 + delta.seconds
+
+
+def _epoch_millis(value: datetime) -> int:
+    """epoch 毫秒：不走浮点（timestamp()*1000 再 int() 截断可能少 1ms——end 偏小会丢数据）。"""
+    if value.tzinfo is None:
+        value = value.astimezone()
+    delta = value - _EPOCH_UTC
+    return (delta.days * 86400 + delta.seconds) * 1000 + delta.microseconds // 1000
+
+
 def format_time(value: datetime, fmt: str, field: str = "window.format"):
     """按配置格式化时间：支持 unix（秒）/ unix_ms（毫秒），并自己实现 %s / %P。
 
@@ -334,11 +395,11 @@ def format_time(value: datetime, fmt: str, field: str = "window.format"):
     fmt = str(fmt or DEFAULT_TIME_FORMAT)
     lowered = fmt.lower()
     if lowered in ("unix", "unix_s"):
-        return int(value.timestamp())
+        return _epoch_seconds(value)
     if lowered in ("unix_ms", "unix_millis"):
-        return int(value.timestamp() * 1000)
+        return _epoch_millis(value)
     if fmt == "%s":
-        return int(value.timestamp())
+        return _epoch_seconds(value)
     check_format_string(fmt, field=field)
     # %s / %P 先换成哨兵再交给 strftime（不这么绕的话，Windows 上 strftime 会直接抛错）。
     # 哨兵不能用 \x00：strftime 收的是 C 字符串，NUL 会把它后面的内容整段截掉（Linux 实测输出空串）。
@@ -350,7 +411,7 @@ def format_time(value: datetime, fmt: str, field: str = "window.format"):
     # locale/平台相关指令同样先换成哨兵：交给 strftime 的话，中文/法语环境下 %b 会
     # 拼出「9月」「sept.」，同一份配置在开发机与调度机上算出不同的参数值
     locale_free = _locale_free_values(value)
-    substitutions = {s_sentinel: str(int(value.timestamp())), p_sentinel: "am" if value.hour < 12 else "pm"}
+    substitutions = {s_sentinel: str(_epoch_seconds(value)), p_sentinel: "am" if value.hour < 12 else "pm"}
     for code in _LOCALE_DEPENDENT_CODES:
         sentinel = f"\x01{code}\x01"
         substitutions[sentinel] = locale_free[code]
@@ -371,6 +432,9 @@ def _moment(value: datetime, fmt: str, api_tz, field: str = "window.format") -> 
 
     field 透传给 format_time 的报错文案（window.format / window.extra_params[名]）。
     """
+    # 与 format_time 同一口径先做空值回退：空串在两边判定不同会"跳过时区换算却输出
+    # 完整时间戳"（format_time 把 "" 回退成带时刻的默认格式），窗口参数整体错 8 小时
+    fmt = str(fmt or DEFAULT_TIME_FORMAT)
     if not is_date_only_format(fmt):
         value = value.astimezone(api_tz)
     return format_time(value, fmt, field=field)
@@ -401,7 +465,9 @@ def _format_window(win: dict, start: datetime, end: datetime, day: date, last_da
     if win.get("extra_params"):
         base = datetime.combine(day, dtime(0, 0), tzinfo=tz)
         for name, extra_fmt in dict(win["extra_params"]).items():
-            result[str(name)] = _moment(base, str(extra_fmt), api_tz, field=f"window.extra_params[{name!r}]")
+            # 不把 None 提前 str() 成字面量 "None"（会绕过 _moment 的空值回退，把
+            # statDate=None 发给接口、静默查不到数）；由 _moment/format_time 统一回退
+            result[str(name)] = _moment(base, extra_fmt, api_tz, field=f"window.extra_params[{name!r}]")
     return result
 
 
@@ -418,15 +484,18 @@ def _check_range_extra_params(win: dict, days: list[date], tz) -> None:
     if not extra or days[0] == days[-1]:
         return
     api_tz = load_api_zone(win.get("api_tz"))
-    base_first = datetime.combine(days[0], dtime(0, 0), tzinfo=tz)
-    base_last = datetime.combine(days[-1], dtime(0, 0), tzinfo=tz)
+    bases = [datetime.combine(day, dtime(0, 0), tzinfo=tz) for day in days]
     for name, extra_fmt in dict(extra).items():
-        first_value = _moment(base_first, str(extra_fmt), api_tz, field=f"window.extra_params[{name!r}]")
-        last_value = _moment(base_last, str(extra_fmt), api_tz, field=f"window.extra_params[{name!r}]")
-        if first_value != last_value:
+        # 对区间内每一天求值再比：只比首尾会漏掉"周期性格式"——20260101~20260201 的 %d
+        # 首尾都是 "01"、中间 31 天却各不相同，那种配置过了校验、整段却只按首日值过滤。
+        # days 本来就在内存里，成本可忽略
+        values = [_moment(base, extra_fmt, api_tz, field=f"window.extra_params[{name!r}]") for base in bases]
+        first_value = values[0]
+        changed = next((value for value in values[1:] if value != first_value), None)
+        if changed is not None:
             raise ConfigError(
                 f"window.extra_params 的 {name}（{extra_fmt}）在区间 {days[0]} ~ {days[-1]} 上会变"
-                f"（{first_value} → {last_value}）：range 模式整段只发一次请求、派生参数只能取首日的值，"
+                f"（{first_value} → {changed}）：range 模式整段只发一次请求、派生参数只能取首日的值，"
                 f"后半段数据会静默拉不到。请改用 window.mode=per_day（每天一个请求），"
                 f"或把区间收窄到该参数不跨界的范围"
             )
@@ -459,7 +528,12 @@ def window_param_sets(job: dict, days: list[date]) -> list[dict | None]:
             f"{'传负数相当于把窗口两头往里缩，会漏掉边界数据' if pad_hours < 0 else '超过 24 会让相邻两天重合超过一整天'}"
         )
     tz = date_tz_of(job)
-    mode = str(win.get("mode") or "per_day").lower()
+    mode = str(win.get("mode") or "per_day").strip().lower()
+    if mode not in ("per_day", "range"):
+        # 拼错/带空格的 mode（"range "/"rang"）原来静默按 per_day 跑：range 语义失效、
+        # _check_range_extra_params 的区间校验也整段跳过，按天请求还会带上整月参数
+        # （如 billingCycle=%Y-%m）把整月数据写进单日 pt——配置错要在配置阶段报出来
+        raise ConfigError(f"window.mode 只支持 per_day / range，实际 {win.get('mode')!r}")
     # 纯日期格式的接口要的是"哪一天"，只输出年月日、没有时刻能承载余量：
     # 减 pad 不会"多拉一段"，而是把日期整体顶到前一天（业务日 9/18 发出 9/17），
     # 落进 pt=业务日 就是整表错一天。所以这里直接按天级边界算，忽略 pad。

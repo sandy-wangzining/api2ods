@@ -249,15 +249,22 @@ def request_once(
         # 不跟随重定向（见上面的说明）：把 Location 报出来让用户直接改成最终地址。
         # 这里抛 ConfigError（确定性错误、不重试），别让它掉进"网络抖动"的退避里
         location = redact(str(response.headers.get("Location") or ""))
+        response.close()
         raise ConfigError(
             f"接口返回重定向 HTTP {status}（Location: {location}）：本工具不跟随重定向——"
             f"301/302/303 会把 POST 降级成不带 body 的 GET（窗口参数全丢），"
             f"自定义鉴权头也可能被转发到别的地址。请把 request.base_url 改成最终地址"
         )
     if status == 429 or 500 <= status < 600:
-        raise RetryLater(_retry_after_seconds(response), f"HTTP {status}")
+        # 重试前先关掉响应：不消费响应体的话连接不会归还连接池，
+        # 重试次数多时会占着连接（响应体只在 retry 场景才需要读 Retry-After 头）
+        retry_after = _retry_after_seconds(response)
+        response.close()
+        raise RetryLater(retry_after, f"HTTP {status}")
     if 400 <= status < 500:
-        raise FatalApiError(f"HTTP {status}：{redact(response.text[:300])}")
+        detail = redact(response.text[:300])
+        response.close()
+        raise FatalApiError(f"HTTP {status}：{detail}")
     response.raise_for_status()
 
     if not expect_json:

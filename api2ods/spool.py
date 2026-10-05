@@ -93,22 +93,31 @@ class SpoolWriter:
                 self.bytes += len(line.encode("utf-8")) + 1
                 self.count += 1
                 progress_log("已落盘", self.count)
+            # 每批落完 flush 一次：日志说"已落盘"而数据还在缓冲里时，
+            # 进程被 kill 会让日志行数与磁盘实际内容对不上（逐条 flush 又太贵）
+            self._handle.flush()
             return len(records)
 
     def iter_rows(self):
         """重新从头逐行读出（可多次调用：写库失败重试时会重新读一遍）。
 
         读回必须在"全部写入结束"之后：fetch 全部完成后才进入写库阶段。
-        整段读持锁：否则并发 write_records 可能 flush 出半行，读到的就不是完整 JSON。
+        **不在 yield 期间持锁**：重试路径会把上一趟失败的 traceback 留在引用里，
+        被 traceback 引用住的生成器不会关闭——若它在 yield 时持锁，下一趟 iter_rows
+        会永远等在这把锁上（写库重试直接死锁）。flush 在锁内做（避免读到半行），
+        读出本身要求调用方遵守"不再并发写"的契约。
         """
         with self._lock:
-            if not self._closed:
-                self._handle.flush()
-            with open(self.path, "r", encoding="utf-8", newline="") as handle:
-                for line in handle:  # 逐行读：对超长行（大 JSON）也安全
-                    line = line.rstrip("\n")
-                    if line:
-                        yield line
+            if self._closed:
+                # 关闭后文件可能已被删除（keep=False）：原来会抛没有上下文的
+                # FileNotFoundError；明确报错，与 write_records 的关闭口径一致
+                raise RuntimeError(f"落盘文件已关闭，不能再读回：{self.path}")
+            self._handle.flush()
+        with open(self.path, "r", encoding="utf-8", newline="") as handle:
+            for line in handle:  # 逐行读：对超长行（大 JSON）也安全
+                line = line.rstrip("\n")
+                if line:
+                    yield line
 
     def iter_batches(self, batch_size: int = 1000, max_bytes: int = 8_000_000):
         """按批读回，每批 ≤ batch_size 行且 ≤ max_bytes 字节。

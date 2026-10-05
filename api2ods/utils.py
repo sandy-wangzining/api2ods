@@ -84,6 +84,7 @@ def remove_log_sink(handle) -> None:
 
 
 _logged_once: set = set()
+_sink_write_warned = False
 
 
 def reset_log_once() -> None:
@@ -92,8 +93,26 @@ def reset_log_once() -> None:
     不重置的话，同一进程里第二次调用 main（测试、嵌入调用）会静默吞掉
     第一次已经打过的那条告警——用户看不到任何提示。
     """
+    global _sink_write_warned
     with _lock:
         _logged_once.clear()
+        _sink_write_warned = False
+
+
+def _warn_log_sink_once(exc: BaseException) -> None:
+    """日志文件写失败时往 stderr 打一条（同一次运行只提示一次），sink 已由 log() 摘掉关闭。"""
+    global _sink_write_warned
+    with _lock:
+        if _sink_write_warned:
+            return
+        _sink_write_warned = True
+    try:
+        sys.stderr.write(
+            f"警告：--log-file 写入失败（{type(exc).__name__}: {exc}），该文件后续不再写入；控制台日志不受影响\n"
+        )
+        sys.stderr.flush()
+    except Exception:  # noqa: BLE001 - stderr 也坏了就放弃
+        pass
 
 
 def log_once(message: str) -> None:
@@ -137,12 +156,33 @@ def log(message: str) -> None:
             encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
             safe = line.encode(encoding, "replace").decode(encoding, "replace")
             print(safe, flush=True)
+        except (OSError, ValueError, RuntimeError, AttributeError):
+            # stdout 断管/关闭（BrokenPipeError、`| head` 提前退出；sys.stdout 属性缺失等
+            # 极端形态抛 RuntimeError/AttributeError）：日志函数不能反过来把业务打挂
+            # （写文件的那一路下面还有自己的兜底）——与 sftp2ods / feishu2ods 同口径
+            pass
+        failed_exc = None
+        alive = []
+        broken: list = []
         for handle in _sinks:
             try:
                 handle.write(line + "\n")
                 handle.flush()
-            except Exception:  # noqa: BLE001 - 日志文件问题不影响主流程
-                pass
+                alive.append(handle)
+            except Exception as exc:  # noqa: BLE001 - 日志文件问题不影响主流程，但必须可见一次
+                failed_exc = exc
+                broken.append(handle)
+        if failed_exc is not None:
+            _sinks[:] = alive
+            # 摘掉的同时把句柄关掉（写坏的文件句柄不可再用，留着只是泄漏）
+            for handle in broken:
+                try:
+                    handle.close()
+                except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
+                    pass
+        sink_exc = failed_exc
+    if sink_exc is not None:
+        _warn_log_sink_once(sink_exc)
 
 
 class RunLock:
@@ -165,18 +205,35 @@ class RunLock:
     def __enter__(self):
         """拿锁；已被别人持有就抛 SystemExit（不等待），拿不到直接让本次运行退出。"""
         if fcntl is None and msvcrt is None:
+            # 平台完全没有文件锁模块：与"文件系统不支持锁"同口径留一次告警——
+            # 静默退化成"无锁"会让并发启动同一作业时互斥形同虚设而无人察觉
+            log_once("  警告：当前平台没有 fcntl/msvcrt，本次不加锁继续；并发启动同一作业将无法互斥")
             return self
         try:
             # "a+" 而不是 "w"：w 会在打开时把文件截断，持锁进程刚写进去的 pid 就被抹掉了
             # （锁本身是文件区域锁，与文件内容无关，互斥不受影响；丢的是排障用的"谁在跑"）
-            self.fh = open(self.path, "a+")
-        except OSError as exc:
+            # POSIX 上 O_NOFOLLOW：锁路径若是符号链接就拒绝跟随，新建按 0600
+            # （与 sftp2ods / feishu2ods 的锁同口径）
+            open_kwargs: dict = {"encoding": "utf-8", "errors": "replace"}
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if nofollow:
+                open_kwargs["opener"] = lambda path, flags, _nf=nofollow: os.open(path, flags | _nf, 0o600)
+            self.fh = open(self.path, "a+", **open_kwargs)
+        except (OSError, UnicodeError) as exc:
             # 父目录被删/路径过长（Windows MAX_PATH）时给一句人话，
             # 而不是让 FileNotFoundError 以裸 traceback 的形式糊在用户脸上
             raise SystemExit(
                 f"无法创建运行锁文件 {self.path}（{exc}）；请检查该路径所在目录是否存在/可写，或用 --job 指定别处的作业"
             )
-        if not _try_lock(self.fh):
+        try:
+            locked = _try_lock(self.fh)
+        except BaseException:
+            # _lock_oserror_result 对未识别的 errno 会上抛：确保任何路径下句柄都被释放
+            # （否则锁文件句柄只能等 GC，同一进程重复进入时可能累积）
+            self.fh.close()
+            self.fh = None
+            raise
+        if not locked:
             self.fh.close()
             self.fh = None
             raise SystemExit(f"已有任务在运行（锁文件 {self.path}），本次退出；确认没有任务在跑时可删除该文件后重试。")
@@ -235,13 +292,21 @@ def _try_lock(fh) -> bool:
 
 
 def _lock_oserror_result(exc: OSError) -> bool:
-    """busy → False；不支持 → True（不加锁继续）；其它 OSError 上抛。"""
+    """busy → False；文件系统不支持锁 → 默认 fail-closed 拒绝执行（除非显式
+    API2ODS_ALLOW_NO_LOCK=1 接受无互斥风险）；其它 OSError 上抛。"""
     code = exc.errno
     if code in _LOCK_BUSY:
         return False
     if code in _LOCK_UNSUPPORTED:
-        log(f"  警告：当前文件系统不支持运行锁（{exc}），本次不加锁继续；并发启动同一作业将无法互斥")
-        return True
+        if os.environ.get("API2ODS_ALLOW_NO_LOCK", "").strip() == "1":
+            log(f"  警告：文件系统不支持运行锁（{exc}）；API2ODS_ALLOW_NO_LOCK=1 已显式接受无互斥风险，本次不加锁继续")
+            return True
+        # fail-closed：无锁继续会让两个实例并发写同一作业/表（purge/rename 互拆、数据被
+        # 静默覆盖），宁可拒绝执行
+        raise SystemExit(
+            f"运行锁所在文件系统不支持加锁（{exc}）：拒绝无锁执行（并发实例会互相写坏数据）。"
+            f"请把锁目录放到本地磁盘，或确认无人并发时设置 API2ODS_ALLOW_NO_LOCK=1"
+        )
     raise exc
 
 
@@ -330,6 +395,9 @@ def check_header_values(headers: dict) -> None:
     更糟的是它属于"一个字节都没发出去"的确定性错误，被当成网络抖动退避能白等 20 多分钟。
     所以在这里提前拦下，报错只给头名、不回显值。
     """
+    if headers is not None and not isinstance(headers, dict):
+        # 写错成列表/字符串时 .items() 是裸 AttributeError；与其余配置错同口径给中文报错
+        raise ConfigError(f"request.headers 必须是对象（键值对），实际 {type(headers).__name__}")
     for name, value in (headers or {}).items():
         if isinstance(value, bytes):
             try:
@@ -386,8 +454,44 @@ _SENSITIVE_WORDS = {
     "appsecret",
 }
 _WORD_RE = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
-# 参数名做左边界限制（不用 \b：下划线在正则里算词字符，client_secret 会被漏掉）
-_QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})=([^&\s\"']+)")
+# 参数名做左边界限制（不用 \b：下划线在正则里算词字符，client_secret 会被漏掉）。
+# 分隔符同时认 = 与 :、且允许键后收尾引号与分隔符后空格（`{"password": 12345}` 这类
+# 不带引号的数字/布尔值只有这条能遮，JSON 规则只吃带引号的字符串值）
+_QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})(['\"]?)([:=])([ 	]*)([^&\s\"']+)")
+# 敏感键的值吃到行尾/`&`为止：`password=my secret` 原来只遮 "my"、"secret" 明文留下
+# （口令短语很常见）。负向先行断言只挡「引号后紧跟 ***」的已遮罩文本（避免把
+# `"secret_key": "***", "page": 2` 整行再吞一遍）；未闭合引号（password="abc 被日志
+# 截断）或「带引号的键」+ 不带引号的值（\"password\": my secret）必须走这条兜底——
+# 否则 KV/JSON 要收尾引号、常规 QUERY 的值类不吃引号，三套规则全绕过
+_QUERY_SPACE_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.\-]{1,64})(?P<q>[\"']?)(?P<sep>\s*[:=]\s*)(?!\s*[\"']?\s*\*\*\*)(?P<val>[^&\n]+)"
+)
+
+
+def _mask_spaced_values(text: str) -> str:
+    """敏感键 + 无引号值遮到行尾/`&`（口令短语含空格不被第一个词截断）。
+
+    用扫描器而不是一次 sub：非敏感键的贪婪值会吞掉其后的 k=v（sub 不重叠），
+    这里非敏感只前移到"值起点"继续扫，后续键照常处理。
+    """
+    parts: list[str] = []
+    pos = 0
+    while True:
+        match = _QUERY_SPACE_RE.search(text, pos)
+        if not match:
+            parts.append(text[pos:])
+            break
+        parts.append(text[pos : match.start()])
+        head = f"{match.group('key')}{match.group('q')}{match.group('sep')}"
+        if _is_sensitive_key(match.group("key")):
+            parts.append(head + "***")
+            pos = match.end()
+        else:
+            parts.append(head)
+            pos = match.start("val")
+    return "".join(parts)
+
+
 # 同时认单引号：异常里直接插值的 dict（f"{cfg}"）和 repr（{exc!r}）都是单引号形态，
 # 只认双引号会让含密钥的 KeyError/ValueError 消息把密钥原样带进日志。
 # 值用「回引号」收尾而不是 [^"']*：repr 对「值里含单引号」的串会改用双引号包裹
@@ -398,13 +502,20 @@ _QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})=([^&\s\"']
 # 里面能装 ~290 个反斜杠 ≈ 永不返回）。触发方是不受控的第三方接口（回一个 400、或 200 但
 # records_path 不匹配），且纯 Python 正则期间 Ctrl+C 也打断不了——必须在正则层面消掉歧义。
 _JSON_RE = re.compile(r"""(?i)(["']([^"']{1,64})["']\s*:\s*)(?P<q>["'])((?:\\.|(?!\\.)(?!(?P=q))[\s\S])*)(?P=q)""")
+# 键不带引号、值带引号（access_token='t-xxx' / app_secret: "xx"）：f-string 的 !r 插值与
+# repr 的输出正好是这种形态，而 _QUERY_RE 的值部分 [^&\s"']+ 不吃引号——行中出现的这类
+# 取值会整段漏遮（行首的由 _HEADER_RE 兜底，行中不会）。值体与 _JSON_RE 同款互斥分支，
+# 转义引号与「另一种引号出现在值里」（repr 会改用另一种引号包裹）都能认。
+_KV_QUOTED_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})(\s*[:=]\s*)(?P<q>[\"'])((?:\\.|(?!\\.)(?!(?P=q))[^\n])*)(?P=q)"
+)
 _BEARER_RE = re.compile(r"(?i)(\b(?:bearer)\s+)[A-Za-z0-9._~+/=-]{6,}")
 _BASIC_RE = re.compile(r"(?i)(authorization:\s*basic\s+)\S{8,}")
 # URL 里的 userinfo（https://user:pass@host）：代理/接口地址常把账号密码写在地址里，
 # requests 自己的 ProxyError 不带密码，但配置报错与 --check 概要会原样回显整条地址。
 # scheme 部分限长（{0,63}）：无上限时在长小写字母数字串上会在每个起始位置贪婪回扫
 # （实测 20KB 要 10 秒、40KB 要 50 秒），限长后整条规则保持线性
-_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]{0,63}://[^/\s:@]+):([^/\s@]+)@")
+_URL_AUTH_RE = re.compile(r"(?i)([a-z][a-z0-9+.\-]{0,63}://[^/\s:@]+):([^\s/]+)@")
 # 请求头行：'X-Api-Key: xxx' / 'X-Api-Key=xxx'（requests 抛错时带的 headers 是这种形态）。
 # 上一条 Authorization 规则只认 Basic/Bearer 两种值，其余自定义头名要靠这里兜。
 # 值要吃到行尾：只吃第一个词的话，"Authorization: Token abc…" 会变成 "*** abc…"
@@ -413,7 +524,10 @@ _HEADER_RE = re.compile(r"(?im)^(\s*([A-Za-z0-9_.\-]{1,64})\s*[:=]\s*)(.+)$")
 # 飞书 webhook 形态：open.feishu.cn/open-apis/bot/v2/hook/<id>；scheme 部分可选——
 # requests 的异常消息里只带 URL 的路径（"Max retries exceeded with url: /open-apis/..."），
 # 这时靠这个规则兜底，别让 hook id 明文进日志
-_WEBHOOK_RE = re.compile(r"(?i)((?:https?://[^\s\"']*?)?/hook/)[A-Za-z0-9\-_]{4,}")
+# 可选前缀限长（{0,1024}）：无上限的惰性展开在"超长且无空白、又没有 /hook/"的
+# 文本上会二次回溯（每个 https:// 起点都要扫到 token 末尾）；限长后保持线性。
+# 真实 webhook 的 URL 前缀远短于 1024 字符。
+_WEBHOOK_RE = re.compile(r"(?i)((?:https?://[^\s\"']{0,256}?)?/hook/)[A-Za-z0-9\-_]{4,}")
 
 
 def _is_sensitive_key(name) -> bool:
@@ -445,7 +559,14 @@ def _is_sensitive_key(name) -> bool:
     )
 
 
-def redact(text: str) -> str:
+# 脱敏递归的深度上限：正常文本（嵌套 JSON、值里再嵌 k=v）深度 ≤3，
+# 构造性文本（"a=b=c=…" 上千个等号）能把递归喂到 Python 上限（见 redact 的 _depth）。
+# 注意：每一层的 query 规则与头行规则会各递归一次，深度上限同时决定最坏调用量
+# （随深度指数增长），所以这个值要小——10 层已经远超正常文本所需。
+_MAX_REDACT_DEPTH = 10
+
+
+def redact(text: str, _depth: int = 0) -> str:
     """把文本里的密钥/签名/token 值替换成 ***，用于日志与异常信息。
 
     覆盖：URL query（?token=…）、请求体/配置片段（"secret_key": "…"）、
@@ -455,9 +576,16 @@ def redact(text: str) -> str:
     规则顺序按"认得出的形态"从严到宽：Bearer/Basic 与配置片段先处理——query 规则会
     按 `=` / `:` 把值截断，先跑它的话 `header: 'Authorization=Bearer abc123def'` 会被
     切成 `Authorization=`，后面的 Bearer 规则就再也匹配不到了（密钥原样留在日志里）。
+
+    _depth：内部递归深度，调用方不要传。各回调会把匹配到的值再交给 redact 递归处理
+    （嵌套 JSON、"值里还有 k=v 链"），正常文本深度 ≤3；构造性文本（如上千个等号的
+    `a=b=c=…`、第三方响应体里的任意内容）能把深度喂到 Python 递归上限，
+    把"脱敏"本身打成 RecursionError。到上限按"宁可多脱敏"整段遮掉。
     """
     if not text:
         return text
+    if _depth >= _MAX_REDACT_DEPTH:
+        return "***"
 
     def _bearer(match: re.Match) -> str:
         """Bearer / Basic 形态：scheme 保留，值换掉。"""
@@ -486,31 +614,44 @@ def redact(text: str) -> str:
             except ValueError:
                 decoded = None
             if decoded is not None:
-                redacted = redact(decoded)
+                redacted = redact(decoded, _depth + 1)
                 if redacted != decoded:
                     return f"{prefix}{quote}{json.dumps(redacted, ensure_ascii=False)[1:-1]}{quote}"
         # 键名不敏感时值里也可能藏着密钥（'X-Api-Key: xxx' 这种头行、查询串、
         # 嵌套的 {"auth": {"token": "…"}}），递归脱敏一次再放回去
-        return f"{prefix}{quote}{redact(value)}{quote}"
+        return f"{prefix}{quote}{redact(value, _depth + 1)}{quote}"
+
+    def _kv_quoted(match: re.Match) -> str:
+        """`key='value'` / `key: "value"`（键无引号、值有引号）：命中密钥词才遮值。"""
+        key, gap, qchar, value = (match.group(1), match.group(2), match.group(3), match.group(4))
+        head = f"{key}{gap}{qchar}"
+        if _is_sensitive_key(key):
+            return f"{head}***{qchar}"
+        # 键名不敏感时值里也可能藏着密钥（'note=access_token=abc'）：递归一次兜底
+        redacted = redact(value, _depth + 1)
+        if redacted != value:
+            return f"{head}{redacted}{qchar}"
+        return match.group(0)
 
     def _query(match: re.Match) -> str:
-        """URL 查询串里的 key=value：命中密钥词才替换值，其余原样返回。
+        """URL 查询串里的 key=value / "key": 12345：命中密钥词才替换值，其余原样返回。
 
         没命中的值再看两层：① 递归脱敏（值里可能嵌着 'Authorization=Bearer xxx'）；
         ② 值是 URL 编码的整串（target=https%3A%2F%2F…%3Ftoken%3Dx）时，编码后的
         'token%3D…' 任何规则都匹配不到——解码后能识别出密钥就整段遮掉（宁可多脱敏）。
         """
-        if _is_sensitive_key(match.group(1)):
-            return f"{match.group(1)}=***"
-        value = match.group(2)
+        key, quote, sep, gap, value = (match.group(1), match.group(2), match.group(3), match.group(4), match.group(5))
+        head = f"{key}{quote}{sep}{gap}"  # 原样保留引号/分隔符/空白，只换值
+        if _is_sensitive_key(key):
+            return f"{head}***"
         if "%" in value:
             try:
                 decoded = unquote(value)
             except Exception:  # noqa: BLE001 - 解码失败按原文处理
                 decoded = value
-            if decoded != value and redact(decoded) != decoded:
-                return f"{match.group(1)}=***"
-        return f"{match.group(1)}={redact(value)}"
+            if decoded != value and redact(decoded, _depth + 1) != decoded:
+                return f"{head}***"
+        return f"{head}{redact(value, _depth + 1)}"
 
     def _header(match: re.Match) -> str:
         """多行文本里的一行 "Header: value"：只吃头名命中密钥词 / 敏感头名的行。
@@ -520,7 +661,7 @@ def redact(text: str) -> str:
         header_name = match.group(2)
         if header_name.lower() in _SECRET_HEADER_KEYS or _is_sensitive_key(header_name):
             return f"{match.group(1)}***"
-        return f"{match.group(1)}{redact(match.group(3))}"
+        return f"{match.group(1)}{redact(match.group(3), _depth + 1)}"
 
     out = str(text)
     out = _BEARER_RE.sub(_bearer, out)
@@ -536,6 +677,9 @@ def redact(text: str) -> str:
     # JSON 片段规则至少要出现引号才可能匹配：没引号的长文本直接跳过，省一遍全量扫描
     if '"' in out or "'" in out:
         out = _JSON_RE.sub(_json, out)
+        out = _KV_QUOTED_RE.sub(_kv_quoted, out)
+    # 敏感键 + 无引号值先整体遮到行尾（password=my secret），再走常规 query 扫描
+    out = _mask_spaced_values(out)
     out = _QUERY_RE.sub(_query, out)
     # 头行规则放最后：它最宽松（只要求行首是 name: value），前面几条先处理过更精确的形态
     return _HEADER_RE.sub(_header, out)
@@ -691,17 +835,31 @@ def redact_secrets(values, text: str) -> str:
     """
     if not text:
         return text
+    if isinstance(values, str):
+        # 单个字符串会被 set() 拆成单字符（全部短于 _SECRET_MIN_LEN 被跳过）：
+        # 值级脱敏静默失效，凭证反而明文进日志；按"只有一个密钥"处理
+        values = [values]
     text = str(text)  # 与 redact 同样的宽容度：调用方直接传异常对象/数字也不会炸
-    for secret in sorted(set(values or ()), key=len, reverse=True):
+    # 非字符串的密钥值（数字等）先 str()：key=len 对 int 会抛 TypeError，
+    # 与"宽容度"的契约不符（直接调用方传 [123] 也该能脱敏）；None/bool 不是密钥
+    # （str 化后会把文本里的 "None"/"True" 误替成 ***），跳过
+    secrets = {str(v) for v in (values or ()) if v is not None and not isinstance(v, bool)}
+    for secret in sorted(secrets, key=len, reverse=True):
         # 短值（< _SECRET_MIN_LEN）连值级替换也要挡：否则 "SEC" 会把别的密钥切成
         # "***RET-…"——既没遮住，还把报错信息搅乱。值从 collect_secret_values 来时
         # 已经过滤过，这里再守一道是为了直接调用本函数的入口（防以后新调用方）。
         if len(secret) < _SECRET_MIN_LEN:
             continue
-        # 凭证可能以 URL 编码形态出现在自由文本里（如 t%2Dabc123... 对应 t-abc123...），
-        # 而自由文本没有可识别的键名，形态规则挡不住；只替明文会漏，编码后的凭证仍会
-        # 原样进日志。明文、quote、quote_plus 三种形态一起替换（长值优先的排序不变）。
-        for variant in (secret, quote(secret, safe=""), quote_plus(secret)):
+        # 凭证可能以 URL 编码形态出现在自由文本里（`+`/`/`/`=` 会被 quote 编码；
+        # 部分编码器更激进，连 `-` 这类字符也编码成 %2D），而自由文本没有可识别的
+        # 键名，形态规则挡不住；只替明文会漏。明文、quote、quote_plus 与"非字母数字
+        # 全编码"四种形态一起替换（长值优先的排序不变）。
+        # 按字节（不是 chr(b) 的 Latin-1 字符）判断：>=0x80 的字节在 Latin-1 里常恰好是
+        # "字母"（0xE5='å'），原样保留会让含中文的密钥生成错误的编码变体、漏遮
+        aggressive = "".join(
+            f"%{b:02X}" if not (b < 128 and chr(b).isalnum()) else chr(b) for b in secret.encode("utf-8")
+        )
+        for variant in (secret, quote(secret, safe=""), quote_plus(secret), aggressive):
             if variant:
                 text = text.replace(variant, "***")
     return redact(text)
@@ -712,33 +870,71 @@ def redact_secrets(values, text: str) -> str:
 # =============================================================================
 
 
+# requests 的「确定性」异常：请求根本没发出去（缺 scheme、URL/请求头非法），重试多少次
+# 都是同一结果。都是 ValueError 子类，直接加 ValueError 会把"响应体解析失败"这类
+# 可能重试成功的错误也卷进来，所以按类型点名；requests 未安装时为空
+try:  # pragma: no cover - requests 未安装的离线环境走空元组
+    from requests import exceptions as _requests_exceptions
+
+    DETERMINISTIC_HTTP_ERRORS: tuple[type[BaseException], ...] = tuple(
+        exc_type
+        for name in ("MissingSchema", "InvalidSchema", "InvalidURL", "InvalidHeader", "URLRequired")
+        if isinstance(exc_type := getattr(_requests_exceptions, name, None), type)
+    )
+except ImportError:  # pragma: no cover
+    DETERMINISTIC_HTTP_ERRORS = ()
+
+
 def retry_call(
-    fn, attempts: int = 5, base_delay: float = 15, desc: str = "", fatal=(FatalApiError,), max_delay: float = 300
+    fn,
+    attempts: int = 5,
+    base_delay: float = 15,
+    desc: str = "",
+    fatal=(FatalApiError,),
+    max_delay: float = 300,
+    secrets=(),
 ):
     """执行 fn，瞬时错误指数退避重试；FatalApiError 与调用方声明的不重试异常直接抛出。
 
     重试日志与最终异常都会做脱敏，避免把 URL 里的签名/token 打进日志。
+    secrets 给定时（如 collect_secret_values 的结果）：除了形态规则，再按配置里的密钥值
+    精确遮蔽——底层 SDK/Tunnel 把凭证写进自由文本报错时，形态规则盖不住（与 sftp2ods 同口径）。
     """
     if attempts < 1:
         # attempts<=0 时循环体一次都不执行，last_err 保持 None，最终报错会变成
         # "重试 -1 次仍失败：None"（丢失失败原因）——提前给一句明确的参数错误
         raise ValueError(f"retry_call 的 attempts 必须 >= 1，当前 {attempts}")
-    delay = base_delay
+    delay = min(base_delay, max_delay)  # 首次退避同样受 max_delay 约束
     last_err = None
     for attempt in range(1, attempts + 1):
         try:
             return fn()
         except fatal:
             raise
+        except (
+            TypeError,
+            AttributeError,
+            KeyError,
+            NameError,
+            ImportError,
+            *DETERMINISTIC_HTTP_ERRORS,
+        ) as exc:
+            # 确定性编程错误：重试多少次都是同一个结果，退避只会白等几分钟、
+            # 还把原始错误类型包成 RuntimeError 掩盖掉（与 sftp2ods 同口径）。
+            # DETERMINISTIC_HTTP_ERRORS：requests 的 MissingSchema/InvalidURL/InvalidHeader
+            # 等（都是 ValueError 子类）——请求根本没发出去，重试无意义
+            raise RuntimeError(
+                f"{desc} 出现确定性错误（不重试）：{type(exc).__name__}: {redact_secrets(secrets, str(exc))}"
+            ) from exc
         except Exception as exc:  # noqa: BLE001 - 网络/服务端类错误统一重试
             last_err = exc
             if attempt == attempts:
                 break
             # 分子/分母都按"总尝试次数"口径，避免写成 第 x/(n-1) 次 这种对不上的读法
-            log(f"  [{desc} 第 {attempt}/{attempts} 次尝试失败] {redact(str(exc))}；{delay:g}s 后重试")
+            log(f"  [{desc} 第 {attempt}/{attempts} 次尝试失败] {redact_secrets(secrets, str(exc))}；{delay:g}s 后重试")
             time.sleep(delay)
             delay = min(delay * 2, max_delay)
     # 报"重试 N-1 次"（成功那次之外又试了几次），和 http.py 的口径一致：
     # 写 attempts 会让人以为总共发了 attempts+1 个请求，对不上实际请求数；
     # from last_err 保住原始异常链（调用方按异常类型分流、看底层 SDK 栈都需要它）
-    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{redact(str(last_err))}") from last_err
+    raise RuntimeError(f"{desc} 重试 {attempts - 1} 次仍失败：{redact_secrets(secrets, str(last_err))}") from last_err

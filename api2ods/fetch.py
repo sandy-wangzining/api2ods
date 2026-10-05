@@ -13,8 +13,10 @@
 
 from __future__ import annotations
 
+import decimal
 import math
-import time
+import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date
@@ -26,6 +28,10 @@ from .dates import window_param_sets
 from .http import request_with_retry
 from .parsers import ensure_object_records, extract_json_records, get_path, parse_payload
 from .utils import ConfigError, FatalApiError, as_bool, check_header_values, collect_secret_values, log, redact_secrets
+
+# HTTP 方法按 RFC 7230 的 token 形态（字母数字与 !#$%&'*+-.^_`|~）：任意字符串原样写进
+# request.method 会把换行等拼进请求行，或者让 requests 报难以归类的底层错误
+_METHOD_RE = re.compile(r"\A[A-Za-z][A-Za-z0-9!#$%&'*+\-.^_`|~]{0,31}\Z")
 
 # 体检用 page_size=1 被拒时的判据：宁缺毋滥，命中不了的接口最多少回退一次。
 # 不收录光秃秃的 "limit"：报错说"时段超限/调用次数 limit"的接口会被误判成拒绝页大小，
@@ -64,7 +70,8 @@ def _as_number(value, fallback: float, field: str) -> float:
         return fallback
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError：JSON 里的超长整数字面量 float() 会溢出
         raise SystemExit(f"{field} 必须是数字，实际 {value!r}")
     # NaN / inf 过得了 float()，却会让后面的范围判断全部失效（NaN 跟谁比都是 False），
     # 于是"超限值"被当成合法配置一路带下去；这类值一律按写错处理
@@ -112,10 +119,20 @@ def _is_zero_count(value) -> bool:
         # NaN == 0 为 False，但 inf 也不能当"明确的 0 条"去收尾
         return False
     try:
-        return float(value) == 0
-    except (TypeError, ValueError, OverflowError):
-        # 超大整数转 float 会 OverflowError：不是 0，按"读不出来"处理
+        # Decimal 而不是 float：float("1e-400") 会下溢成 0.0，把"极小但非零"误判成
+        # "明确的 0 条"（接口写 0 才是零数据日的收尾信号，误判会少拉数据）
+        return decimal.Decimal(str(value).strip()) == 0
+    except (decimal.InvalidOperation, TypeError, ValueError):
+        # 解析不出来（超大整数/奇怪文本）：不是 0，按"读不出来"处理
         return False
+
+
+class UnconfirmedEndError(RuntimeError):
+    """翻页中途空页、且接口没给总页数/总条数：无法证明"确实翻完了"。
+
+    正常拉取（strict）按失败上报——宁可让调度看见，也别静默少数据；
+    体检（probe）只拉一页、对这类接口必然遇到，按"能连通、空结果"处理。
+    """
 
 
 def _unfinished_reason(current: int, total_pages, count: int, total_items) -> str | None:
@@ -166,10 +183,17 @@ class Fetcher:
         """
         request_cfg = job.get("request") or {}
         self.job = job
+        # 停止信号：某个单元致命失败（401/配置错）或 fetch_all 退出时置位，
+        # 其余在飞 worker 据此尽快收手（不再发新请求、不再空等退避 sleep）
+        self._stop = threading.Event()
         self.request_cfg = request_cfg
         self.parse_cfg = job.get("parse") or {}
         self.pagination = job.get("pagination") or {}
-        self.method = str(request_cfg.get("method") or "GET").upper()
+        self.method = str(request_cfg.get("method") or "GET").upper().strip()
+        if not _METHOD_RE.match(self.method):
+            # 任意字符串会原样写进 request.method：requests 报的是难以归类的底层错误，
+            # 还有把换行拼进请求行的空间；这里按 RFC 的 token 形态先挡住
+            raise SystemExit(f"request.method 不是合法的 HTTP 方法：{self.method!r}（如 GET / POST）")
 
         # 完整 URL = base_url + path（path 为空时直接用 base_url）
         base_url = str(request_cfg.get("base_url") or "").rstrip("/")
@@ -187,7 +211,14 @@ class Fetcher:
         self.response_type = str(request_cfg.get("response_type") or "json").lower()
         self.fail_if = request_cfg.get("fail_if") or []
         self.retry_times = int(_as_number(request_cfg.get("retry_times"), 5, "request.retry_times"))
+        if self.retry_times < 0:
+            # 负数会被 max(1, ...) 吞成 0 次重试（配置意图不明），与 timeout/retry_delay 同口径
+            raise SystemExit(f"request.retry_times 不能为负数，实际 {self.retry_times}")
         self.retry_delay = _as_number(request_cfg.get("retry_delay"), 15.0, "request.retry_delay")
+        if self.retry_delay < 0:
+            # 负值会在 time.sleep() 里抛裸 ValueError，被当成网络抖动静默重试，
+            # 掩盖真正的配置错（与上面的 timeout_seconds 校验同口径）
+            raise SystemExit(f"request.retry_delay 不能为负数（秒），实际 {self.retry_delay:g}")
         self.verify = as_bool(request_cfg.get("verify"), default=True, field="request.verify")
         self.proxies = request_cfg.get("proxies") or None
         self.records_path = str(request_cfg.get("records_path") or "")
@@ -248,7 +279,7 @@ class Fetcher:
         # 页码分页时把页大小压到 1：体检只需要"能连通、能解析"，拉一条就够。
         # 游标分页不动页大小——游标接口常从首页游标里推下一页，改 size 可能改变返回结构，
         # 而体检本来也只发一次请求，不需要靠 size 来限流
-        page_type = str(self.pagination.get("type") or "none").lower()
+        page_type = str(self.pagination.get("type") or "none").strip().lower()
         size_override = 1 if page_type == "page" else None
         try:
             records = self.fetch_unit(
@@ -261,9 +292,21 @@ class Fetcher:
                 raise
             log(f"  体检用 page_size=1 被接口拒绝（{self.redact(exc)}），改回配置的页大小重试一次")
             records = self.fetch_unit(unit, max_pages_override=1, stop_after_first_page=True)
+        except UnconfirmedEndError as exc:
+            # 体检只拉一页，对"接口不给总数"的源永远无法确证翻完——按"能连通、空结果"
+            # 处理，不能把这类好源判成体检失败（空数据日尤其常见）
+            log(f"  体检提示：单页体检无法确证翻完（{self.redact(exc)}），按“能连通、当日无数据”处理")
+            return unit.label, 0
         return unit.label, len(records)
 
     # ------------------------------------------------------------------ 单次
+
+    def _sleep(self, delay: float) -> bool:
+        """可中断等待：返回 True 表示等待期间收到了停止信号（其它单元已失败/中断）。
+
+        封装成方法也便于测试替换（单测不想真等 10s/20s 的整窗重试间隔）。
+        """
+        return self._stop.wait(delay)
 
     def _decorate(self, records: list) -> list:
         """给记录追加固定字段（add_fields）；API 已有同名键时保留 API 原值。"""
@@ -335,7 +378,7 @@ class Fetcher:
         if unit.params:
             params.update(unit.params)
 
-        page_type = str(self.pagination.get("type") or "none").lower()
+        page_type = str(self.pagination.get("type") or "none").strip().lower()
         if page_type == "none":
             payload = self._do_request(params, unit.label, expect_json=self.response_type != "bytes")
             records = parse_payload(
@@ -365,7 +408,12 @@ class Fetcher:
         - 任何模式：超过 max_pages 页主动中止（防死循环）。
         """
         page_cfg = self.pagination
-        page_type = str(page_cfg.get("type") or "none").lower()
+        page_type = str(page_cfg.get("type") or "none").strip().lower()
+        if page_type not in ("none", "page", "cursor"):
+            # 拼错（pages/offset）或尾随空格的值原来会落到下面的 else 分支、被当成 cursor：
+            # cursor_path 为空 → "取不到游标 = 翻完了"，只拉第一页还报成功。
+            # validate_job 会拦；库调用方没走校验时在这里兜一道（先 strip 再比）
+            raise ConfigError(f"pagination.type 不支持：{page_type!r}（可用 none / page / cursor）")
         page_param = str(page_cfg.get("page_param") or "page")
         # size_param 显式写 null = 不带页大小参数（游标接口不认 size 时用）；
         # 没写才用默认名 "size"
@@ -389,6 +437,13 @@ class Fetcher:
         total_items_path = str(page_cfg.get("total_items_path") or "")
         cursor_param = str(page_cfg.get("cursor_param") or "cursor")
         cursor_path = str(page_cfg.get("cursor_path") or "")
+        if page_type == "cursor" and not cursor_path:
+            # validate_job 会拦；库调用方没走校验时在这里兜一道：cursor_path 为空时
+            # get_path 取不到游标 → 被当成"翻完了"，只拉第一页还报成功（静默截断比报错危险）
+            raise ConfigError(
+                "pagination.type=cursor 需要 cursor_path（响应里下一页游标的字段路径），"
+                "否则第一页之后取不到游标会被当成已翻完、静默只拉第一页"
+            )
         cursor_start = page_cfg.get("cursor_start")
         delay = _as_number(page_cfg.get("delay_seconds"), 0.0, "pagination.delay_seconds")
         if delay < 0:
@@ -420,6 +475,13 @@ class Fetcher:
                 "请求里没有页大小，无法用「本页条数 < 页大小」判断末页（接口默认页大小比配置值小时，"
                 "第一页就会被误判成最后一页）。请改用 total_pages_path/total_items_path，"
                 "或恢复 size_param 并在接口文档确认页大小"
+            )
+        if stop_when_short and (page_cfg.get("total_pages_path") or page_cfg.get("total_items_path")):
+            # validate_job 会拦这一对；库调用方没走校验时在这里兜一道（与 cursor_path 同口径）：
+            # 短页判定会先 break，总数终点永远走不到——只拉第一页还"自洽"，静默截断比报错危险
+            raise ConfigError(
+                "pagination.stop_when_short 与 total_pages_path/total_items_path 互斥"
+                "（前者按“本页条数 < page_size”判断翻完，后者按接口给的总数判断，只能二选一）"
             )
 
         effective_page_size = int(_as_number(raw_page_size, 100, "pagination.page_size"))
@@ -518,7 +580,9 @@ class Fetcher:
                         break
                     message = f"{unit.label} 第 {current} 页返回为空，但{unfinished}，可能是接口抖动"
                     if strict:
-                        raise RuntimeError(message)
+                        # 专用类型：体检（probe）只拉一页、对"不给总数"的接口必然遇到这种
+                        # 情况，需要按"能连通、空结果"处理；正常拉取仍按失败上报
+                        raise UnconfirmedEndError(message)
                     # 非严格模式：接口给的终点不准时不该让整个调度永久失败，
                     # 但必须留痕——静默收尾正是"少拉数据却显示成功"的成因
                     log(f"  警告：{message}；pagination.strict=false，按已拉到的 {len(records)} 条收尾")
@@ -552,8 +616,12 @@ class Fetcher:
                 return records
             if stop_after_first_page:
                 return records
-            if delay > 0:
-                time.sleep(delay)
+            if self._stop.is_set():
+                # 其它单元已致命失败（或用户中断）：不再发新请求；raise 让本 worker 尽早
+                # 结束，异常由 future 承载（此时无人接收，无害）
+                raise FatalApiError(f"{unit.label}：其它单元已失败，停止翻页")
+            if delay > 0 and self._sleep(delay):
+                raise FatalApiError(f"{unit.label}：其它单元已失败，停止翻页")
         else:
             # 用 ConfigError（不可重试）而不是 RuntimeError：整窗重试会把同一份数据
             # 再翻满 max_pages 页（默认 2000 页）才失败，白白多打几千个请求
@@ -578,10 +646,13 @@ class Fetcher:
         - 返回 (每单元条数统计 [(label, 条数)], 失败明细 [(label, 错误)])；
         - 只要 failures 非空，调用方必须放弃写库（见 cli.run_sync）。
         """
+        self._stop.clear()  # 上一轮退出时置过位：新一轮用户/串行路径不能一进来就被它拦下
         units = self.build_units(days)
         try:
             attempts = max(1, 1 + int(window_retries or 0))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError：JSON 里 1e999 解析成 float('inf')，int(inf) 会溢出——
+            # 漏掉它这句"必须是整数"的配置错就变成裸 traceback
             raise SystemExit(f"pagination.window_retries 必须是整数，实际 {window_retries!r}")
         stats: list[tuple[str, int]] = []
         failures: list[tuple[str, str]] = []
@@ -596,6 +667,9 @@ class Fetcher:
             delay = 10
             last_err = None
             for attempt in range(1, attempts + 1):
+                if self._stop.is_set():
+                    # worker 还没起跑（或刚醒来）时其它单元已失败：直接收手，不发任何请求
+                    raise FatalApiError(f"{unit.label}：其它单元已失败，不再尝试")
                 try:
                     return unit.label, self.fetch_unit(unit)
                 except (FatalApiError, ConfigError):
@@ -605,7 +679,9 @@ class Fetcher:
                     if attempt == attempts:
                         break
                     log(f"  [{unit.label}] 第 {attempt}/{attempts - 1} 次失败：{self.redact(exc)}；{delay}s 后整窗重试")
-                    time.sleep(delay)
+                    # 可中断的退避：其它单元已致命失败时立刻收手，不再空等 10s/20s
+                    if self._sleep(delay):
+                        raise FatalApiError(f"{unit.label}：其它单元已失败，停止重试")
                     delay *= 2
             # 走得到这里的只有可重试的异常（FatalApiError / ConfigError 在循环里就抛了），
             # 统一按普通失败上报；消息要脱敏，重试日志里也不该出现密钥
@@ -624,20 +700,25 @@ class Fetcher:
 
         if workers <= 1 or len(units) <= 1:
             # 串行：顺序稳定，日志简单
-            for unit in units:
-                try:
-                    label, records = run_unit(unit)
-                    handle(label, records)
-                except (FatalApiError, ConfigError):
-                    # 同上：不接住就会被下面的 except Exception 吃掉，同一份配置下后面的单元
-                    # 必然同样失败，继续跑只是把错误重复几十遍（ConfigError 与 run_unit 里的
-                    # 放行口径一致：配置类错误与具体某天数据无关）
-                    raise
-                except Exception as exc:  # noqa: BLE001
-                    # 统一 redact：on_records（落盘）的报错里可能带着记录原文/密钥，
-                    # 它没走 run_unit 的脱敏包装，这是最后一道口
-                    failures.append((unit.label, self.redact(exc)))
-                    log(f"  ❌ {unit.label} 拉取失败：{self.redact(exc)}")
+            try:
+                for unit in units:
+                    try:
+                        label, records = run_unit(unit)
+                        handle(label, records)
+                    except (FatalApiError, ConfigError):
+                        # 同上：不接住就会被下面的 except Exception 吃掉，同一份配置下后面的单元
+                        # 必然同样失败，继续跑只是把错误重复几十遍（ConfigError 与 run_unit 里的
+                        # 放行口径一致：配置类错误与具体某天数据无关）
+                        raise
+                    except Exception as exc:  # noqa: BLE001
+                        # 统一 redact：on_records（落盘）的报错里可能带着记录原文/密钥，
+                        # 它没走 run_unit 的脱敏包装，这是最后一道口
+                        failures.append((unit.label, self.redact(exc)))
+                        log(f"  ❌ {unit.label} 拉取失败：{self.redact(exc)}")
+            finally:
+                # 与并发分支同口径：fetch_all 退出（成功/失败/中断）就置停止信号，
+                # 保持"方法结束即 _stop 已置位"的不变式；下一次 fetch_all 入口会 clear
+                self._stop.set()
         else:
             # 并发：只并发网络等待；回调在主线程的 as_completed 循环里，天然串行安全
             pool = ThreadPoolExecutor(max_workers=workers)
@@ -663,9 +744,13 @@ class Fetcher:
                         failures.append((unit.label, self.redact(exc)))
                         log(f"  ❌ {unit.label} 拉取失败：{self.redact(exc)}")
             finally:
+                # 置停止信号：本方法要退出了（成功/失败/中断都一样），在飞 worker 据此
+                # 不再发新请求、不再空等退避 sleep——否则它们会带着整窗重试继续打接口，
+                # 且 ThreadPoolExecutor 的非守护线程会让解释器退出/下一次用例启动时被拖住
+                self._stop.set()
                 # 不用 with：它的 __exit__ 是 shutdown(wait=True)，Ctrl+C 之后还要等
                 # 所有在飞的请求（可能正卡在 180s 超时或整窗重试的 sleep 里）跑完才退出。
-                # cancel_futures 取消没开始的，在飞的请求超时后会自己结束，进程不再被拖住
+                # cancel_futures 取消没开始的，在飞的请求收到停止信号后尽快结束，进程不再被拖住
                 pool.shutdown(wait=False, cancel_futures=True)
 
         return stats, failures
