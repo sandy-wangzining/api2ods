@@ -425,7 +425,6 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
                 return  # 配置的编码名写错：交给 decode() 报 ConfigError
             continue
         stripped = head.lstrip("\ufeff").lstrip()
-        trimmed = data.strip(b"\r\n\t ")
         if not stripped and len(data) > 4096:
             # 前 4KB 全是空白/BOM：极罕见，退回整包解码保持原语义
             try:
@@ -445,22 +444,20 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
                 texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())
             except LookupError:
                 continue
-        elif (
-            stripped
-            and len(data) <= _SNIFF_MAX_BYTES
-            and b"\n" not in trimmed
-            and not any(sep in trimmed for sep in (b",", b"\t", b";", b"|"))
-        ):
-            # 去掉首尾空白（含服务器补的尾随换行——nginx/框架很常见）后：单行、无列分隔符、
-            # 还有内容 → 疑似 JSON 标量错误体（"错误消息" / 500 / null）。
-            # 当 CSV 解析会静默产出 0 行（唯一"列名"就是错误消息本身）、调度按"零数据"收尾；
-            # 确属单行单列数据的源极少（该路径本来就按文件流配的），宁失败勿写错。
-            # 判断走 bytes（b"\n"/分隔符是 C 层扫描）且限体积：不制造整包解码副本
-            try:
-                texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())
-            except LookupError:
-                continue
-            scalar_candidate = True
+        elif stripped and len(data) <= _SNIFF_MAX_BYTES:
+            # 只对小包做 strip：bytes.strip 会新建等长副本，百 MB 的包不能无条件裁
+            trimmed = data.strip(b"\r\n\t ")
+            if b"\n" not in trimmed and not any(sep in trimmed for sep in (b",", b"\t", b";", b"|")):
+                # 去掉首尾空白（含服务器补的尾随换行——nginx/框架很常见）后：单行、无列分隔符、
+                # 还有内容 → 疑似 JSON 标量错误体（"错误消息" / 500 / null）。
+                # 当 CSV 解析会静默产出 0 行（唯一"列名"就是错误消息本身）、调度按"零数据"收尾；
+                # 确属单行单列数据的源极少（该路径本来就按文件流配的），宁失败勿写错。
+                # 判断走 bytes（b"\n"/分隔符是 C 层扫描）且限体积：不制造整包解码副本
+                try:
+                    texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())
+                except LookupError:
+                    continue
+                scalar_candidate = True
     if not texts:
         return
     fmt = str(parse_cfg.get("format") or "").lower()
