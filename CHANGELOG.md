@@ -6,6 +6,11 @@
 
 ### 修复
 
+- **日志写入不再持有全局锁（可靠性）**：log() 原来在模块级锁内执行 stdout 与 --log-file
+  的 write/flush——慢速目标（管道被压满、NFS/满盘上的日志盘）会把其它线程的 log_once /
+  add_log_sink / remove_log_sink 一起卡死，整个进程表现为停滞；现在锁内只做 sink 快照，
+  写入全部在锁外（写失败摘除仍在锁内，且不覆盖并发新加进来的 sink）。
+
 - **并发停止信号改为每轮新对象（正确性）**：原实现（`clear()` 复用同一个 Event）会把上一轮
   `shutdown(wait=False)` 遗留的在飞 worker 的停止位复位——它们醒来后继续发请求、把数据写进
   上一轮已提交的 spool；现在每轮换新 event 并按轮注入（run_unit / fetch_unit / _fetch_pages

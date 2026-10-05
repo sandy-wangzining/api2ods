@@ -4095,6 +4095,28 @@ class TestLogging(OfflineTestCase):
             utils._sinks.remove(handle)
         self.assertIn("写一份到文件", handle.getvalue())
 
+    def test_log_sink_write_happens_outside_lock(self):
+        """慢 sink（NFS/满盘）只该拖慢这条日志，不该占住全局锁卡死其它线程。"""
+        seen = {}
+
+        class Probe:
+            def write(self, *_a):
+                seen["locked"] = utils._lock.locked()
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        probe = Probe()
+        utils.add_log_sink(probe)
+        try:
+            utils.log("hello")
+        finally:
+            utils.remove_log_sink(probe)
+        self.assertIs(seen["locked"], False)
+
     def test_remove_log_sink_detaches_and_closes(self):
         """句柄要同时完成两件事：不再接收日志 + 关闭文件（否则日志会一直占着句柄）。"""
         handle = io.StringIO()
