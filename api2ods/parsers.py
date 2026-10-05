@@ -444,6 +444,20 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
             # 宽表单行 >4KB 的 JSONL 会被误判成单行 JSON、照样整包解码（b"\n" in data 是
             # C 层线性扫描，不产生副本）
             if len(data) > _SNIFF_MAX_BYTES and b"\n" in data:
+                # 大且多行（如 pretty-printed 的大 JSON/错误体）：为内存不解码整包——
+                # 但"以 }/] 收尾"的错误体特征仍要拦（与小包同口径；只取尾部小样本，
+                # jsonl 格式不适用）。不拦会把 JSON 当 CSV 解析成垃圾记录写进 ODS
+                if str(parse_cfg.get("format") or "").lower() != "jsonl":
+                    tail = data[-4096:]
+                    try:
+                        tail_text = tail.decode(name, "replace").lstrip("﻿").rstrip()
+                    except LookupError:
+                        continue
+                    if tail_text[-1:] in ("}", "]"):
+                        raise RuntimeError(
+                            f"{label} {where}期望文件流，但响应像一个无法解析的 JSON"
+                            f"（大响应按尾部采样判定：以 }} / ] 收尾）：{tail_text[-120:]!r}"
+                        )
                 continue
             try:
                 texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())
@@ -476,6 +490,11 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
         parsed = True
         break
     if not parsed:
+        if scalar_candidate:
+            # 单行、无列分隔符、又解不出来：纯文本错误体（"503 Service Unavailable" 这类，
+            # 注释里举的"错误消息"正是此形态）。当 CSV 解析会静默产出 0 行（唯一"列名"
+            # 就是错误消息本身）——直接拦下；能解析成 JSON 标量的在下面 parsed 分支拦
+            raise RuntimeError(f"{label} {where}期望文件流，但响应是单行文本（疑似纯文本错误体）：{texts[0][:200]!r}")
         # 解不出来又以 }/] 收尾：大概率是含 NaN/被截断的 JSON 错误体。
         # 尾字符判断用解码后的文本：utf-16 的 } 不是单字节 0x7d。
         # jsonl 不走这一支：多行 JSONL 本来就不是一个 JSON 值，整包解不出来是正常的

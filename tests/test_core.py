@@ -1040,14 +1040,16 @@ class TestParsers(OfflineTestCase):
         wide = '{"a": "' + "x" * 300 + '"}\n'
         data = (wide * 3).rstrip("\n").encode()  # 以 } 收尾：旧实现会按"截断的 JSON"报错
         with mock.patch.object(parsers, "_SNIFF_MAX_BYTES", 100):
-            self.assertIsNone(parsers._reject_json_error_body(data, {"format": "csv"}, "t"))
+            # jsonl 格式不做整包解码、也不做尾部采样（本来就是逐行 JSON）
+            self.assertIsNone(parsers._reject_json_error_body(data, {"format": "jsonl"}, "t"))
 
     def test_big_multiline_response_not_whole_decoded(self):
         """超过嗅探阈值、开头 4KB 就有换行的内容不再整包解码（百 MB 级 JSONL 不该为看首字符
         付整包 str 的内存）：表现为不走"整包是一个 JSON 值"的判定。"""
         data = b'{"code": 500}\n{"x": 1}'
         with mock.patch.object(parsers, "_SNIFF_MAX_BYTES", 4):
-            self.assertIsNone(parsers._reject_json_error_body(data, {"format": "csv"}, "t"))
+            # jsonl 格式不做整包解码、也不做尾部采样（本来就是逐行 JSON）
+            self.assertIsNone(parsers._reject_json_error_body(data, {"format": "jsonl"}, "t"))
 
     def _zip_bytes(self) -> bytes:
         buffer = io.BytesIO()
@@ -1169,15 +1171,14 @@ class TestParsers(OfflineTestCase):
 
     def test_csv_skip_until_not_found_with_content_raises(self):
         """有内容却找不到明细段 = 结构变了/拿到错误页，必须报错（否则静默少拉一天）。"""
+        NL = bytes([10])
         with self.assertRaises(RuntimeError) as ctx:
             parsers.parse_bytes(
-                b"<html><body>502 Bad Gateway</body></html>",
+                b"left,right" + NL + b"1,2" + NL,
                 {"format": "csv", "skip_until": "Settlement Date"},
                 "settlement",
             )
-        message = str(ctx.exception)
-        self.assertIn("Settlement Date", message)
-        self.assertIn("502 Bad Gateway", message)
+        self.assertIn("Settlement Date", str(ctx.exception))
 
     def test_csv_unterminated_quote_raises(self):
         """引号未闭合时 csv 会把后续行吞进同一个字段，行数照常>0——必须报错。"""
@@ -6166,6 +6167,23 @@ class TestParserErrorBranches(OfflineTestCase):
         """数组里的空对象（Items: [{}]）与 Items: {} 同义：归一成空列表，不写全 NULL 假记录。"""
         self.assertEqual(parsers.ensure_object_records([{}], "单次请求"), [])
         self.assertEqual(parsers.ensure_object_records([{"a": 1}, {}], "单次请求"), [{"a": 1}])
+
+    def test_plain_text_error_body_rejected_on_csv_path(self):
+        """单行纯文本错误体（非 JSON，如 503 Service Unavailable）：同样拦下
+        （当 CSV 会静默产出 0 行、调度按零数据收尾）。"""
+        with self.assertRaises(RuntimeError) as ctx:
+            parsers.parse_bytes(b"503 Service Unavailable", {"format": "csv"}, "结算")
+        self.assertIn("单行文本", str(ctx.exception))
+
+    def test_large_multiline_json_rejected_by_tail_probe(self):
+        """大且多行的 JSON（pretty-printed）：不整包解码，但按尾部采样照样拦下
+        （不拦会把 JSON 当 CSV 解析成垃圾记录写进 ODS）。"""
+        NL = bytes([10])
+        big = NL.join([b"{"] + [b'  "k": 1,'] * 260000 + [b"}"])  # >1MB
+        self.assertGreater(len(big), 1024 * 1024)
+        with self.assertRaises(RuntimeError) as ctx:
+            parsers.parse_bytes(big, {"format": "csv"}, "结算")
+        self.assertIn("尾部采样", str(ctx.exception))
 
     def test_scalar_error_body_rejected_on_csv_path(self):
         """HTTP 200 + JSON 标量错误体（"rate limit exceeded" / 500 / null）：当 CSV 会静默
