@@ -38,7 +38,7 @@ def onerway_sign(ctx: dict) -> dict:
     # 但 str() 只对"发送出去时也长这样"的标量成立：列表会被 requests 按 doseq 展开成
     # ids=1&ids=2、对象走 JSON 时是 {"a":1}——签名串必须与框架实际发出的形态一致，否则
     # 服务端重算的摘要必然对不上（恒定 401）。非标量参数先在这里显式拒绝，提示规范化
-    non_scalar = [k for k in keys if isinstance(params[k], (list, dict, tuple, set))]
+    non_scalar = [k for k in keys if isinstance(params[k], (list, dict, tuple, set, bytes, bytearray))]
     if non_scalar:
         raise ValueError(
             f"签名串无法可靠推导非标量参数 {non_scalar!r} 的发送形态（列表会被展开、对象走 JSON）；"

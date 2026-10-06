@@ -231,7 +231,12 @@ class Fetcher:
         self.base_params = dict(request_cfg.get("params") or {})
         self.base_headers = {str(k): str(v) for k, v in (request_cfg.get("headers") or {}).items()}
         # params_in=headers：请求参数（含窗口参数）最终放进请求头而不是 URL（Onerway 结算文件接口）
-        self.params_in = str(request_cfg.get("params_in") or "query").lower()
+        params_in_raw = str(request_cfg.get("params_in") or "query").strip().lower()
+        if params_in_raw not in ("query", "headers"):
+            # 拼错（"header"）会静默退回 query：签名/密钥参数进 URL 明文、签名位置也错，
+            # 排查只能靠对比抓包——配置错要在这里报出来
+            raise ConfigError(f"request.params_in 只支持 query / headers，实际 {request_cfg.get('params_in')!r}")
+        self.params_in = params_in_raw
         self.auth = AuthApplier(request_cfg, job_dir)
         self._job_dir = job_dir
         # 值级脱敏的输入：接口把凭证写进自由文本报错时，形态规则（redact）盖不住，
@@ -679,11 +684,16 @@ class Fetcher:
         self._stop = stop
         units = self.build_units(days)
         try:
-            attempts = max(1, 1 + int(window_retries or 0))
+            retries_value = float(window_retries or 0)
         except (TypeError, ValueError, OverflowError):
-            # OverflowError：JSON 里 1e999 解析成 float('inf')，int(inf) 会溢出——
-            # 漏掉它这句"必须是整数"的配置错就变成裸 traceback
+            # OverflowError：JSON 里 1e999 解析成 float('inf')，float(inf) 本身不抛，
+            # 但后面 int() 会——这里统一先转 float 再逐项校验
             raise SystemExit(f"pagination.window_retries 必须是整数，实际 {window_retries!r}")
+        if not math.isfinite(retries_value) or retries_value != int(retries_value) or retries_value < 0:
+            # int() 截断会把 2.5 变成 2（静默改变行为）、-3 被 max(1,…) 吞成"没配重试"：
+            # 与 request.retry_times 同口径，先按原值校验只接受非负整数
+            raise SystemExit(f"pagination.window_retries 必须是非负整数，实际 {window_retries!r}")
+        attempts = max(1, 1 + int(retries_value))
         stats: list[tuple[str, int]] = []
         failures: list[tuple[str, str]] = []
 

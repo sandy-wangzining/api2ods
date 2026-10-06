@@ -2508,11 +2508,25 @@ class TestFetcher(OfflineTestCase):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
-        with self.assertRaises(ValueError) as err:
-            module.onerway_sign({"params": {"ids": [1, 2]}, "request": {"secret_key": "s"}})
-        self.assertIn("非标量", str(err.exception))
+        for bad_params in ({"ids": [1, 2]}, {"raw": b"x"}):
+            with self.assertRaises(ValueError) as err:
+                module.onerway_sign({"params": bad_params, "request": {"secret_key": "s"}})
+            self.assertIn("非标量", str(err.exception))
         ok = module.onerway_sign({"params": {"a": "1", "b": 2}, "request": {"secret_key": "s"}})
         self.assertIn("sign", ok["params"])
+
+    def test_window_retries_fractional_or_negative_rejected(self):
+        """window_retries 先校验再取整：2.5/-1 不能被 int() 截断/被 max(1,…) 吞掉。"""
+        for bad in (2.5, -1, float("inf")):
+            with self.assertRaises(SystemExit) as ctx:
+                self._fetcher(minimal_job()).fetch_all([date(2026, 9, 18)], window_retries=bad)
+            self.assertIn("window_retries", str(ctx.exception))
+
+    def test_params_in_typo_is_config_error(self):
+        """params_in 拼错（header）不能静默退回 query（签名/密钥参数进 URL 明文）。"""
+        with self.assertRaises(SystemExit) as ctx:
+            self._fetcher(minimal_job(request={"params_in": "header"}))
+        self.assertIn("params_in", str(ctx.exception))
 
     def test_retry_times_fractional_or_negative_rejected(self):
         """retry_times 先校验再取整：-0.5/2.5 不能被 int() 截断后绕过校验。"""
