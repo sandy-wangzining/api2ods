@@ -6,6 +6,9 @@
 
 ### 修复
 
+- **`--log-file` 展开 `~`（可用性）**：参数写成 `"~/logs/x.log"`（带引号时 shell 不展开）
+  时，字面量 `~` 会在 CWD 下建目录、日志落错位置；现在先 expanduser 再打开。
+
 - **低危分歧项处置（正确性）**：`window_retries` 先校验再取整（2.5/-1 不再被截断或被
   `max(1,…)` 吞掉）；`params_in` 只认 query/headers（拼错不再静默退回 query 把签名参数
   送进 URL）；签名示例的非标量守卫补 `bytes`/`bytearray`。
