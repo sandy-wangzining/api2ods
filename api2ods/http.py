@@ -117,7 +117,17 @@ def _decode_json_body(response, json_encoding: str | None) -> str:
                 f"request.json_encoding 不能是 {json_encoding!r}：它能把任何字节序列解成乱码"
                 f'而不报错；源是 GBK 之类请写具体编码（如 "gbk"），是 UTF-8 就删掉这一项'
             )
-        candidates.append(str(json_encoding))
+        # 编码名先单独校验：拼错了（如 "gbk " / "utf8sig"）原来会抛 LookupError 被候选循环
+        # 静默跳过——显式配置被悄悄忽略，最后按 UTF-8 解出乱码或报"都解不出来"，指不清方向
+        encoding_name = str(json_encoding).strip()
+        try:
+            codecs.lookup(encoding_name)
+        except LookupError:
+            raise ConfigError(
+                f"request.json_encoding 不是有效的编码名：{json_encoding!r}；"
+                f"常见取值：utf-8 / utf-8-sig / gbk / gb18030 / utf-16"
+            ) from None
+        candidates.append(encoding_name)
     # utf-8-sig：有些源会在 JSON 最前面带 BOM，按 utf-8 解出来是 "﻿{"，
     # loads_json 会一直解析失败并重试到耗尽
     candidates.append("utf-8-sig")
@@ -239,15 +249,22 @@ def request_once(
         # 不跟随重定向（见上面的说明）：把 Location 报出来让用户直接改成最终地址。
         # 这里抛 ConfigError（确定性错误、不重试），别让它掉进"网络抖动"的退避里
         location = redact(str(response.headers.get("Location") or ""))
+        response.close()
         raise ConfigError(
             f"接口返回重定向 HTTP {status}（Location: {location}）：本工具不跟随重定向——"
             f"301/302/303 会把 POST 降级成不带 body 的 GET（窗口参数全丢），"
             f"自定义鉴权头也可能被转发到别的地址。请把 request.base_url 改成最终地址"
         )
     if status == 429 or 500 <= status < 600:
-        raise RetryLater(_retry_after_seconds(response), f"HTTP {status}")
+        # 重试前先关掉响应：不消费响应体的话连接不会归还连接池，
+        # 重试次数多时会占着连接（响应体只在 retry 场景才需要读 Retry-After 头）
+        retry_after = _retry_after_seconds(response)
+        response.close()
+        raise RetryLater(retry_after, f"HTTP {status}")
     if 400 <= status < 500:
-        raise FatalApiError(f"HTTP {status}：{redact(response.text[:300])}")
+        detail = redact(response.text[:300])
+        response.close()
+        raise FatalApiError(f"HTTP {status}：{detail}")
     response.raise_for_status()
 
     if not expect_json:
@@ -260,23 +277,37 @@ def request_once(
         raise RuntimeError(f"接口返回不是 JSON 或含非法数值（{exc}）：{redact(text[:300])}")
 
 
+# float 能精确表示的最大整数：再大的整数转 float 会折叠（19 位订单号/纳秒时间戳
+# 会与相邻值压成同一个浮点数），equals 漏判、not_equals 误杀
+_SAFE_INT = 2**53
+
+
 def _normalize_compare(value):
     """fail_if 比较用：布尔转 'true'/'false'；数字统一按 float，数字样字符串也按 float。
 
     原实现把数字 str() 后比：接口返回 0.0（浮点序列化）与配置 0 会判成"不相等"——
     equals 方向漏判（把业务错误当成功继续写库）、not_equals 方向误杀；
     反过来 str(2e2)="200.0" 与 "200" 也对不上。统一按数值比后这些形态一致。
+
+    超过 2^53 的整数保持精确值不折叠（见 _SAFE_INT）；字符串路径同理。
     """
     if isinstance(value, bool):
         return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return float(value)
+    if isinstance(value, int):
+        return float(value) if abs(value) <= _SAFE_INT else value
+    if isinstance(value, float):
+        return value
     if isinstance(value, str):
+        text = value.strip()
         try:
-            number = float(value.strip())
+            number = int(text)
         except ValueError:
-            return value
-        return number if math.isfinite(number) else value
+            try:
+                number = float(text)
+            except ValueError:
+                return value
+            return number if math.isfinite(number) else value
+        return float(number) if abs(number) <= _SAFE_INT else number
     return value
 
 
@@ -296,7 +327,9 @@ def check_fail_if(payload, fail_if: list | None) -> None:
         )
         if not bad:
             continue
-        message = f"接口返回业务错误：{cond['path']}={value!r}"
+        # cond.get 而不是下标：validate_job 要求 fail_if 每项带 path，但库调用方可能没走校验，
+        # 命中条件时抛裸 KeyError 看不出是配置问题（上一行取值就是 .get 容错）
+        message = f"接口返回业务错误：{cond.get('path', '')}={value!r}"
         if cond.get("message_path"):
             message += f"，{cond['message_path']}={get_path(payload, cond['message_path'], default=None)!r}"
         if cond.get("retry"):
@@ -347,6 +380,12 @@ def request_with_retry(
     mask = redactor or redact
     delay = retry_delay
     last_err = None
+    # AttributeError/TypeError/KeyError 是配置或代码缺陷，重试只会白等。
+    # 可重试：网络/超时（RequestException 及其子类）、以及 request_once 把解析失败
+    # 包装成的 RuntimeError（截断 JSON / 网关 HTML 页，契约上允许重拉）。
+    retryable: tuple[type[BaseException], ...] = (TimeoutError, ConnectionError, OSError, RuntimeError)
+    if requests is not None:
+        retryable = (requests.exceptions.RequestException, TimeoutError, OSError, RuntimeError)
     for attempt in range(1, attempts + 1):
         try:
             params, headers = build_request()
@@ -357,19 +396,18 @@ def request_with_retry(
             return payload
         except (FatalApiError, ConfigError):
             # 鉴权/配置类错误：重试不会变好，快速失败让调度看到真实原因。
-            # 注意别在这里捕 OSError：requests 的 ConnectionError / Timeout / SSLError
-            # 都是 OSError 子类，捕了会把连接抖动的请求级重试整个误杀
+            # FatalApiError 是 RuntimeError 子类，必须写在 retryable 前面。
             raise
         except RetryLater as exc:
             last_err = exc
             if attempt >= attempts:
                 break
-            wait = exc.seconds if exc.seconds else delay
+            wait = delay if exc.seconds is None else exc.seconds
             # 业务错误（fail_if）的文案可能带接口返回的原文，一样过脱敏
             log(f"  [{desc}] {mask(str(exc))}（第 {attempt}/{attempts - 1} 次），{wait:g}s 后重试")
             time.sleep(wait)
             delay = min(delay * 2, 300)
-        except Exception as exc:  # noqa: BLE001 - 网络/解析类错误统一重试
+        except retryable as exc:
             last_err = exc
             if attempt >= attempts:
                 break

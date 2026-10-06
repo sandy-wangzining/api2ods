@@ -16,7 +16,7 @@ _PATH_TOKEN_RE = re.compile(r"^([^\[\]]*)((?:\[\d+\])*)$")
 _INDEX_RE = re.compile(r"\[(\d+)\]")
 
 # 行边界只认 \r\n / \r / \n（与 csv / JSONL 的行定义一致）。不用 str.splitlines()：
-# 它还会在 \x0b \x0c \x1c \x1d \x1e \x85     处分行——报表导出里的分页符
+# 它还会在 \x0b \x0c \x1c \x1d \x1e \x85 U+2028/U+2029 处分行——报表导出里的分页符
 # \x0c 会让 skip_rows 与 csv.reader 的"第几行"错位（表头错位、列名全错还照样成功），
 # JSON 字符串里的 U+2028（合法字符，工具自己 dump 的记录就可能有）会被劈成两半
 _LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n|$)")
@@ -37,8 +37,23 @@ def _split_lines(text: str, keepends: bool = False) -> list[str]:
 _CSV_FIELD_LIMIT = 7_000_000
 try:
     csv.field_size_limit(_CSV_FIELD_LIMIT)
-except OverflowError:  # pragma: no cover - 32 位平台上 C long 装不下
-    csv.field_size_limit(10**7)
+except OverflowError:  # pragma: no cover - 平台 C long 装不下主值
+    # 退回系统默认上限（128KB）：原来的"降级值" 10**7 比刚刚被拒的主值还大，
+    # 必然在同一个 except 里再抛一次——模块 import 阶段直接崩且没有兜底
+    csv.field_size_limit()
+
+# ZIP 单个条目解压后的上限：条目整条进内存，超高压缩比/异常大条目会把进程打爆。
+# 256MB 对结算文件（几十 MB 量级）留足余量，又能在内存出事前报出可读的错误
+MAX_ZIP_ENTRY_BYTES = 256 * 1024 * 1024
+# 多条目解压后的累计上限：单条目各 200MB 的"多条目炸弹"能绕过单条目上限，
+# 循环里逐条解压 + records 全在内存里累积，总解压量可到几十 GB
+MAX_ZIP_TOTAL_BYTES = 1024 * 1024 * 1024
+# 错误体嗅探的整包解码上限：错误体通常很小；超过这个大小、且开头 4KB 里已经有换行
+# （多行 JSONL 的典型形态）时不再把整包解码成 str——百 MB 级 JSONL 每行都以 { 开头，
+# 逐编码候选各解一份会让峰值内存翻几倍（见 _reject_json_error_body）
+_SNIFF_MAX_BYTES = 1_000_000
+# 常见二进制魔数：文本嗅探必须放过它们（小 ZIP 的字节里恰好没有换行/分隔符时不能被当成单行文本）
+_BINARY_MAGICS = (b"PK", b"\x1f\x8b", b"%PDF", b"\x89PNG", b"\xd0\xcf\x11\xe0")
 
 
 def _as_int(value, fallback: int, field: str) -> int:
@@ -49,6 +64,14 @@ def _as_int(value, fallback: int, field: str) -> int:
     """
     if value is None or value == "":
         return fallback
+    if isinstance(value, bool):
+        # int(True)=1：skip_rows: true 这类布尔笔误会被静默当成 1、切掉真表头，
+        # 整窗数据以"成功"状态写错键名——与 float 分支同口径拒绝
+        raise ConfigError(f"{field} 必须是整数，实际 {value!r}")
+    if isinstance(value, float) and not value.is_integer():
+        # 2.9 静默截断成 2 会让 skip_rows 少跳/多跳一行、表头整体错位；
+        # NaN/Infinity 的 is_integer() 同样是 False，一并挡掉
+        raise ConfigError(f"{field} 必须是整数，实际 {value!r}")
     try:
         return int(value)
     except (TypeError, ValueError):
@@ -145,6 +168,7 @@ def ensure_object_records(records, label: str) -> list[dict]:
         records = [records]
     if not isinstance(records, list):
         raise RuntimeError(f"{label} records_path 指向的不是数组/对象：{type(records).__name__}")
+    cleaned: list[dict] = []
     for index, item in enumerate(records):
         if not isinstance(item, dict):
             snippet = json.dumps(item, ensure_ascii=False)[:120] if not isinstance(item, str) else item[:120]
@@ -152,7 +176,12 @@ def ensure_object_records(records, label: str) -> list[dict]:
                 f"{label} records_path 指向的数组第 {index} 个元素不是对象"
                 f"（是 {type(item).__name__}：{snippet!r}）；这种记录写进 ODS 后下游取不到任何字段"
             )
-    return records
+        if not item:
+            # 数组里的空对象（Items: [{}]）与"Items: {}"同义：接口用它表示"这次没有数据"。
+            # 放行会写一条全 NULL 的假记录，分页时还会让"零数据日"豁免失效、一路空翻到 max_pages
+            continue
+        cleaned.append(item)
+    return cleaned
 
 
 def extract_json_records(payload, request_cfg: dict, label: str, missing_ok: bool = False) -> list:
@@ -198,25 +227,27 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
 
     if skip_rows:
         before = text
-        text = "".join(_split_lines(text, keepends=True)[skip_rows:])
+        before_lines = _split_lines(text, keepends=True)
+        text = "".join(before_lines[skip_rows:])
         if before.strip() and not text.strip():
             # 文件本来有内容，被 skip_rows 一行不剩地跳空了：要么 skip_rows 配大了，
             # 要么源文件结构缩水（比如错误页只有两行）。空结果是静默的，得留个痕
             log(
                 f"  警告：{label or '文件'} 按 skip_rows={skip_rows} 跳过之后没有任何内容"
-                f"（原文件 {len(_split_lines(before))} 行）；请核对 parse.skip_rows 与文件结构"
+                f"（原文件 {len(before_lines)} 行）；请核对 parse.skip_rows 与文件结构"
             )
     if skip_until and not text.strip():
         # 配置了两个跳过项、且 skip_rows 正好把内容全跳空了：按空结果处理。
         # 这条要放在冲突检测前面——"文件里有内容"这个前提不成立时，
         # 报"两者冲突"会把方向指错（那是文件本身就是空的/只有前置段）
         return []
-    if skip_until and skip_rows and skip_until not in text:
-        # 标记行本身就在被 skip_rows 跳掉的前几行里时，删完才去找必然找不到，
-        # 而报错文案会指向"文件结构变了"这个错误方向。这里把两种配置的冲突说清楚
+    if skip_until and skip_rows and skip_until not in text and skip_until in before:
+        # 只有"标记确实落在被跳掉的前几行里"才判定为配置冲突（删完必然找不到）。
+        # 原文里根本没有标记 = 结构变了/错误页，要落到下面的 RuntimeError 触发整窗
+        # 重试（可恢复的上游抖动不能被当成"重试无意义"的配置错）
         raise ConfigError(
             f"parse.skip_until={skip_until!r} 在跳过前 {skip_rows} 行之后找不到了："
-            f"标记行可能就在被跳过的那几行里，skip_rows 与 skip_until 不要同时配"
+            f"标记行就在被跳过的前 {skip_rows} 行里，skip_rows 与 skip_until 不要同时配"
         )
     if skip_until:
         # 报表类文件常有前置说明/汇总段：从"包含标记的那一行"开始解析（该行即表头）。
@@ -270,22 +301,43 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
             return []
         try:
             for line_no, row in enumerate(reader, start=2):
-                if all(v is None or str(v).strip() == "" for v in row.values()) and len(fieldnames) > 1:
-                    # 全空白行：多列文件里是排版垃圾，跳过；单列文件里它更像"值为空"的
-                    # 一条记录，保留下来（下游自己判空）。
+                # 先把多出的列（restkey=None 里的列表）取出来再判空行：留着它一起做"全空白"
+                # 判断，",,,," 这类末尾填充行会被判成非空、硬报"列数多于表头"
+                extra = row.pop(None, None)
+                blank_row = all(v is None or str(v).strip() == "" for v in row.values())
+                extra_has_content = extra is not None and any(v is not None and str(v).strip() for v in extra)
+                if blank_row and not extra_has_content and len(fieldnames) > 1:
+                    # 全空白行（含末尾填充行）：多列文件里是排版垃圾，跳过；单列文件里它更像
+                    # "值为空"的一条记录，保留下来（下游自己判空）。
                     # 注意：真正一个字符都没有的行 csv 模块在迭代时就吞掉了，
                     # 到不了这里——所以"单列文件的空行能作为空值记录保留"只对
                     # "有分隔符/空格"的空白行成立
                     continue
-                # 列数比表头多：多出来的字段会落进 restkey=None，静默丢字段等于写错数据
-                extra = row.pop(None, None)
-                if extra:
+                if extra_has_content:
+                    # 列数比表头多：多出来的字段会落进 restkey=None，静默丢字段等于写错数据
                     raise RuntimeError(
                         f"{label or '文件'} 第 {line_no} 行列数多于表头（多出 {len(extra)} 个值：{extra[:3]}），"
                         f"字段会被截断；请检查文件格式或分隔符"
                     )
+                if any(v is None for v in row.values()):
+                    # 列数少于表头：DictReader 给缺失列补 restval=None，静默写库会变全 NULL
+                    # （下游 get_json_object 取不到值）；与"多出列"对称，同样硬报错。
+                    # 字段里含未转义换行、文件被截断都会走到这里
+                    missing = sum(1 for v in row.values() if v is None)
+                    raise RuntimeError(
+                        f"{label or '文件'} 第 {line_no} 行列数少于表头（缺 {missing} 列，会被静默补成 NULL）；"
+                        f"请检查文件是否被截断、字段里是否有未转义的换行"
+                    )
                 record = {str(k): (None if v is None else str(v)) for k, v in row.items()}
-                if entry_field:
+                # entry 为空 = 非 ZIP 来源（整包 CSV）：原来无条件写入会把 CSV 本来就有
+                # 同名列的值整列覆盖成空串，而且是"行数校验通过"的假数据
+                if entry_field and entry:
+                    if entry_field in record:
+                        # 与文件自带列重名：覆盖会把真实列值静默改成条目名（校验全过、数据全假）
+                        raise ConfigError(
+                            f"{label or '文件'} 第 {line_no} 行：parse.entry_field={entry_field!r} "
+                            f"与 CSV 自带列重名，写入会静默覆盖真实列值；请换一个不冲突的列名"
+                        )
                     record[entry_field] = entry
                 records.append(record)
         except csv.Error as exc:
@@ -293,10 +345,12 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
                 f"{label or '文件'} 第 {reader.line_num} 行 CSV 解析失败：{exc}；"
                 f"多半是引号未闭合/字段内含未转义的引号，整份文件的行数会因此对不上"
             )
-        # 同名列会让前面的列被后面的覆盖、空列名的键是 ""（下游 get_json_object 取不到），
-        # 都等于静默丢列（表头都是字符串时才可能出现）
-        if fieldnames and any(str(name).strip() == "" for name in fieldnames):
-            raise RuntimeError(f"{label or '文件'} 的 CSV 表头有空列名（行尾多了一个分隔符？）：{fieldnames}")
+        # 同名列会让前面的列被后面的覆盖；空列名的键是 ""、带首尾空白的列名（" amount"）
+        # 会原样成为 json 键——下游按精确名 get_json_object 取不到，都等于静默丢列
+        if fieldnames and any(str(name) != str(name).strip() or str(name).strip() == "" for name in fieldnames):
+            raise RuntimeError(
+                f"{label or '文件'} 的 CSV 表头有空列名或带首尾空白的列名（导出格式问题？）：{fieldnames}"
+            )
         if fieldnames and len(fieldnames) != len(set(fieldnames)):
             raise RuntimeError(f"{label or '文件'} 的 CSV 表头有重复列名，解析会丢列：{fieldnames}")
     elif fmt == "jsonl":
@@ -315,7 +369,20 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
                     f"{label or '文件'} 第 {line_no} 行不是 JSON 对象"
                     f"（是 {type(item).__name__}：{line[:120]!r}）；jsonl 要求每行一个对象"
                 )
-            if entry_field:
+            if not item:
+                # 空对象行（{}）与 Items: {} / [{}] 同义：接口"无数据"的占位。
+                # 必须在合并 entry_field 之前判定——否则 {} 会被合并成 {entry_field: ...}
+                # 又变非空，写进 ODS 成只含条目名的假记录（CSV/JSON 路径都对空对象归零）
+                continue
+            # entry 为空 = 非 ZIP 来源（整包 JSONL）：原来无条件写入会把文件里本来就有
+            # 同名列的值整列覆盖成空串，而且是"校验全部通过"的假数据
+            if entry_field and entry:
+                if entry_field in item:
+                    # 与记录自带字段重名：覆盖会把真实值静默改成条目名（校验全过、数据全假）
+                    raise ConfigError(
+                        f"{label or '文件'} 第 {line_no} 行：parse.entry_field={entry_field!r} "
+                        f"与记录自带字段重名，写入会静默覆盖真实值；请换一个不冲突的字段名"
+                    )
                 item = dict(item, **{entry_field: entry})
             records.append(item)
     else:
@@ -340,23 +407,102 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
     （nginx/框架/工具自己补），而 JSONL 规范（jsonlines.org）明确允许最后一行不带换行分隔符，
     `{"a":1}\n{"b":2}` 这种多行 JSONL 整包也解不成一个 JSON 值，照常解析。
     """
-    probe = data.lstrip(b" \t\r\n\xef\xbb\xbf")
-    if probe[:1] not in (b"{", b"["):
-        # 不以 {/[ 开头（整个 ZIP 响应也在这里）不可能是 JSON 错误体
-        return
-    fmt = str(parse_cfg.get("format") or "").lower()
-    # 按配置的编码试，再按 utf-8-sig 试（源是 GBK 时 JSON 错误体同样要抓得住）
-    encodings = []
-    for name in (str(parse_cfg.get("encoding") or "utf-8-sig"), "utf-8-sig"):
+    # 不能只看原始首字节：utf-16/utf-32 带 BOM 时首字节是 \xff/\xfe/\x00，
+    # 会把 JSON 错误体当成 CSV 写进 ODS。先按配置编码解码，再剥 BOM / 空白看首字符。
+    encodings: list[str] = []
+    configured = str(parse_cfg.get("encoding") or "utf-8-sig")
+    for name in (configured, "utf-8-sig"):
         if name.lower() not in [seen.lower() for seen in encodings]:
             encodings.append(name)
+    # utf-16/32 的 BOM 不是 `{`/`[` 的 ASCII 字节；配置没写对应编码时也要认
+    # （不要用 utf-16-sig：标准库没有这个名字，LookupError 会把整次探测短路掉）
+    if data.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+        encodings.append("utf-32")
+    elif data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings.append("utf-16")
+    texts: list[str] = []
+    scalar_candidate = False
+    for name in encodings:
+        # 只解码开头一小段做「首字符」嗅探：这里只判断去掉 BOM/空白后的首字符是不是
+        # { / [，不该为了看一眼首字符就把整包（可能是几十 MB 的 CSV/ZIP）解码成 str——
+        # replace 遇到非法字节还会膨胀成 U+FFFD，内存翻数倍
+        try:
+            head = data[:4096].decode(name, "replace")
+        except LookupError:
+            if name.lower() == configured.lower():
+                return  # 配置的编码名写错：交给 decode() 报 ConfigError
+            continue
+        stripped = head.lstrip("\ufeff").lstrip()
+        if not stripped and len(data) > 4096:
+            # 前 4KB 全是空白/BOM：极罕见，退回整包解码保持原语义
+            try:
+                stripped = data.decode(name, "replace").lstrip("\ufeff").lstrip()
+            except LookupError:
+                continue
+        if stripped[:1] in ("{", "["):
+            # 首字符像 JSON 才需要整包文本（后面要 loads_json）——错误体通常很小。
+            # 大响应的整包解码要克制：百 MB 级 JSONL 每行都以 { 开头，且编码候选不止一个，
+            # 整包解一遍就是一份（多候选时好几份）整个响应的 str 副本，内存受限时直接 OOM。
+            # 只有"包小"或"整包单行"时才解码：多行判断必须扫整包字节——只看前 4KB 的话，
+            # 宽表单行 >4KB 的 JSONL 会被误判成单行 JSON、照样整包解码（b"\n" in data 是
+            # C 层线性扫描，不产生副本）
+            if len(data) > _SNIFF_MAX_BYTES:
+                if b"\n" in data:
+                    # 大且多行（如 pretty-printed 的大 JSON/错误体）：为内存不解码整包——
+                    # 但"以 }/] 收尾"的错误体特征仍要拦（与小包同口径；只取尾部小样本，
+                    # jsonl 格式不适用）。不拦会把 JSON 当 CSV 解析成垃圾记录写进 ODS
+                    if str(parse_cfg.get("format") or "").lower() != "jsonl":
+                        tail = data[-4096:]
+                        try:
+                            tail_text = tail.decode(name, "replace").lstrip("﻿").rstrip()
+                        except LookupError:
+                            continue
+                        if tail_text[-1:] in ("}", "]"):
+                            raise RuntimeError(
+                                f"{label} {where}期望文件流，但响应像一个无法解析的 JSON"
+                                f"（大响应按尾部采样判定：以 }} / ] 收尾）：{tail_text[-120:]!r}"
+                            )
+                    continue
+                # 大且单行（如 300MB 单行 JSON 导出）：整包 decode 是 OOM 源——只按
+                # 首/尾字节判定「整包就是一个 JSON」（首 {/[ 且尾 }/]），宁失败勿 OOM
+                tail_bytes = data.rstrip(b"\r\n\t ")
+                if data[:1] in (b"{", b"[") and tail_bytes[-1:] in (b"}", b"]"):
+                    raise RuntimeError(
+                        f"{label} {where}期望文件流，但响应像一个 JSON（大响应不整包解码：首尾字符与 JSON 一致）"
+                    )
+                continue
+            try:
+                texts.append(data.decode(name, "replace").lstrip("\ufeff").lstrip())
+            except LookupError:
+                continue
+        elif stripped and len(data) <= _SNIFF_MAX_BYTES:
+            # 只对小包做 strip：bytes.strip 会新建等长副本，百 MB 的包不能无条件裁
+            trimmed = data.strip(b"\r\n\t ")
+            if (
+                b"\r" not in trimmed
+                and b"\n" not in trimmed
+                and not any(sep in trimmed for sep in (b",", b"\t", b";", b"|"))
+                and not data.startswith(_BINARY_MAGICS)
+            ):
+                # 去掉首尾空白（含服务器补的尾随换行——nginx/框架很常见）后：单行、无列分隔符、
+                # 还有内容 → 疑似 JSON 标量错误体（"错误消息" / 500 / null）。
+                # 当 CSV 解析会静默产出 0 行（唯一"列名"就是错误消息本身）、调度按"零数据"收尾；
+                # 确属单行单列数据的源极少（该路径本来就按文件流配的），宁失败勿写错。
+                # 判断走 bytes（b"\n"/分隔符是 C 层扫描）且限体积：不制造整包解码副本
+                # 二进制（小 ZIP 的字节里恰好没有换行/逗号）不能被当成单行文本：
+                # 魔数已先挡一道，这里再要求'能严格解码'（解不出就换/跳过该编码候选）
+                try:
+                    candidate = data.decode(name)
+                except (UnicodeDecodeError, LookupError):
+                    continue
+                texts.append(candidate.lstrip("\ufeff").lstrip())
+                scalar_candidate = True
+    if not texts:
+        return
+    fmt = str(parse_cfg.get("format") or "").lower()
     payload = None
     parsed = False
-    for name in encodings:
-        try:
-            text = data.decode(name, "replace")
-        except LookupError:
-            return  # 编码名写错：交给 decode() 报"parse.encoding 不是有效的编码名"
+    for text in texts:
         try:
             payload = loads_json(text)
         except ValueError:
@@ -364,16 +510,28 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
         parsed = True
         break
     if not parsed:
+        if scalar_candidate:
+            # 单行、无列分隔符、又解不出来：纯文本错误体（"503 Service Unavailable" 这类，
+            # 注释里举的"错误消息"正是此形态）。当 CSV 解析会静默产出 0 行（唯一"列名"
+            # 就是错误消息本身）——直接拦下；能解析成 JSON 标量的在下面 parsed 分支拦
+            raise RuntimeError(f"{label} {where}期望文件流，但响应是单行文本（疑似纯文本错误体）：{texts[0][:200]!r}")
         # 解不出来又以 }/] 收尾：大概率是含 NaN/被截断的 JSON 错误体。
-        # （CSV 表头以 { [ 开头虽罕见但合法，所以只在这个更窄的形态上报错）
-        # jsonl 不走这一支：多行 JSONL 本来就不是一个 JSON 值，整包解不出来是正常的，
-        # 真有坏行由 _parse_text 带着行号报出来，比这里的"疑似被截断"准得多
-        if fmt != "jsonl" and probe[-1:] in (b"}", b"]"):
+        # 尾字符判断用解码后的文本：utf-16 的 } 不是单字节 0x7d。
+        # jsonl 不走这一支：多行 JSONL 本来就不是一个 JSON 值，整包解不出来是正常的
+        stripped = texts[0].lstrip("\ufeff").rstrip()
+        if fmt != "jsonl" and stripped[-1:] in ("}", "]"):
             raise RuntimeError(
                 f"{label} {where}期望文件流，但响应像一个无法解析的 JSON（含 NaN/Infinity 或被截断）："
-                f"{data[:200].decode('utf-8', 'replace')!r}"
+                f"{stripped[:200]!r}"
             )
         return
+    if scalar_candidate and (payload is None or isinstance(payload, (str, int, float, bool))):
+        # 单行无分隔符、又能解析成一个 JSON 标量：不是文件流该有的形态，按错误体拦下——
+        # 静默产出 0 行比报错危险得多
+        raise RuntimeError(
+            f"{label} {where}期望文件流，但响应是一个 JSON 标量（疑似错误体）：{texts[0][:200]!r}；"
+            f"若确认这是数据，请与上游核对响应形态后调整 response_type / parse.format"
+        )
     if not isinstance(payload, (dict, list)):
         return
     hint = ""
@@ -416,8 +574,8 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
             if strict_encoding:
                 # 这里也必须去 BOM：非严格分支有 lstrip，漏掉会让同一个开关下
                 # 列名变成 "﻿date"，下游 get_json_object('$.date') 静默取空
-                return raw.decode(encoding).lstrip("﻿")
-            text = raw.decode(encoding, "replace").lstrip("﻿")
+                return raw.decode(encoding).lstrip("\ufeff")
+            text = raw.decode(encoding, "replace").lstrip("\ufeff")
         except LookupError:
             # 编码名写错（如 "utf8sig"、"utf-8-sig " 带空格）：decode 抛的是 LookupError，
             # 既不是可重试的网络抖动、也不是 ConfigError，会被整窗重试白等十几分钟
@@ -444,33 +602,60 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
         snippet = data[:200].decode("utf-8", "replace")
         raise RuntimeError(f"{label} 期望 ZIP 文件但返回不是 ZIP；片段：{snippet!r}")
     with archive:
-        names = [n for n in archive.namelist() if not n.endswith("/")]
+        # 按 infolist() 逐条拿 ZipInfo，而不是 namelist() 的名字再 getinfo：ZIP 允许重名条目
+        # （两次导出追加进同一个包），按名字只会解析到其中一条——循环两遍读的是同一份数据、
+        # 另一条被静默丢掉，任务还报成功。按 ZipInfo 读，重名的各读各的。
+        entries = [info for info in archive.infolist() if not info.filename.endswith("/")]
         if entry_contains:
-            names = [n for n in names if entry_contains in n]
-        if not names:
+            entries = [info for info in entries if entry_contains in info.filename]
+        if not entries:
             raise RuntimeError(
                 f"{label} ZIP 里没有匹配 entry_contains={entry_contains!r} 的文件：{archive.namelist()[:10]}"
             )
+        names = [info.filename for info in entries]
         # 不筛条目时，多文件（明细+汇总、多语言副本等）会被无脑串成一份记录：
         # 表头还可能各不相同。要么用 entry_contains 指定，要么明确接受全部。
-        if len(names) > 1 and not entry_contains and not allow_multi_entry:
+        if len(entries) > 1 and not entry_contains and not allow_multi_entry:
             raise RuntimeError(
                 f"{label} ZIP 里有多个文件（表头可能不同，混在一起会写错数据）：{names[:10]}；"
                 f"请用 parse.entry_contains 指定要取的文件名关键字，"
                 f"确实要全部解析时设 parse.allow_multi_entry=true"
             )
-        if len(names) > 1:
+        if len(entries) > 1:
             # 指定了 entry_contains 却命中多个条目：常见用法（按地区/批次分包、表头一致）
-            # 需要合并，所以不拦；但表头不一致时会拼出字段不齐的记录，得让用户看见
+            # 需要合并，所以不拦；但表头不一致时会拼出字段不齐的记录，必须硬报错
             log(
                 f"  提示：{label} ZIP 里匹配 entry_contains={entry_contains!r} 的条目有 "
-                f"{len(names)} 个，将按文件名顺序合并：{sorted(names)[:5]}"
+                f"{len(entries)} 个，将按文件名顺序合并：{sorted(names)[:5]}"
             )
+            if len(set(names)) != len(names):
+                log("  提示：其中有同名条目（ZIP 允许重名），将按各自的条目内容分别解析")
         records: list[dict] = []
-        for name in sorted(names):
+        seen_headers: tuple | None = None
+        seen_name = ""
+        total_bytes = 0
+        for info in sorted(entries, key=lambda item: item.filename):
+            name = info.filename
+            total_bytes += int(info.file_size or 0)
+            if total_bytes > MAX_ZIP_TOTAL_BYTES:
+                raise ConfigError(
+                    f"{label} ZIP 条目解压后累计 {total_bytes:,} 字节，超过上限 "
+                    f"{MAX_ZIP_TOTAL_BYTES:,} 字节（多个大条目/压缩炸弹）；请在源侧确认导出内容"
+                )
+            if info.file_size > MAX_ZIP_ENTRY_BYTES:
+                # 条目整条解压进内存：超高压缩比/异常大条目（zip bomb、源侧导出事故）会
+                # 直接把进程内存打爆。按 central directory 声明的解压后大小先挡一道
+                # （zipfile 的 read 最多解到声明大小，声明大小就是内存上界）
+                raise ConfigError(
+                    f"{label} ZIP 条目 {name!r} 解压后 {info.file_size:,} 字节，超过上限 "
+                    f"{MAX_ZIP_ENTRY_BYTES:,} 字节；请在源侧确认导出内容（异常大条目可能是压缩炸弹）"
+                )
             try:
-                raw = archive.read(name)
-            except zipfile.BadZipFile as exc:  # 条目损坏（截断包等）：可能重拉就好，仍按可重试
+                raw = archive.read(info)
+            except (zipfile.BadZipFile, EOFError) as exc:
+                # 条目损坏（截断包等）：可能重拉就好，仍按可重试。EOFError 是压缩流没到
+                # end-of-stream 时 zipfile 抛的（"Compressed file ended before..."），
+                # 与 BadZipFile 同类，漏掉会让"可重试"语义失效、裸异常冒出
                 raise RuntimeError(f"{label} ZIP 条目 {name!r} 读取失败：{exc}")
             except (RuntimeError, NotImplementedError) as exc:
                 # 条目加密时 zipfile 抛的正是 RuntimeError("File ... is encrypted, password
@@ -485,7 +670,20 @@ def parse_bytes(data: bytes, parse_cfg: dict, label: str) -> list:
             # 条目单独再过一道：整包是 ZIP（PK 开头）时上面的检查看不到条目内容，
             # 导出失败的 ZIP 里常有一个 {"code":500,...} 的错误体条目，不能当数据写进去
             _reject_json_error_body(raw, parse_cfg, label, where=f"条目 {name!r} ")
-            records.extend(_parse_text(decode(raw, f"条目 {name!r} "), parse_cfg, entry=name, label=label))
+            chunk = _parse_text(decode(raw, f"条目 {name!r} "), parse_cfg, entry=name, label=label)
+            if chunk:
+                # 行是 {列名: 值} 的 dict：键序随 JSON/CSV 原文变化（同构的两行键序可能不同），
+                # 按"排序后的键集合"比——按插入序比会把同结构的条目误判成"表头不一致"整批失败
+                headers = tuple(sorted(chunk[0]))
+                if seen_headers is None:
+                    seen_headers, seen_name = headers, name
+                elif headers != seen_headers:
+                    raise RuntimeError(
+                        f"{label} ZIP 条目表头不一致：{seen_name!r}={list(seen_headers)} "
+                        f"vs {name!r}={list(headers)}；混在一起会写出错位记录，"
+                        f"请用 parse.entry_contains 只取同结构的文件"
+                    )
+            records.extend(chunk)
         return records
 
 

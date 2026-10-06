@@ -7,7 +7,7 @@
   },
   "maxcompute": {
     "project": "<项目名>",
-    "endpoint": "http://service.us-west-1.maxcompute.aliyun.com/api",
+    "endpoint": "https://service.us-west-1.maxcompute.aliyun.com/api",
     "access_key_id": "<阿里云 AccessKeyId>",
     "access_key_secret": "<阿里云 AccessKeySecret>"
   },
@@ -25,7 +25,8 @@
       "type": "sha256_concat",
       "secret_key": "${secrets.onerway_secret_key}",
       "sign_field": "sign",
-      "sign_in": "body"
+      "//sign_in": "签名必须与参数走同一个位置（params_in=headers）：body 位置在 GET 请求里无处安放，服务端在 Header 里拿到参数却找不到匹配的签名",
+      "sign_in": "header"
     },
     "response_type": "bytes"
   },
@@ -38,7 +39,8 @@
     "pad_hours": 0,
     "start_param": "date",
     "format": "%Y%m%d",
-    "//": "结算日=美东日期；date 参数格式 yyyyMMdd；默认回扫 21 天（每周出账 + 改账回刷）"
+    "//": "结算日=美东日期；date 参数格式 yyyyMMdd；默认回扫 21 天（每周出账 + 改账回刷）",
+    "//pad_hours": "接口按「该结算日」返回整份文件、date 参数只传结算日（所以不做时区折算、pad=0）；若你的接口是按参数日切分的（同一美东结算日在 +08:00 下横跨两个自然日），需把 pad_hours 加到 ≥时区差（此处 13 小时）或改为回扫 date±1 天"
   },
 
   "parse": {

@@ -11,7 +11,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .dates import DEFAULT_DATE_TZ, check_format_string, date_tz_of, env_bizdate
-from .utils import ConfigError, as_bool, redact, require_identifier
+from .utils import ConfigError, _is_sensitive_key, as_bool, redact, require_identifier
 
 ALLOWED_AUTH_TYPES = ("none", "basic", "token", "bearer", "query", "sha256_concat", "aliyun_rpc", "custom")
 ALLOWED_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
@@ -97,7 +97,7 @@ _WARNINGS_KEY = "__warnings__"
 # 默认分区（target.pt / 业务日）只认 8 位业务日：pt 是"一次运行写一个分区"的口径，
 # 写错形态的数据没人读；--pt 显式指定时放宽（测试/对比/补数用的特殊分区），
 # 只要求是合法分区名——那时"有没有人读"由使用者自己负责
-_PT_RE = re.compile(r"\A\d{8}\Z")
+_PT_RE = re.compile(r"\A[0-9]{8}\Z")
 _PT_ANY_RE = re.compile(r"\A[A-Za-z0-9_\-]+\Z")
 
 
@@ -183,7 +183,21 @@ def resolve_placeholder(name: str, context: dict):
     return node
 
 
-def deep_substitute(value, context: dict):
+def _inline_scalar(value, name: str) -> str:
+    """内联占位符（"a${secrets.x}b"）的解析结果转字符串。
+
+    None/容器不能 str() 成 "None"/"['a']" 混进配置——secrets.x 为 null（模板注入失败）
+    时静默转成 "None"，校验全过、请求带着 "None" 发出去，报错指不到配置上。
+    """
+    if value is None or isinstance(value, (list, dict, tuple, set)):
+        raise ConfigError(
+            f"占位符 ${{{name}}} 解析结果不是标量（{type(value).__name__}），"
+            f"无法内联进字符串——检查对应的 secrets/占位符配置"
+        )
+    return str(value)
+
+
+def deep_substitute(value, context: dict, *, literal_ok: bool = False):
     """递归替换配置里的占位符（字符串里可混写，如 'Bearer ${secrets.x}'）。
 
     例子：
@@ -191,6 +205,10 @@ def deep_substitute(value, context: dict):
         "${secrets.ids}"（整串占位）    →  直接返回原始对象（列表/数字等，不强制转字符串）
         "${bizdate}"                    →  "20260918"
     找不到的占位符直接报错（不静默留空，避免密钥没配却悄悄请求失败）。
+
+    literal_ok=True 用于凭据字段（键名含 token/secret/password 等，如 Authorization 头、
+    签名参数）的值：这类值是自由文本，里面出现 "${" 只是密钥的一个字符，能解析的占位符
+    照常解析、畸形或未知的原样保留——不能因为密钥长什么样就让整份作业加载失败。
     """
     if isinstance(value, dict):
         # 键也替换：多实例共用一份作业时参数名本身常被参数化（如 {"${secrets.param_name}": "v"}），
@@ -198,36 +216,81 @@ def deep_substitute(value, context: dict):
         result = {}
         for key, item in value.items():
             new_key = deep_substitute(key, context) if isinstance(key, str) else key
-            result[str(new_key)] = deep_substitute(item, context)
+            if isinstance(key, str) and not isinstance(new_key, str):
+                # 整串占位符解析成非字符串（如 ${secrets.lst} 是列表）：str() 会把键静默
+                # 变成 "['a', 'b']" 这种没人认得的字符串，配置笔误要在这里报出来
+                raise ConfigError(
+                    f"配置的键 {redact(key)!r} 解析结果不是字符串（{type(new_key).__name__}），无法作为 JSON 键"
+                )
+            if str(new_key) in result:
+                # 替换后键名撞车（"a" 与 "${secrets.b}" 都解析成同一个键）：静默覆盖会让
+                # 前一个配置项凭空消失，必须报错
+                raise ConfigError(f"占位符替换后键名冲突：{redact(str(new_key))!r}（源键 {redact(str(key))!r}）")
+            result[str(new_key)] = deep_substitute(
+                item, context, literal_ok=isinstance(key, str) and _is_sensitive_key(key)
+            )
         return result
     if isinstance(value, list):
-        return [deep_substitute(item, context) for item in value]
+        return [deep_substitute(item, context, literal_ok=literal_ok) for item in value]
     if not isinstance(value, str):
         return value
 
     match = _PLACEHOLDER_RE.fullmatch(value)
     if match:
-        return resolve_placeholder(match.group(1), context)
+        try:
+            resolved = resolve_placeholder(match.group(1), context)
+        except SystemExit:
+            # 凭据字段整串恰好长成 ${...}（密钥本身就是这个字面量、或模板没改干净）：
+            # 与下面的内联容错同口径，按字面量保留——不能同一段文本多一个字符就换个行为
+            if literal_ok:
+                return value
+            raise
+        if resolved is None:
+            # 整串解析成 null 的占位符会原样交给下层（requests 会把 None 编码成字面量
+            # "None" 发出去）：与内联路径的 _inline_scalar 同口径拒绝；容器/数字是
+            # 合法的整串结果，放行
+            raise ConfigError(f"占位符 ${{{match.group(1)}}} 解析成了 null，请检查对应的 secrets 配置")
+        return resolved
+
+    if literal_ok:
+
+        def _replace_tolerant(m: re.Match) -> str:
+            try:
+                resolved = resolve_placeholder(m.group(1), context)
+            except SystemExit:
+                return m.group(0)  # 未知键：按字面量保留
+            return _inline_scalar(resolved, m.group(1))
+
+        # 未闭合的 "${" 正则匹配不到，sub 会原样保留；成对但未知的占位符也按字面量留下
+        return _PLACEHOLDER_RE.sub(_replace_tolerant, value)
 
     if value.count("${") != len(_PLACEHOLDER_RE.findall(value)):
         # 未闭合（"${secrets.token" 少一个 }）或空键（${}）的形态不会被正则匹配到，
         # 原样发给接口只会得到 401/参数不生效，日志里看不出是配置写错——直接报错
         raise SystemExit(
-            f"配置里有未闭合或写法不对的占位符：{value[:120]!r}（应形如 ${{secrets.键名}}，${{ 与 }} 必须成对）"
+            f"配置里有未闭合或写法不对的占位符：{redact(value[:120])!r}（应形如 ${{secrets.键名}}，${{ 与 }} 必须成对）"
         )
 
     def _replace(m: re.Match) -> str:
         """字符串里混着占位符（如 "Bearer ${secrets.t}"）时的替换回调，结果一律转成字符串。"""
-        return str(resolve_placeholder(m.group(1), context))
+        return _inline_scalar(resolve_placeholder(m.group(1), context), m.group(1))
 
     return _PLACEHOLDER_RE.sub(_replace, value)
 
 
-def render_job(job_raw: dict, config: dict, bizdate: date) -> dict:
+def render_job(job_raw: dict, config: dict, bizdate: date) -> tuple[dict, dict]:
     """作业配置 → 替换占位符（secrets/日期）后的运行时配置。
+
+    返回 (rendered_job, rendered_config)：**不改写调用方的入参**（与 sftp2ods 同口径）。
+    原来直接在调用方的 config 里就地替换并只返回 job：同一份 config 在同一进程里第二次
+    渲染时，maxcompute/profiles 里已是上一次的字面量、${...} 再也替换不到，第二个作业会
+    静默用上第一个作业的密钥（多实例复用同一份 config 的用法正好踩这一条）。
 
     作业文件里的 secrets 原样保留（密钥本身不参与占位符替换），只用于 ${secrets.x}。
     """
+    # 类型检查必须在任何取值之前：下面 date_tz_of 就要取 window.date_tz / window 块，
+    # 而 window 写成字符串时那是 'str' object has no attribute 'get' 的裸 traceback
+    check_block_types(job_raw)
     context = build_context(config, bizdate, job_raw.get("secrets"), tz=date_tz_of(job_raw))
     job = {key: value for key, value in job_raw.items() if key != "secrets"}
     rendered = deep_substitute(job, context)
@@ -235,11 +298,12 @@ def render_job(job_raw: dict, config: dict, bizdate: date) -> dict:
     # --config 文件自己的 maxcompute/profiles/notify 也参与替换：共享凭证常写成
     # {"maxcompute": {"access_key_id": "${secrets.ak}"}}（secrets 就在同一份文件里），
     # 只渲染作业文件会让它原样带着 ${...} 去连 MaxCompute（鉴权失败还看不出原因）。
-    # 原地更新：config 是调用方的运行时字典，取值方随后直接读它；替换本身幂等
+    # 在副本上替换：调用方拿返回值用，原 dict 保持原样（只替换顶层块，浅拷贝足够）
+    rendered_config = dict(config)
     for block in ("maxcompute", "profiles", "notify"):
-        if isinstance(config.get(block), dict):
-            config[block] = deep_substitute(config[block], context)
-    return rendered
+        if isinstance(rendered_config.get(block), dict):
+            rendered_config[block] = deep_substitute(rendered_config[block], context)
+    return rendered, rendered_config
 
 
 def check_block_types(job: dict) -> None:
@@ -253,6 +317,27 @@ def check_block_types(job: dict) -> None:
         value = job.get(block)
         if value is not None and not isinstance(value, dict):
             raise ConfigError(f"作业配置的 {block} 必须是对象（键值对），实际 {type(value).__name__}：{_show(value)}")
+
+
+def _infer_pagination_type(pagination: dict) -> str:
+    """分页类型推断（normalize_job 与 validate_job 共用）。
+
+    只看 type 字段会让"库调用方单独调 validate_job"（不走 normalize）时把
+    cursor/page 误判成 none、整段相关校验被跳过——两条入口必须同一结论。
+    """
+    page_type = str(pagination.get("type") or "").lower()
+    if page_type:
+        return page_type
+    if pagination.get("cursor_path"):
+        return "cursor"
+    if (
+        pagination.get("total_pages_path")
+        or pagination.get("total_items_path")
+        or pagination.get("stop_when_short")
+        or pagination.get("page_param")
+    ):
+        return "page"
+    return "none"
 
 
 def normalize_job(job: dict) -> dict:
@@ -274,19 +359,10 @@ def normalize_job(job: dict) -> dict:
     check_block_types(job)
     pagination = dict(job.get("pagination") or {})
     if pagination:
-        page_type = str(pagination.get("type") or "").lower()
-        if not page_type:
-            if pagination.get("cursor_path"):
-                page_type = "cursor"
-            elif (
-                pagination.get("total_pages_path")
-                or pagination.get("total_items_path")
-                or pagination.get("stop_when_short")
-                or pagination.get("page_param")
-            ):
-                page_type = "page"
-            else:
-                page_type = "none"
+        page_type = _infer_pagination_type(pagination)
+        if page_type not in ("page", "cursor", "none"):
+            # 未知取值原来会一路带到 fetch 的 if/elif 之外，行为不可预期；配置阶段拦下
+            raise ConfigError(f"pagination.type 不支持：{page_type!r}（可用 page / cursor / none）")
         pagination["type"] = page_type
         if page_type == "page":
             pagination.setdefault("page_param", "page")
@@ -319,20 +395,46 @@ def _check_unknown_keys(obj: dict, allowed: set, where: str, warnings: list) -> 
             warnings.append(f"{where}.{key} 不是已知配置项（拼写错误？）——已忽略")
 
 
+def _append_warning(job: dict, message: str) -> None:
+    """把校验告警挂到 job 上的内部通道（__warnings__）。
+
+    不能写 `_append_warning(job, ...)`：用户误写了同名非 list 键
+    （如 "__warnings__": "note"）时 setdefault 会返回那个字符串，.append 直接裸
+    AttributeError。非 list 一律替换成新的 list。
+    """
+    pending = job.get(_WARNINGS_KEY)
+    if not isinstance(pending, list):
+        pending = []
+        job[_WARNINGS_KEY] = pending
+    pending.append(message)
+
+
 def collect_warnings(job: dict) -> list[str]:
     """收集未知配置项告警（拼写错误提醒），不阻断运行。"""
     warnings: list[str] = []
-    # 先取走校验阶段挂上来的告警：_WARNINGS_KEY 不是用户配置项，
-    # 留在 job 里会被下面的未知键扫描当成拼写错误再报一条
-    warnings.extend(job.pop(_WARNINGS_KEY, None) or [])
-    _check_unknown_keys(job, JOB_KEYS, "作业", warnings)
-    _check_unknown_keys(job.get("request") or {}, REQUEST_KEYS, "request", warnings)
-    _check_unknown_keys(job.get("window") or {}, WINDOW_KEYS, "window", warnings)
-    _check_unknown_keys(job.get("pagination") or {}, PAGINATION_KEYS, "pagination", warnings)
-    _check_unknown_keys(job.get("parse") or {}, PARSE_KEYS, "parse", warnings)
-    _check_unknown_keys(job.get("target") or {}, TARGET_KEYS, "target", warnings)
-    if isinstance(job.get("notify"), dict):
-        _check_unknown_keys(job["notify"], NOTIFY_KEYS, "notify", warnings)
+    # 校验阶段挂上来的告警：只读不 pop——同一份 job dict 反复收集要拿到同样的告警
+    # （原来第一次就把键拿走、第二次返回空）。只有 list 形态才算内部通道；
+    # 用户误写的同名键（字符串等）不参与 extend（原来 extend("oops") 会按字符拆成
+    # 4 条假告警），并照常落入下面"不是已知配置项"的扫描
+    pending = job.get(_WARNINGS_KEY)
+    allowed_job_keys = JOB_KEYS | {_WARNINGS_KEY} if isinstance(pending, list) else JOB_KEYS
+    if isinstance(pending, list):
+        warnings.extend(str(item) for item in pending)
+    _check_unknown_keys(job, allowed_job_keys, "作业", warnings)
+    # 逐块判断 isinstance 而不是 `or {}` 兜底：`or {}` 只挡假值，
+    # "window": ["a"] / "target": 5 这类真值非对象会让 _check_unknown_keys 抛
+    # AttributeError/TypeError，而"收集告警不阻断运行"是本函数的契约
+    for block, allowed in (
+        ("request", REQUEST_KEYS),
+        ("window", WINDOW_KEYS),
+        ("pagination", PAGINATION_KEYS),
+        ("parse", PARSE_KEYS),
+        ("target", TARGET_KEYS),
+        ("notify", NOTIFY_KEYS),
+    ):
+        value = job.get(block)
+        if isinstance(value, dict):
+            _check_unknown_keys(value, allowed, block, warnings)
     return warnings
 
 
@@ -345,19 +447,21 @@ def _require_number(value, where: str, *, minimum=None, exclusive_min=None, inte
     if value is None or value == "":
         return
     if isinstance(value, bool):
-        raise SystemExit(f"{where} 必须是{'整数' if integer else '数字'}，实际 {value!r}")
+        raise SystemExit(f"{where} 必须是{'整数' if integer else '数字'}，实际 {_show(value)}")
     try:
         number = float(value)
-    except (TypeError, ValueError):
-        raise SystemExit(f"{where} 必须是{'整数' if integer else '数字'}，实际 {value!r}")
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError：JSON 里的超长整数字面量（几百位）float() 会溢出，
+        # 不是 ValueError/TypeError，漏掉它本函数承诺的"配置阶段给人话报错"就失效了
+        raise SystemExit(f"{where} 必须是{'整数' if integer else '数字'}，实际 {_show(value)}")
     if not math.isfinite(number):
-        raise SystemExit(f"{where} 必须是有限数字（不能是 NaN/Infinity），实际 {value!r}")
+        raise SystemExit(f"{where} 必须是有限数字（不能是 NaN/Infinity），实际 {_show(value)}")
     if integer and number != int(number):
-        raise SystemExit(f"{where} 必须是整数，实际 {value!r}")
+        raise SystemExit(f"{where} 必须是整数，实际 {_show(value)}")
     if minimum is not None and number < minimum:
-        raise SystemExit(f"{where} 不能小于 {minimum:g}，实际 {value!r}")
+        raise SystemExit(f"{where} 不能小于 {minimum:g}，实际 {_show(value)}")
     if exclusive_min is not None and number <= exclusive_min:
-        raise SystemExit(f"{where} 必须大于 {exclusive_min:g}，实际 {value!r}")
+        raise SystemExit(f"{where} 必须大于 {exclusive_min:g}，实际 {_show(value)}")
 
 
 def validate_job(job: dict) -> None:
@@ -373,10 +477,12 @@ def validate_job(job: dict) -> None:
         raise SystemExit("作业配置缺少 request.base_url（API 根地址）")
     if not target.get("table"):
         raise SystemExit("作业配置缺少 target.table（MaxCompute 目标表名）")
-    if "secrets" in job and not isinstance(job["secrets"], dict):
+    # 显式 JSON null 按"未配置"处理（与 check_block_types / 运行期口径一致：
+    # 把不用的块写成 null 是常态，校验不该反过来拦下）
+    if "secrets" in job and job["secrets"] is not None and not isinstance(job["secrets"], dict):
         raise SystemExit("作业配置的 secrets 必须是对象（键值对）")
     for block in ("maxcompute", "profiles"):
-        if block in job and not isinstance(job[block], dict):
+        if block in job and job[block] is not None and not isinstance(job[block], dict):
             raise SystemExit(f"作业配置的 {block} 必须是对象")
     # 子项也要查：profiles.prod 写成字符串时，取用它的一刻才抛裸 ValueError
     # （get_mc_profile_meta 里还有一道兜底，这里让报错在"校验配置"阶段就出现）
@@ -470,6 +576,10 @@ def validate_job(job: dict) -> None:
                 "（或把 start_param/end_param 都删掉，用默认 startTime/endTime）"
             )
         fmt = str(window.get("format") or "").strip()
+        if window.get("format") is not None:
+            # 校验通过的值写回（与 target/fields 的既有口径一致）：不写回的话，
+            # " %Y-%m-%d" 这类带首尾空白的写法过了校验、运行时却按含空白的字面量格式化
+            window["format"] = fmt
         # 既不是 unix 家族、又不含任何 strftime 指令的 format 几乎必然是笔误（如 unixms）：
         # 原样发给接口会得到一份"时间参数没生效"的数据，而且会被当成"纯日期格式"
         # 跳过时区换算、静默忽略 pad_hours
@@ -501,9 +611,14 @@ def validate_job(job: dict) -> None:
                 text = str(extra_fmt).strip()
                 if text.lower() not in ("unix", "unix_s", "unix_ms", "unix_millis"):
                     check_format_string(text, field=f"window.extra_params[{extra_name!r}]")
+                # 与 window.format 同口径把校验值写回：' %Y-%m-%d' 这类带首尾空白的写法
+                # 不能"过了校验、运行时却按含空白的字面量格式化"（发出去的参数带空格）
+                extra_params[extra_name] = text
 
     pagination = job.get("pagination") or {}
-    page_type = str(pagination.get("type") or "none").lower()
+    # 与 normalize_job 同一套推断：单独调用 validate_job（库调用方）时不能把
+    # cursor/page 误判成 none、静默跳过 stop_when_short/总数/文件类响应的校验
+    page_type = _infer_pagination_type(pagination)
     if page_type not in ALLOWED_PAGINATION_TYPES:
         raise SystemExit(f"pagination.type 不支持：{page_type}（可用 none/page/cursor）")
     _require_number(pagination.get("page_size"), "pagination.page_size", exclusive_min=0, integer=True)
@@ -515,10 +630,11 @@ def validate_job(job: dict) -> None:
         # 数据量一大就静默少拿（看着像配了分页）。
         # 条件是"或"不是"与"：只写 page_size（最像"我配好分页了"的写法）或只写
         # size_param 时原来都不告警，静默只发一次请求、条数校验还拿这"一页"自比
-        job.setdefault(_WARNINGS_KEY, []).append(
+        _append_warning(
+            job,
             "pagination 里只配了 size_param/page_size，没有页码或翻页终点，"
             "本次只会请求一次（等于 type=none）；确实要分页请补 page_param + "
-            "total_pages_path/total_items_path，或补 cursor_path 用游标分页"
+            "total_pages_path/total_items_path，或补 cursor_path 用游标分页",
         )
     stop_when_short = False
     if "stop_when_short" in pagination:
@@ -536,9 +652,12 @@ def validate_job(job: dict) -> None:
             )
         # 两个参数同名时：组装请求时 size 会覆盖 page，接口永远收到同一页的请求，
         # 同一页被反复拉取、再按终点正常收尾——重复行写进 ODS，写后条数校验还自洽
-        if str(pagination.get("page_param") or "") == str(pagination.get("size_param") or ""):
+        page_param = str(pagination.get("page_param") or "")
+        size_param = str(pagination.get("size_param") or "")
+        # 两个都空时（没走 normalize、也没写参数名）不是"同名覆盖"，后面会按缺省各自补默认值
+        if page_param and size_param and page_param == size_param:
             raise SystemExit(
-                f"pagination.page_param 与 size_param 不能同名（都是 {pagination.get('page_param')!r}）："
+                f"pagination.page_param 与 size_param 不能同名（都是 {page_param!r}）："
                 f"页大小会覆盖页码参数，接口只会返回同一页，重复行会静默写进 ODS"
             )
         if not has_total and not stop_when_short:
@@ -557,9 +676,10 @@ def validate_job(job: dict) -> None:
             # cursor 模式判断"没翻完"的唯一依据就是返回体里的总条数：游标字段改名、
             # 或接口某页不回游标时，"取不到游标"会被当成"翻完了"，只拉第一页就收尾
             # （静默少数据、写后条数校验还自洽）。强烈建议配上总数路径
-            job.setdefault(_WARNINGS_KEY, []).append(
+            _append_warning(
+                job,
                 "pagination.type=cursor 没配 total_items_path：游标字段写错或接口中途不回游标时，"
-                "会被当成「翻完了」只拉第一页（静默少数据）。建议补上 total_items_path（返回体里总条数的路径）"
+                "会被当成「翻完了」只拉第一页（静默少数据）。建议补上 total_items_path（返回体里总条数的路径）",
             )
     if response_type == "bytes" and page_type != "none":
         raise SystemExit("response_type=bytes（文件类响应）不支持分页，请把 pagination.type 设为 none")
@@ -584,15 +704,20 @@ def validate_job(job: dict) -> None:
         # entry_field 只有在 unzip 多条目合并时才有来源可标：没开 unzip 时
         # _parse_text 拿到的 entry 是空串，每条记录会被多写一个恒为空的字段。
         # 不报错只告警：字段恒空不影响数据正确性，但用户多半是漏开了 unzip
-        job.setdefault(_WARNINGS_KEY, []).append(
+        _append_warning(
+            job,
             f"parse.entry_field={str(parse.get('entry_field'))!r} 只在 parse.unzip=true（ZIP 多条目）"
-            f"时生效：当前每条记录会多出一个恒为空的字段；不需要请删掉它，需要就用 unzip 打开"
+            f"时生效：当前每条记录会多出一个恒为空的字段；不需要请删掉它，需要就用 unzip 打开",
         )
 
-    fail_if = request.get("fail_if") or []
-    if not isinstance(fail_if, list):
-        raise SystemExit('request.fail_if 必须是数组（每个元素形如 {"path": "Code", "not_equals": "Success"}）')
-    for cond in fail_if:
+    fail_if = request.get("fail_if")
+    if fail_if is not None and not isinstance(fail_if, list):
+        # 不能 `or []` 再查类型："" / 0 / {} 都是假值，会静默当成"没有失败条件"
+        raise SystemExit(
+            f'request.fail_if 必须是数组（每个元素形如 {{"path": "Code", "not_equals": "Success"}}），'
+            f"实际 {type(fail_if).__name__}：{_show(fail_if)}"
+        )
+    for cond in fail_if or []:
         if not isinstance(cond, dict) or not cond.get("path"):
             raise SystemExit("request.fail_if 每个元素必须包含 path")
         if "equals" not in cond and "not_equals" not in cond:
@@ -601,7 +726,8 @@ def validate_job(job: dict) -> None:
     # 目标表标识符会直接拼进 DDL / SQL：在这里白名单校验，挡住拼错/SQL 注入
     if target.get("project"):
         require_identifier(target["project"], "target.project")
-    require_identifier(target["table"], "target.table")
+    # .get：缺 table 走 require_identifier 的中文配置错，不要裸 KeyError
+    require_identifier(target.get("table"), "target.table")
     if target.get("column"):
         require_identifier(target["column"], "target.column")
     if target.get("stored_as"):
@@ -613,10 +739,15 @@ def validate_job(job: dict) -> None:
         if (
             isinstance(raw_lifecycle, bool)
             or not isinstance(raw_lifecycle, (int, float))
-            or float(raw_lifecycle) != int(raw_lifecycle)
-            or int(raw_lifecycle) <= 0
+            # NaN/Infinity 先挡掉：json.load 默认接受这些字面量，而 float(raw) != int(raw)
+            # 会对 NaN 直接抛 ValueError（裸 traceback）；浮点相等比较也不可靠，改判 is_integer()
+            or (
+                isinstance(raw_lifecycle, float)
+                and (not math.isfinite(raw_lifecycle) or not raw_lifecycle.is_integer())
+            )
+            or raw_lifecycle <= 0
         ):
-            raise SystemExit(f"target.lifecycle_days 必须是正整数（天），实际 {raw_lifecycle!r}")
+            raise SystemExit(f"target.lifecycle_days 必须是正整数（天），实际 {_show(raw_lifecycle)}")
 
 
 def _backfill_without_bizdate(args) -> bool:
@@ -639,7 +770,8 @@ def _backfill_without_bizdate(args) -> bool:
     anchored = explicit_bizdate or explicit_pt or env_bizdate() is not None
     dates = str(getattr(args, "dates", "") or "").strip()
     window = str(getattr(args, "start_date", "") or "").strip() or str(getattr(args, "end_date", "") or "").strip()
-    return (dates or window) and not explicit_pt and not anchored
+    # 显式 bool()：`dates or window` 返回的是字符串，函数标注的返回值是 bool
+    return bool((dates or window) and not explicit_pt and not anchored)
 
 
 def resolve_notify(job: dict, config: dict) -> dict:
@@ -656,6 +788,8 @@ def resolve_notify(job: dict, config: dict) -> dict:
 
 def resolve_target(job: dict, config: dict, args, bizdate: date) -> tuple[str, str, str, str]:
     """解析目标表信息 → (project, table, column, pt值)。"""
+    # 与 get_mc_profile_meta 同一道防线：target 非对象时给中文报错而不是裸 AttributeError
+    check_block_types(job)
     target = job.get("target") or {}
     profile = get_mc_profile_meta(config, job, args)
     project = str(target.get("project") or profile.get("project") or "")
@@ -663,8 +797,15 @@ def resolve_target(job: dict, config: dict, args, bizdate: date) -> tuple[str, s
         raise SystemExit(
             "没有目标项目：请在作业文件的 maxcompute.project（或 profiles.<名>.project）或 target.project 里指定"
         )
+    # validate_job 只校验了 target.project；project 还可能来自 profiles.<名>.project /
+    # maxcompute.project，那条路径同样会直接拼进 DDL/SQL，这里对"最终解析出来的值"再校验一次
+    require_identifier(project, "目标项目（target.project / maxcompute.project / profiles.<名>.project）")
     table = str(target.get("table") or "")
     column = str(target.get("column") or "json")
+    # 与 project 同口径：这两个值也会直接拼进 DDL/SQL，库调用方不经 validate_job 时
+    # 同样要过标识符白名单
+    require_identifier(table, "目标表（target.table）")
+    require_identifier(column, "目标列（target.column）")
     if _backfill_without_bizdate(args):
         raise SystemExit(
             "补数（--dates / --start-date+--end-date）必须跟着 --bizdate 一起用，"
@@ -672,8 +813,10 @@ def resolve_target(job: dict, config: dict, args, bizdate: date) -> tuple[str, s
             "  用法：--bizdate 20260920 --start-date 2026-07-01 --end-date 2026-09-20\n"
             "  含义：整段补数数据写进 pt=20260920（一个分区装一次运行，与调度口径一致）"
         )
-    explicit_pt = str(getattr(args, "pt", "") or "")
-    if explicit_pt.strip():
+    # 去掉首尾空格/制表符后取用（不改换行等真的脏值）：原来判空用 strip、取值用原串，
+    # "--pt ' 20260921 '" 这类只多打了空格的写法会被误判为非法分区名
+    explicit_pt = str(getattr(args, "pt", "") or "").strip(" 	")
+    if explicit_pt:
         # --pt 是显式指定的"专家开关"：测试写入、新旧对比、补数都可能用特殊分区
         # （test_20260921、cmp_*、backfill_*），不能一律按业务日卡死。
         # 这里只要求值本身是合法分区名；特殊分区不会被调度/DWD 自动读到，
@@ -722,6 +865,8 @@ def get_mc_profile_meta(config: dict, job: dict, args) -> dict:
     查找顺序：作业文件的 profiles.<名> / maxcompute → --config 文件的 profiles.<名> / maxcompute。
     （作业内优先，方便一份作业自带全部凭证。）
     """
+    # target 写成字符串/数字时，下面的 .get 是裸 AttributeError；与其它入口统一先挡块类型
+    check_block_types(job)
     name = str(getattr(args, "mc_profile", "") or (job.get("target") or {}).get("profile") or "default").strip()
     available: list[str] = []
 

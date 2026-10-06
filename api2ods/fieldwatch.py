@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+import os
+import tempfile
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .utils import log
@@ -25,16 +28,17 @@ STATE_DIR_NAME = ".field-state"
 
 
 class FieldObserver:
-    """收集一次运行观察到的记录字段名。"""
+    """收集一次运行观察到的记录字段名（fetch 阶段多线程并发回调，内部加锁）。"""
 
     def __init__(self) -> None:
         self.fields: set[str] = set()
+        self._lock = threading.Lock()
 
     def update(self, records) -> None:
         """拿一批记录（逐条取 dict 的键）并进字段集合。"""
-        for record in records:
-            if isinstance(record, dict):
-                self.fields.update(str(key) for key in record)
+        names = {str(key) for record in records if isinstance(record, dict) for key in record}
+        with self._lock:
+            self.fields.update(names)
 
 
 def snapshot_path(job_path: Path) -> Path:
@@ -54,6 +58,10 @@ def load_snapshot(job_path: Path) -> set[str] | None:
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            # 合法 JSON 但非对象（数组/字符串/null）时 data.get 抛的是 AttributeError，
+            # 不在捕获范围内、会中断主流程；统一归一成 ValueError 走告警分支
+            raise ValueError(f"顶层应是 JSON 对象，实际是 {type(data).__name__}")
         fields = data.get("fields")
         if not isinstance(fields, list) or not all(isinstance(item, str) for item in fields):
             raise ValueError("fields 不是字符串数组")
@@ -69,11 +77,29 @@ def save_snapshot(job_path: Path, fields, job_name: str) -> None:
     if not names:
         return
     path = snapshot_path(job_path)
-    payload = {"job": job_name, "fields": names, "updated_at": datetime.now().isoformat(timespec="seconds")}
+    # updated_at 用带时区的 UTC：不同机器/时区下写出的快照可直接比较（本地朴素时间跨时区会误判新旧）
+    payload = {"job": job_name, "fields": names, "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
+        handle, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
+        try:
+            try:
+                tmp = os.fdopen(handle, "w", encoding="utf-8")
+            except Exception:
+                # fdopen 失败时 fd 还没被接管：显式关闭，否则文件描述符泄漏到进程退出
+                try:
+                    os.close(handle)
+                except OSError:
+                    pass
+                raise
+            with tmp:
+                tmp.write(json.dumps(payload, ensure_ascii=False, indent=2))
+            os.replace(tmp_name, path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
     except OSError as exc:
         log(f"  警告：字段快照写入失败（{path}）：{exc}（不影响本次数据）")
