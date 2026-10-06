@@ -7963,6 +7963,15 @@ class TestEighthPassReview(OfflineTestCase):
         job = {"secrets": {"tok": "SECRET-abc123"}}
         self.assertEqual(cli_mod._redact_job(job, "bad token SECRET-abc123"), "bad token ***")
 
+    def test_cli_job_redaction_includes_config_secrets(self):
+        """--config 独有的凭据（如 maxcompute.access_key_secret，作业文件里是占位符）也要遮：
+        SDK 异常回显的 AK/密码来自 config 那份明文，只收作业文件的密钥值会漏遮。"""
+        job = {"secrets": {"tok": "SECRET-abc123"}}
+        config = {"maxcompute": {"access_key_secret": "CFG-SECRET-987654"}}
+        out = cli_mod._redact_job(job, "boom CFG-SECRET-987654", config)
+        self.assertNotIn("CFG-SECRET-987654", out)
+        self.assertIn("***", out)
+
     def test_fetch_retry_log_and_failures_mask_free_text_secret(self):
         """run_unit 的重试日志与失败列表也走值级脱敏（配置里的密钥值回显）。"""
         job = minimal_job(window={"mode": "per_day", "date_tz": "UTC", "start_param": "s"})

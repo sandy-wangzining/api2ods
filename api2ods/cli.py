@@ -283,10 +283,15 @@ def _lock_path(job_path: Path) -> Path:
     return fallback
 
 
-def _redact_job(job: dict, text) -> str:
-    """作业上下文下的脱敏：先按配置里的密钥值遮（形态规则盖不住的自由文本回显），
-    再走形态兜底。错误只在真出错时走这里，每次重收密钥值的开销可忽略。"""
-    return redact_secrets(collect_secret_values(job), str(text))
+def _redact_job(job: dict, text, config: dict | None = None) -> str:
+    """作业上下文下的脱敏：按作业（连同 --config）里的密钥值遮（形态规则盖不住的自由
+    文本回显），再走形态兜底。错误只在真出错时走这里，每次重收密钥值的开销可忽略。
+
+    凭证常只写在 --config（作业文件里是 ${secrets.xxx}），SDK 异常回显的明文来自
+    config 那份，只收作业文件的密钥值会漏遮。
+    """
+    nodes = (job,) if config is None else (job, config)
+    return redact_secrets([value for node in nodes for value in collect_secret_values(node)], str(text))
 
 
 def _notifier(job: dict, args):
@@ -300,7 +305,7 @@ def _notifier(job: dict, args):
     return lambda title, lines, footer="": notify(webhook, title, lines, footer, enabled=enabled)
 
 
-def _job_summary(job: dict) -> list[str]:
+def _job_summary(job: dict, config: dict | None = None) -> list[str]:
     """体检时打印的作业概要（让用户一眼确认配置理解正确）。"""
     request = job.get("request") or {}
     window = job.get("window") or {}
@@ -330,10 +335,11 @@ def _job_summary(job: dict) -> list[str]:
             job,
             f"  作业      : {job.get('job') or '(未命名)'}"
             + (f" —— {job['description']}" if job.get("description") else ""),
+            config,
         ),
         # path 允许带查询串（--init 就是这么把签名类 URL 存下来的），
         # 概要会落进 --check 日志和 --log-file，必须过一遍脱敏
-        "  接口      : " + _redact_job(job, endpoint),
+        "  接口      : " + _redact_job(job, endpoint, config),
         f"  响应      : {response_text}",
         f"  窗口      : {window_text}",
         f"  分页      : {pagination.get('type') or 'none'}"
@@ -348,7 +354,7 @@ def run_check(job: dict, config: dict, config_path: Path, args, bizdate, job_pat
     project, table_name, column, pt = resolve_target(job, config, args, bizdate)
 
     log("== 作业概要 ==")
-    for line in _job_summary(job):
+    for line in _job_summary(job, config):
         log(line)
     log(f"  目标      : {project}.{table_name}（列 {column} + 分区 {PARTITION_COLUMN}，pt={pt}）")
 
@@ -358,11 +364,11 @@ def run_check(job: dict, config: dict, config_path: Path, args, bizdate, job_pat
         fetcher = Fetcher(job, job_dir)
         label, count = fetcher.probe([bizdate])
         # label 里可能带 URL/签名（与下面失败分支、run_sync 的失败列表同口径脱敏）
-        log(f"  ✅ {_redact_job(job, label)} 请求成功，拿到 {count:,} 条记录")
+        log(f"  ✅ {_redact_job(job, label, config)} 请求成功，拿到 {count:,} 条记录")
     except Exception as exc:  # noqa: BLE001
         # 统一走 redact：接口的错误体常回显 token/签名（fail_if 的 message_path
         # 往往是整段错误消息），run_sync 的同类分支一直是脱敏的，这里不能搞两套标准
-        log(f"  ❌ 请求失败：{_redact_job(job, exc)}")
+        log(f"  ❌ 请求失败：{_redact_job(job, exc, config)}")
         return 1
 
     log("")
@@ -385,10 +391,10 @@ def run_check(job: dict, config: dict, config_path: Path, args, bizdate, job_pat
             has_pt = table.exist_partition(f"{PARTITION_COLUMN}={pt}")
             log(f"  ✅ {table_name} 结构符合；pt={pt} 分区{'已存在' if has_pt else '不存在（运行时创建）'}")
     except SystemExit as exc:
-        log(f"  ❌ {_redact_job(job, exc)}")
+        log(f"  ❌ {_redact_job(job, exc, config)}")
         return 1
     except Exception as exc:  # noqa: BLE001
-        log(f"  ❌ 连接/校验失败：{_redact_job(job, exc)}")
+        log(f"  ❌ 连接/校验失败：{_redact_job(job, exc, config)}")
         return 1
 
     log("")
@@ -409,14 +415,14 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     pagination = job.get("pagination") or {}
     job_name = job.get("job") or job_path.stem
     notifier = _notifier(job, args)
-    footer = _redact_job(job, f"作业 {job_name} · 目标 {project}.{table_name} · pt={pt}")
+    footer = _redact_job(job, f"作业 {job_name} · 目标 {project}.{table_name} · pt={pt}", config)
 
     # 构造 Fetcher 会读 signers.py（自定义签名）：文件缺失/写错时抛 SystemExit，
     # 不要让它变成裸 traceback（--check 走的是同一条路，所以那边一直是干净的）
     try:
         fetcher = Fetcher(job, job_dir)
     except SystemExit as exc:
-        log(f"❌ {_redact_job(job, exc)}")
+        log(f"❌ {_redact_job(job, exc, config)}")
         return 1
     unit_count = fetcher.unit_count(days)
     log(
@@ -424,6 +430,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             job,
             f"{job.get('job') or '作业'} 启动：{days[0]} ~ {days[-1]}（{len(days)} 天，{unit_count} 次请求计划），"
             f"目标 {project}.{table_name} pt={pt}",
+            config,
         )
     )
     if len(days) > 30:
@@ -463,7 +470,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             for label, err in failures:
                 # fetch_all 已脱敏，这里再走一遍兜底：除 fetch 之外的失败源也要进同一道口。
                 # label 里可能带 URL/签名（如带查询串的接口地址），与同一行的 err 同口径脱敏
-                log(f"  - {_redact_job(job, label)}: {_redact_job(job, err)}")
+                log(f"  - {_redact_job(job, label, config)}: {_redact_job(job, err, config)}")
             return 1
 
         log(
@@ -493,7 +500,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             notifier(
                 # 标题同样过 _redact_job：job 名是自由文本（可能含联调样例的 ak/sk），
                 # 卡片会发到外部 webhook，泄露面比日志更大
-                _redact_job(job, f"{job_name}：接口出现新增字段"),
+                _redact_job(job, f"{job_name}：接口出现新增字段", config),
                 [
                     f"**新增字段**：{shown}（共 {len(new_fields)} 个）",
                     f"**本次窗口**：{days[0]} ~ {days[-1]}",
@@ -596,7 +603,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             raise
         except Exception as exc:  # noqa: BLE001 - SQL/Tunnel 失败统一按失败退出（调度可告警）
             keep_spool = args.keep_spool
-            log(f"❌ 写库失败：{_redact_job(job, exc)}")
+            log(f"❌ 写库失败：{_redact_job(job, exc, config)}")
             return 1
 
         # 写库成功后才更新字段快照（与"台账只在写成功后记账"一致；失败/中断不更新，下次重报）。
@@ -614,7 +621,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         # 4xx（密钥错/参数错/没权限）：不写库、不打整窗重试，直接把接口给的原因打出来。
         # 这类错误在 fetch_all 里就已经跳过重试了，这里只是把出口做得干净些
         keep_spool = args.keep_spool
-        log(f"❌ 接口返回不可重试的错误，本次不写库：{_redact_job(job, exc)}")
+        log(f"❌ 接口返回不可重试的错误，本次不写库：{_redact_job(job, exc, config)}")
         return 1
     except KeyboardInterrupt:
         keep_spool = args.keep_spool
@@ -740,7 +747,7 @@ def main(argv: list[str] | None = None) -> int:
         job = normalize_job(job)  # 补齐默认值（翻页方式/参数名等），让配置尽量短
         validate_job(job)
         for warning in collect_warnings(job):  # 未知字段告警（拼写错误提示）
-            log(f"⚠️ {_redact_job(job, warning)}")  # job 已渲染：与其它日志同口径值级脱敏
+            log(f"⚠️ {_redact_job(job, warning, config)}")  # job 已渲染：与其它日志同口径值级脱敏
 
         # notify 合并进 job（作业优先、--config 兜底）：共享 --config 文件里的 webhook
         # 也要被 collect_secret_values 的值级脱敏收集（它按 job 收集），否则 webhook 裸
@@ -796,7 +803,7 @@ def main(argv: list[str] | None = None) -> int:
             # 配置类错误（ConfigError 是 SystemExit 子类）从 run_sync 里冒泡时同样带着
             # 在飞请求：不走 _exit_now 的话，解释器退出阶段仍要 join 它们（实测进程耗时
             # 随在飞请求线性增长）。消息可能是配置片段，log 前统一过脱敏
-            log(f"❌ {_redact_job(job, exc)}")
+            log(f"❌ {_redact_job(job, exc, config)}")
             return _exit_now(1)
         except KeyboardInterrupt:
             # 准备阶段（还没进 run_sync）被 Ctrl+C：没有线程要等，但走同一条出口更省心
