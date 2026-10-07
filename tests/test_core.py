@@ -5405,6 +5405,18 @@ class TestMainEntry(OfflineTestCase):
                 cli_mod._open_log_file(tmp)
         self.assertIn("指向的是目录", str(ctx.exception))
 
+    def test_log_file_open_failure_returns_2_not_systemexit(self):
+        """--log-file 指向目录（打不开）属"参数问题"：main 必须返回 2，不能把 SystemExit
+        冒泡出去——docstring 承诺返回 int，同进程多次调用 main 的宿主（测试/嵌入）会被
+        SystemExit 直接终止（它继承 BaseException，宿主 except Exception 也拦不住）。"""
+        import api2ods.cli as cli_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(cli_mod, "log") as spy:
+                rc = cli_mod.main(["--job", str(Path(tmp) / "demo.json"), "--log-file", tmp])
+        self.assertEqual(rc, 2)
+        self.assertIn("指向的是目录", chr(10).join(str(c.args[0]) for c in spy.call_args_list))
+
     def test_block_wrong_type_reports_through_main(self):
         """走真实入口：类型检查必须在 date_tz_of 之前生效，否则是裸 AttributeError。
 

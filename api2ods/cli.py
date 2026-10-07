@@ -650,7 +650,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     # 日志文件要先挂上：--init 的交互问答也值得留痕（原来它 return 在新挂载点之前）
-    log_handle = _open_log_file(args.log_file)
+    try:
+        log_handle = _open_log_file(args.log_file)
+    except SystemExit as exc:
+        # --log-file 指向目录/打不开属于"参数问题"：按 docstring 的退出码约定报 2（还没做过
+        # 任何操作），不能混进 1（运行失败）让调度侧按"数据问题"处理；也不能让 SystemExit
+        # 冒泡出 main——docstring 承诺返回 int，且同进程多次调用 main 时宿主会被直接终止
+        log(f"❌ {exc}")
+        return 2
     if log_handle is not None:
         from .utils import add_log_sink
 
