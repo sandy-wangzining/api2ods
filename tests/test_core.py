@@ -9288,6 +9288,12 @@ class TestFieldWatch(OfflineTestCase):
     def test_non_utf8_job_path_roundtrips_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
             job = Path(tmp) / os.fsdecode(b"job-\xff.json")
+            try:
+                job.write_bytes(b"{}")
+            except OSError as exc:
+                if exc.errno != errno.EILSEQ:
+                    raise
+                self.skipTest("当前文件系统不支持非 UTF-8 文件名（如 macOS APFS）")
             fieldwatch_mod.save_snapshot(job, ["a"], job.stem)
             self.assertEqual(fieldwatch_mod.load_snapshot(job), {"a"})
 
