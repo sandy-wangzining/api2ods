@@ -71,16 +71,18 @@ def remove_log_sink(handle) -> None:
     if handle is None:
         return
     with _lock:
+        # 摘除与关闭放在同一把锁里：log() 的快照在锁内取，缩小"取完快照后句柄被关"
+        # 的竞态窗口；log() 里对"已摘除句柄抛 ValueError"也有静默兜底
         if handle in _sinks:
             _sinks.remove(handle)
-    try:
-        handle.close()
-    except ValueError:
-        # 句柄已经被关过（同一进程里 main 多次调用时 _detach 会跑两遍）：
-        # 再关一次抛的是"对已关闭文件做 I/O"，不是真错误
-        pass
-    except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
-        pass
+        try:
+            handle.close()
+        except ValueError:
+            # 句柄已经被关过（同一进程里 main 多次调用时 _detach 会跑两遍）：
+            # 再关一次抛的是"对已关闭文件做 I/O"，不是真错误
+            pass
+        except Exception:  # noqa: BLE001 - 关闭失败不影响主流程
+            pass
 
 
 _logged_once: set = set()
@@ -173,6 +175,12 @@ def log(message: str) -> None:
             handle.write(line + "\n")
             handle.flush()
         except Exception as exc:  # noqa: BLE001 - 日志文件问题不影响主流程，但必须可见一次
+            with _lock:
+                still_registered = handle in _sinks
+            if isinstance(exc, ValueError) and not still_registered:
+                # 与 remove_log_sink 的并发竞态：快照取完后句柄被正常摘除并关闭。
+                # 这不是"写坏"，不能打误导性的写入失败告警，也不按故障路径再次关闭
+                continue
             failed_exc = exc
             broken.append(handle)
     if failed_exc is not None:
@@ -193,7 +201,7 @@ class RunLock:
 
     - Linux / macOS：flock 排它锁；
     - Windows：msvcrt 首字节锁（同样是排它、非阻塞）；
-    - 两种锁都没有的平台：退化为"不阻塞"，不挡运行；
+    - 两种锁都没有的平台：默认拒绝执行（fail-closed），仅 API2ODS_ALLOW_NO_LOCK=1 时降级为不加锁；
     - 锁随进程退出自动释放，进程被 kill 也由内核释放，不会残留死锁。
 
     注意：任意进程删除锁文件后，新进程会拿到一把"新锁"，与持锁者不再互斥——
@@ -208,10 +216,17 @@ class RunLock:
     def __enter__(self):
         """拿锁；已被别人持有就抛 SystemExit（不等待），拿不到直接让本次运行退出。"""
         if fcntl is None and msvcrt is None:
-            # 平台完全没有文件锁模块：与"文件系统不支持锁"同口径留一次告警——
-            # 静默退化成"无锁"会让并发启动同一作业时互斥形同虚设而无人察觉
-            log_once("  警告：当前平台没有 fcntl/msvcrt，本次不加锁继续；并发启动同一作业将无法互斥")
-            return self
+            # 与"文件系统不支持锁"同口径 fail-closed：无锁并发会互相写坏同一作业/表
+            # （purge/rename 互拆、数据被静默覆盖），不能只打一条告警就放行
+            if os.environ.get("API2ODS_ALLOW_NO_LOCK", "").strip() == "1":
+                log_once(
+                    "  警告：当前平台没有 fcntl/msvcrt；API2ODS_ALLOW_NO_LOCK=1 已显式接受无互斥风险，本次不加锁继续"
+                )
+                return self
+            raise SystemExit(
+                "当前平台没有 fcntl/msvcrt，无法提供运行锁：拒绝无锁执行（并发实例会互相写坏数据）。"
+                "确认无人并发时设置 API2ODS_ALLOW_NO_LOCK=1"
+            )
         try:
             # "a+" 而不是 "w"：w 会在打开时把文件截断，持锁进程刚写进去的 pid 就被抹掉了
             # （锁本身是文件区域锁，与文件内容无关，互斥不受影响；丢的是排障用的"谁在跑"）
@@ -782,6 +797,41 @@ def _webhook_values(value) -> list[str]:
         match = _WEBHOOK_ID_RE.search(part)
         if match:
             result.append(match.group(1))
+    return result
+
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def safe_label(value, limit: int = 80) -> str:
+    """外部字段名进日志/飞书卡片前的转义：去控制字符与反引号、限长。
+
+    字段名来自接口返回的 JSON 键（不可控）：换行能伪造日志行，反引号会提前闭合
+    飞书卡片里的行内代码。只影响展示，不影响入库的 json 原值。
+    """
+    text = _CONTROL_CHARS_RE.sub(" ", str(value)).replace("`", "'")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def webhook_targets(value) -> list[str]:
+    """把 notify.webhook 归一化成地址列表（字符串或字符串数组）。
+
+    运行时口径：去首尾空白、去空、去重保序；非字符串元素忽略——配置校验阶段会先拦，
+    这里再兜一层，保证告警链路不会因为一个写错的目标把主流程带崩。
+    """
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple)):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        item = item.strip()
+        if item and item not in seen:
+            seen.add(item)
+            result.append(item)
     return result
 
 
