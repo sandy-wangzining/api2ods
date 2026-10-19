@@ -9229,12 +9229,48 @@ class TestLargeJsonResponse(OfflineTestCase):
                 self.assertEqual(rows, [{"序号": "1", "金额": "100"}])
 
     def test_large_jsonl_single_record_honors_explicit_opt_in(self):
-        body = {"value": "x" * (parsers._SNIFF_MAX_BYTES + 10)}
-        data = json.dumps(body).encode()
-        records = parsers.parse_bytes(data, {"format": "jsonl", "allow_single_record": True}, "test")
-        self.assertEqual(records, [body])
-        with self.assertRaisesRegex(RuntimeError, "JSON"):
-            parsers.parse_bytes(data, {"format": "jsonl", "allow_single_record": False}, "test")
+        body = {"value": "x" * (parsers._SNIFF_MAX_BYTES + 10) + "\u2028\u0a00中"}
+        text = json.dumps(body, ensure_ascii=False)
+        for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-32"):
+            for suffix in ("", "\n", "\r", "\r\n", "\n \r\n\t"):
+                with self.subTest(encoding=encoding, suffix=suffix):
+                    data = (text + suffix).encode(encoding)
+                    cfg = {"format": "jsonl", "encoding": encoding, "allow_single_record": True}
+                    self.assertEqual(parsers.parse_bytes(data, cfg, "test"), [body])
+                    cfg["allow_single_record"] = False
+                    with self.assertRaisesRegex(RuntimeError, "JSON"):
+                        parsers.parse_bytes(data, cfg, "test")
+
+    def test_large_jsonl_multiple_records_remain_supported(self):
+        rows = [{"value": "x" * (parsers._SNIFF_MAX_BYTES + 10)}, {"value": "second"}]
+        for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-32"):
+            for newline in ("\n", "\r", "\r\n"):
+                with self.subTest(encoding=encoding, newline=newline):
+                    text = newline.join(json.dumps(row) for row in rows) + newline
+                    cfg = {"format": "jsonl", "encoding": encoding}
+                    self.assertEqual(parsers.parse_bytes(text.encode(encoding), cfg, "test"), rows)
+
+    def test_single_record_sniff_decodes_in_bounded_chunks(self):
+        sizes = []
+        real_factory = parsers.codecs.getincrementaldecoder
+
+        def factory(encoding):
+            def decoder(**kwargs):
+                actual = real_factory(encoding)(**kwargs)
+
+                def decode(chunk, **options):
+                    sizes.append(len(chunk))
+                    return actual.decode(chunk, **options)
+
+                return type("Decoder", (), {"decode": staticmethod(decode)})()
+
+            return decoder
+
+        data = ('{"value":"' + "x" * (parsers._SNIFF_MAX_BYTES + 10) + '"}\r\n').encode()
+        with mock.patch.object(parsers.codecs, "getincrementaldecoder", side_effect=factory):
+            self.assertFalse(parsers._has_multiple_content_lines(data, "utf-8"))
+        self.assertGreater(len(sizes), 1)
+        self.assertLessEqual(max(sizes), 65536)
 
     def test_large_json_with_bom_or_whitespace_is_rejected(self):
         text = '{"value":"' + "x" * (parsers._SNIFF_MAX_BYTES + 10) + '"}'
@@ -9247,6 +9283,18 @@ class TestLargeJsonResponse(OfflineTestCase):
 
 class TestFieldWatch(OfflineTestCase):
     """字段快照：观察并集、读写往返、同名不同作业互不串。"""
+
+    @unittest.skipUnless(os.name == "posix", "POSIX surrogateescape 文件名")
+    def test_non_utf8_job_path_roundtrips_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp) / os.fsdecode(b"job-\xff.json")
+            fieldwatch_mod.save_snapshot(job, ["a"], job.stem)
+            self.assertEqual(fieldwatch_mod.load_snapshot(job), {"a"})
+
+    @unittest.skipUnless(os.name == "posix", "POSIX surrogateescape 文件名")
+    def test_non_utf8_job_path_can_acquire_lock_location(self):
+        job = Path(os.fsdecode(b"job-\xff.json"))
+        self.assertEqual(cli_mod._lock_path(job), cli_mod._lock_path(job))
 
     def test_observer_union(self):
         observer = fieldwatch_mod.FieldObserver()
