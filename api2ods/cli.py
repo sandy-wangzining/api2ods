@@ -23,6 +23,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import VERSION, fieldwatch
+from ._common import private_lock_dir
 from .config import (
     build_context_doc,
     check_block_types,
@@ -251,11 +252,13 @@ def _lock_path(job_path: Path) -> Path:
             # 显式指定的目录不可用要立刻失败：静默换目录等于互斥失效，正是这个开关要防的事
             raise SystemExit(f"API2ODS_LOCK_DIR 指定的锁目录不可用（{exc}）：{base}") from exc
         return base / f"{name}.lock"
-    candidates = [ROOT / ".run-locks", Path(tempfile.gettempdir()) / "api2ods-locks"]
-    for index, base in enumerate(candidates):
+    last_error = None
+    for index in range(2):
         try:
+            base = ROOT / ".run-locks" if index == 0 else private_lock_dir("api2ods")
             base.mkdir(parents=True, exist_ok=True)
-        except OSError:
+        except OSError as exc:
+            last_error = exc
             continue
         try:
             # 探测文件名必须唯一（mkstemp）：原来用所有作业共享的 ".probe"，并发启动时
@@ -276,12 +279,9 @@ def _lock_path(job_path: Path) -> Path:
                 f"若存在多用户/多环境混跑，请用 API2ODS_LOCK_DIR 固定同一锁目录"
             )
         return base / f"{name}.lock"
-    fallback = Path(tempfile.gettempdir()) / f"api2ods-{name}.lock"
-    log(
-        f"  警告：工具目录与系统临时目录都不可写，运行锁临时退回 {fallback}；"
-        f"请用 API2ODS_LOCK_DIR 指定一个可写的固定锁目录，否则并发保护可能失效"
-    )
-    return fallback
+    raise SystemExit(
+        f"无法创建安全运行锁目录（{last_error}）；请用 API2ODS_LOCK_DIR 指定可写的固定目录"
+    ) from last_error
 
 
 def _redact_job(job: dict, text, config: dict | None = None) -> str:

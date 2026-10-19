@@ -131,6 +131,15 @@ def _marker_outside_quotes(line: str, marker: str, quoted: bool, delimiter: str 
     TSV 尤其多）只是普通字符，不能拿它翻转状态——否则标记会被误判成"在引号里"，
     文件有内容却报"找不到明细段"，还指不清方向。
     """
+    # 完整单行记录中的字段名可以加引号；跨行字段继续由下面的状态机跳过。
+    if not quoted and '"' in line:
+        try:
+            fields = next(csv.reader([line], delimiter=delimiter, strict=True))
+        except (csv.Error, StopIteration):
+            pass
+        else:
+            if marker in fields:
+                return True, False
     index = 0
     while index < len(line):
         char = line[index]
@@ -465,8 +474,12 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
                     continue
                 # 大且单行（如 300MB 单行 JSON 导出）：整包 decode 是 OOM 源——只按
                 # 首/尾字节判定「整包就是一个 JSON」（首 {/[ 且尾 }/]），宁失败勿 OOM
-                tail_bytes = data.rstrip(b"\r\n\t ")
-                if data[:1] in (b"{", b"[") and tail_bytes[-1:] in (b"}", b"]"):
+                tail_text = data[-4096:].decode(name, "replace").rstrip()
+                if stripped[:1] in ("{", "[") and tail_text[-1:] in ("}", "]"):
+                    if str(parse_cfg.get("format") or "").lower() == "jsonl" and as_bool(
+                        parse_cfg.get("allow_single_record"), default=False, field="parse.allow_single_record"
+                    ):
+                        continue
                     raise RuntimeError(
                         f"{label} {where}期望文件流，但响应像一个 JSON（大响应不整包解码：首尾字符与 JSON 一致）"
                     )

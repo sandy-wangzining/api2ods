@@ -93,7 +93,7 @@ def save_snapshot(job_path: Path, fields, job_name: str) -> None:
                     pass
                 raise
             with tmp:
-                tmp.write(json.dumps(payload, ensure_ascii=False, indent=2))
+                tmp.write(json.dumps(payload, ensure_ascii=True, indent=2))
             os.replace(tmp_name, path)
         except Exception:
             try:
@@ -101,5 +101,5 @@ def save_snapshot(job_path: Path, fields, job_name: str) -> None:
             except OSError:
                 pass
             raise
-    except OSError as exc:
+    except (OSError, ValueError, TypeError) as exc:
         log(f"  警告：字段快照写入失败（{path}）：{exc}（不影响本次数据）")

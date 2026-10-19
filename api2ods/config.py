@@ -291,7 +291,15 @@ def render_job(job_raw: dict, config: dict, bizdate: date) -> tuple[dict, dict]:
     # 类型检查必须在任何取值之前：下面 date_tz_of 就要取 window.date_tz / window 块，
     # 而 window 写成字符串时那是 'str' object has no attribute 'get' 的裸 traceback
     check_block_types(job_raw)
-    context = build_context(config, bizdate, job_raw.get("secrets"), tz=date_tz_of(job_raw))
+    # 时区先解析 secrets，再生成日期上下文，避免把占位符当成时区名。
+    clock_job = job_raw
+    clock_block = job_raw.get("window")
+    if isinstance(clock_block, dict) and isinstance(clock_block.get("date_tz"), str) and "${" in clock_block["date_tz"]:
+        secrets = _as_secrets(config.get("secrets"), "--config 文件里的 secrets")
+        secrets.update(_as_secrets(job_raw.get("secrets"), "作业配置的 secrets"))
+        resolved_zone = deep_substitute(clock_block["date_tz"], {"secrets": secrets})
+        clock_job = {**job_raw, "window": {**clock_block, "date_tz": resolved_zone}}
+    context = build_context(config, bizdate, job_raw.get("secrets"), tz=date_tz_of(clock_job))
     job = {key: value for key, value in job_raw.items() if key != "secrets"}
     rendered = deep_substitute(job, context)
     rendered["secrets"] = _as_secrets(job_raw.get("secrets"), "作业配置的 secrets")

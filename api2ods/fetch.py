@@ -17,7 +17,7 @@ import decimal
 import math
 import re
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -389,7 +389,7 @@ class Fetcher:
         """执行一个请求单元，返回该单元的记录列表。
 
         三个 override 参数仅供 --check 限量使用（正式同步不传），确保体检只发一次请求。
-        _stop 仅供并发路径注入「本轮」的停止信号（默认用实例当前的 self._stop）：
+        _stop 仅供并发路径注入「本轮」的停止信号；单独调用时使用新的停止信号：
         必须按轮注入——下一轮会换新对象，遗留 worker 只认自己那轮、不会被复活。
         """
         # 基础参数 + 该单元的窗口参数（如 startTime/endTime）
@@ -405,7 +405,14 @@ class Fetcher:
             )
             return self._decorate(records)
         return self._decorate(
-            self._fetch_pages(unit, params, page_size_override, max_pages_override, stop_after_first_page, stop=_stop)
+            self._fetch_pages(
+                unit,
+                params,
+                page_size_override,
+                max_pages_override,
+                stop_after_first_page,
+                stop=_stop if _stop is not None else threading.Event(),
+            )
         )
 
     def _fetch_pages(
@@ -511,6 +518,7 @@ class Fetcher:
         records: list[dict] = []
         current = 1
         cursor = cursor_start
+        seen_cursors = {str(cursor)}
         first_page = True
         # 最近一次读到的终点值（见 ③ 里的说明：有些接口只在第一页回）
         last_total_pages = None
@@ -563,7 +571,14 @@ class Fetcher:
                 # 直接收尾、成功写 0 行。按"接口抖动"处理会整窗重试到失败，把正常的
                 # 零数据日变成天天报警。限第一页（还没拉到任何记录）才这么判：中途翻出
                 # 空页却报 0 条，与前几页的记录自相矛盾，那种情况照旧按未翻完处理
-                if not page_records and not records and (_is_zero_count(raw_pages) or _is_zero_count(raw_items)):
+                if (
+                    not page_records
+                    and not records
+                    and (_is_zero_count(raw_pages) or _is_zero_count(raw_items))
+                    and _positive_int(raw_pages) is None
+                    and _positive_int(raw_items) is None
+                ):
+                    # 一项为零、另一项仍报告有数据时不是零数据日，交给严格空页检查报错。
                     break
                 # 很多接口只在第一页回 totalPages / TotalCount，后续页不带。读到就记下来，
                 # 翻到空页时用最后一次读到的值判断——否则"数据已拉全、末页之后又空翻一页"
@@ -629,17 +644,18 @@ class Fetcher:
                             f"（TotalCount={total_items}，已拉 {len(records)} 条）——cursor_path 是否写错？"
                         )
                         if strict:
-                            raise RuntimeError(message)
+                            raise UnconfirmedEndError(message)
                         log(f"  警告：{message}；pagination.strict=false，按已拉到的 {len(records)} 条收尾")
                     break
-                if str(next_cursor) == str(cursor):
+                if str(next_cursor) in seen_cursors:
                     # 按字符串判等：param_as_string 场景下发出去的是 "1000"、接口回显可能
                     # 是数字 1000——类型不一致时漏判"游标未推进"会一路翻满 max_pages
                     # 游标原样回显（cursor_path 配到了恒定字段）：继续翻只会把同一页拉满
                     # max_pages 次——重复数据无上限累积、还向接口打几千次重复请求
                     raise ConfigError(
-                        f"{unit.label} 游标未推进（接口回显了同一个游标）：请检查 cursor_path / cursor_param 配置"
+                        f"{unit.label} 游标未推进或出现循环（接口回显了已用过的游标）：请检查 cursor_path / cursor_param 配置"
                     )
+                seen_cursors.add(str(next_cursor))
                 cursor = next_cursor
 
             # ④ 翻页间隔 + 体检模式的提前返回
@@ -760,29 +776,34 @@ class Fetcher:
                 # 保持"方法结束即当轮 _stop 已置位"的不变式；下一轮会换新对象（不复位这个）
                 stop.set()
         else:
-            # 并发：只并发网络等待；回调在主线程的 as_completed 循环里，天然串行安全
+            # 未落盘的单元最多 workers 个，避免快速接口把全窗口结果堆在 Future 中。
             pool = ThreadPoolExecutor(max_workers=workers)
             try:
-                futures = {pool.submit(run_unit, unit): unit for unit in units}
-                for future in as_completed(futures):
-                    unit = futures.pop(future)
-                    try:
-                        label, records = future.result()
-                        handle(label, records)
-                        # future 会一直持有返回值（as_completed 内部的集合要到 fetch_all 返回
-                        # 才释放）：不做处理的话，--workers 回补时全窗口数据都驻留内存，打破
-                        # "峰值内存=单个请求单元"的承诺。落盘完成后立即清空（数据已进 spool；
-                        # on_records 拿到的是副本，不受这次清空影响）
-                        if isinstance(records, list):
-                            records.clear()
-                    except (FatalApiError, ConfigError):
-                        # 不能省：下面的 except Exception 会把它吃掉，变成"每个单元各失败一次"，
-                        # 而 401/配置错对所有单元都成立，继续跑只是把同一个错误重复几十遍
-                        raise
-                    except Exception as exc:  # noqa: BLE001
-                        # 同上：on_records（落盘）抛出的报错不经 run_unit，必须自己脱敏
-                        failures.append((unit.label, self.redact(exc)))
-                        log(f"  ❌ {unit.label} 拉取失败：{self.redact(exc)}")
+                pending_units = iter(units)
+                futures = {}
+                for _ in range(min(workers, len(units))):
+                    unit = next(pending_units)
+                    futures[pool.submit(run_unit, unit)] = unit
+                while futures:
+                    completed, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in completed:
+                        unit = futures.pop(future)
+                        try:
+                            label, records = future.result()
+                            handle(label, records)
+                            # 回调收到副本；清掉 Future 持有的原列表后才补交新单元。
+                            if isinstance(records, list):
+                                records.clear()
+                        except (FatalApiError, ConfigError):
+                            raise
+                        except Exception as exc:  # noqa: BLE001
+                            failures.append((unit.label, self.redact(exc)))
+                            log(f"  ❌ {unit.label} 拉取失败：{self.redact(exc)}")
+                    for _ in range(workers - len(futures)):
+                        unit = next(pending_units, None)
+                        if unit is None:
+                            break
+                        futures[pool.submit(run_unit, unit)] = unit
             finally:
                 # 置当轮停止信号：本方法要退出了（成功/失败/中断都一样），在飞 worker 据此
                 # 不再发新请求、不再空等退避 sleep——否则它们会带着整窗重试继续打接口，
