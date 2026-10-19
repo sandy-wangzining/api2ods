@@ -318,6 +318,28 @@ class TestValidateJob(OfflineTestCase):
         with self.assertRaises(SystemExit):
             config_mod.validate_job(job)
 
+    def test_notify_webhook_array(self):
+        job = minimal_job()
+        job["notify"] = {"webhook": [" https://hook/a ", "https://hook/b", "https://hook/a"]}
+        got = config_mod.normalize_job(job)
+        config_mod.validate_job(got)
+        self.assertEqual(got["notify"]["webhook"], ["https://hook/a", "https://hook/b"])
+
+    def test_notify_webhook_array_bad_item(self):
+        job = minimal_job()
+        job["notify"] = {"webhook": ["https://hook/a", 123]}
+        with self.assertRaises(SystemExit):
+            config_mod.validate_job(job)
+
+    def test_notify_webhook_array_placeholders_render(self):
+        """数组里的 ${secrets.x} 占位符逐项渲染（多群地址可放 secrets）。"""
+        job = minimal_job()
+        job["secrets"] = {"hook_a": "https://a/hook/1", "hook_b": "https://b/hook/2"}
+        job["notify"] = {"webhook": ["${secrets.hook_a}", "${secrets.hook_b}"]}
+        rendered, _ = config_mod.render_job(job, {}, date(2026, 9, 18))
+        config_mod.validate_job(rendered)
+        self.assertEqual(rendered["notify"]["webhook"], ["https://a/hook/1", "https://b/hook/2"])
+
     def test_notify_bad_enabled(self):
         job = minimal_job()
         job["notify"] = {"enabled": "flase"}
@@ -4121,13 +4143,21 @@ class TestRunLock(OfflineTestCase):
             # Windows 上持锁期间独占文件，出了 with 再读
             self.assertEqual(path.read_text(encoding="utf-8"), str(os.getpid()))
 
-    def test_lock_degrades_to_noop_without_platform_support(self):
-        """没有 flock/msvcrt 的平台（罕见）退化成不阻塞：不能因此让工具跑不起来。"""
+    def test_lock_refuses_without_platform_support(self):
+        """没有 flock/msvcrt 的平台（罕见）默认拒绝无锁执行；显式 ALLOW_NO_LOCK=1 才继续。"""
         with mock.patch.object(utils, "fcntl", None), mock.patch.object(utils, "msvcrt", None):
             with tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / "job.lock"
-                with utils.RunLock(path):
-                    pass
+                with mock.patch.dict(os.environ, {}, clear=True):
+                    with self.assertRaises(SystemExit):
+                        with utils.RunLock(path):
+                            pass
+                with (
+                    mock.patch.dict(os.environ, {"API2ODS_ALLOW_NO_LOCK": "1"}, clear=True),
+                    mock.patch.object(utils, "log"),
+                ):
+                    with utils.RunLock(path):
+                        pass
                 self.assertFalse(path.exists())  # 没有加锁就不该建文件
 
 
@@ -4203,6 +4233,27 @@ class TestLogging(OfflineTestCase):
         utils.remove_log_sink(handle)
         utils.remove_log_sink(handle)  # 第二次：句柄已关、也已不在列表里
         utils.remove_log_sink(None)  # 没挂日志文件时传 None
+
+    def test_removed_sink_race_is_not_reported_as_broken(self):
+        """快照取完后句柄被正常摘除并关闭：不能误报"写入失败"（并发收尾场景）。"""
+        utils.reset_log_once()
+
+        class ClosingSink:
+            def write(self, _text):
+                utils._sinks.remove(self)  # 模拟 remove_log_sink 在快照之后摘掉
+                raise ValueError("I/O operation on closed file")
+
+            def flush(self):
+                pass
+
+            def close(self):
+                pass
+
+        handle = ClosingSink()
+        utils.add_log_sink(handle)
+        utils.log("并发收尾")
+        self.assertNotIn(handle, utils._sinks)
+        self.assertFalse(utils._sink_write_warned)
 
     def test_broken_sink_does_not_break_logging(self):
         """日志文件写失败（磁盘满/句柄被关）不能影响主流程，且要能被看见一次。"""
@@ -4485,6 +4536,13 @@ class TestNumericConfigGuards(OfflineTestCase):
             config_mod._require_number(10**400, "window.days", exclusive_min=0, integer=True)
         self.assertIn("window.days", str(ctx.exception))
 
+    def test_decimal_string_is_rejected_as_integer(self):
+        """'2.0'/'1e3' 能通过 float() 的整值判断，但运行期 int() 会崩：配置阶段必须拦下。"""
+        for value in ("2.0", "1e3", " 3.5 "):
+            with self.assertRaises(SystemExit) as ctx:
+                config_mod._require_number(value, "pagination.page_size", exclusive_min=0, integer=True)
+            self.assertIn("pagination.page_size", str(ctx.exception))
+
     def test_negative_retry_delay_reports_config_error(self):
         """retry_delay 配成负数会在退避 sleep 时抛裸 ValueError，配置阶段就要拦下。"""
         job = minimal_job(
@@ -4754,7 +4812,7 @@ class TestFourthPassReview(OfflineTestCase):
                 mock.patch.object(cli_mod, "_lock_path", lambda p: Path(tmp) / "t.lock"),
                 mock.patch.object(cli_mod.os, "_exit", side_effect=exits.append),
             ):
-                rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260920", "--days", "1"])
+                rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260920", "--days", "1"], hard_exit=True)
         # 真的走了硬退出（真实 os._exit 不返回，这里被 mock 掉所以还能拿到返回值）
         self.assertEqual(exits, [130])
         self.assertEqual(rc, 130)
@@ -4793,7 +4851,9 @@ class TestFourthPassReview(OfflineTestCase):
                 mock.patch.object(cli_mod, "_lock_path", lambda p: Path(tmp) / "t.lock"),
                 mock.patch.object(cli_mod.os, "_exit", side_effect=exits.append),
             ):
-                rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260920", "--days", "3", "--workers", "3"])
+                rc = cli_mod.main(
+                    ["--job", str(job_file), "--bizdate", "20260920", "--days", "3", "--workers", "3"], hard_exit=True
+                )
         self.assertEqual(exits, [1])
         self.assertEqual(rc, 1)
 
@@ -4813,6 +4873,66 @@ class TestFourthPassReview(OfflineTestCase):
                 rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260920"])
         self.assertEqual(rc, 1)
         exited.assert_not_called()
+
+    def test_embedded_call_returns_code_without_hard_exit(self):
+        """库/嵌入调用（默认 hard_exit=False）：即使并发失败也只返回 int，不终止宿主进程。"""
+        import api2ods.cli as cli_mod
+
+        with tempfile.TemporaryDirectory() as tmp:
+            job_file = Path(tmp) / "demo.json"
+            job_file.write_text(json.dumps(minimal_job()), encoding="utf-8")
+            with (
+                mock.patch.object(cli_mod, "run_sync", return_value=1),
+                mock.patch.object(cli_mod, "_open_log_file", lambda p: None),
+                mock.patch.object(cli_mod, "_lock_path", lambda p: Path(tmp) / "t.lock"),
+                mock.patch.object(cli_mod.os, "_exit") as exited,
+            ):
+                rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260920", "--days", "3", "--workers", "3"])
+        self.assertEqual(rc, 1)
+        exited.assert_not_called()
+
+    def test_hard_exit_survives_missing_standard_streams(self):
+        """sys.stdout/stderr 为 None（pythonw 等）时 flush 抛 AttributeError，硬退出仍要生效。"""
+        import api2ods.cli as cli_mod
+
+        exits = []
+        with tempfile.TemporaryDirectory() as tmp:
+            job_file = Path(tmp) / "demo.json"
+            job_file.write_text(json.dumps(minimal_job()), encoding="utf-8")
+            with (
+                mock.patch.object(cli_mod, "run_sync", return_value=1),
+                mock.patch.object(cli_mod, "_open_log_file", lambda p: None),
+                mock.patch.object(cli_mod, "_lock_path", lambda p: Path(tmp) / "t.lock"),
+                mock.patch.object(cli_mod.os, "_exit", side_effect=exits.append),
+                mock.patch.object(cli_mod.sys, "stdout", None),
+                mock.patch.object(cli_mod.sys, "stderr", None),
+            ):
+                rc = cli_mod.main(
+                    ["--job", str(job_file), "--bizdate", "20260920", "--days", "3", "--workers", "3"], hard_exit=True
+                )
+        self.assertEqual(exits, [1])
+        self.assertEqual(rc, 1)
+
+    def test_unexpected_error_from_run_sync_exits_hard(self):
+        """run_sync 抛未预期异常时也要走脱敏日志 + 硬退出，不能裸 traceback 冒泡。"""
+        import api2ods.cli as cli_mod
+
+        exits = []
+        messages = []
+        with tempfile.TemporaryDirectory() as tmp:
+            job_file = Path(tmp) / "demo.json"
+            job_file.write_text(json.dumps(minimal_job()), encoding="utf-8")
+            with (
+                mock.patch.object(cli_mod, "run_sync", side_effect=RuntimeError("boom")),
+                mock.patch.object(cli_mod, "_open_log_file", lambda p: None),
+                mock.patch.object(cli_mod, "_lock_path", lambda p: Path(tmp) / "t.lock"),
+                mock.patch.object(cli_mod.os, "_exit", side_effect=exits.append),
+                mock.patch.object(cli_mod, "log", side_effect=lambda msg: messages.append(str(msg))),
+            ):
+                rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260920", "--workers", "3"], hard_exit=True)
+        self.assertEqual(exits, [1])
+        self.assertEqual(rc, 1)
+        self.assertTrue(any("未预期错误" in msg for msg in messages))
 
     def test_size_error_hints_are_specific(self):
         """关键词要够具体：无关的 400 不该被当成"页大小被拒"而多发一次请求。"""
@@ -5391,10 +5511,13 @@ class TestMainEntry(OfflineTestCase):
         self.assertEqual(rc, 1)
         self.assertIn("no_such_job.json", chr(10).join(lines))
 
-    def test_version_flag_exits(self):
-        with self.assertRaises(SystemExit) as ctx:
-            self._main(["--version"])
-        self.assertEqual(ctx.exception.code, 0)
+    def test_version_flag_returns_zero(self):
+        """--version 走正常退出语义；main 仍返回 int（嵌入调用不被 SystemExit 终止）。"""
+        self.assertEqual(self._main(["--version"]), 0)
+
+    def test_parse_error_returns_2(self):
+        """argparse 阶段（未做任何操作）的参数错误按"参数问题"返回 2，不退化成 SystemExit。"""
+        self.assertEqual(self._main(["--job", "x", "--sql-timeout", "-5"]), 2)
 
     def test_log_file_pointing_at_directory_reports_clearly(self):
         """--log-file 给成目录：要一句人话，而不是 IsADirectoryError 的裸 traceback。"""
@@ -6000,7 +6123,9 @@ class TestFourthPassUtilsCliWizard(OfflineTestCase):
                 mock.patch.object(cli_mod, "_lock_path", lambda p: Path(tmp) / "t.lock"),
                 mock.patch.object(cli_mod.os, "_exit", side_effect=exits.append),
             ):
-                rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260920", "--days", "1", "--workers", "3"])
+                rc = cli_mod.main(
+                    ["--job", str(job_file), "--bizdate", "20260920", "--days", "1", "--workers", "3"], hard_exit=True
+                )
         self.assertEqual(exits, [1])
         self.assertEqual(rc, 1)
 
@@ -7187,7 +7312,7 @@ class TestMainBranches(OfflineTestCase):
                 mock.patch.object(cli_mod, "_lock_path", lambda p: Path(tmp) / "t.lock"),
                 mock.patch.object(cli_mod.os, "_exit", side_effect=exits.append),
             ):
-                rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260920"])
+                rc = cli_mod.main(["--job", str(job_file), "--bizdate", "20260920"], hard_exit=True)
         self.assertEqual(rc, 130)
         self.assertEqual(exits, [130])
 
@@ -8960,6 +9085,36 @@ class TestNotifyModule(OfflineTestCase):
             with mock.patch.object(notify_mod.requests, "post", return_value=resp):
                 self.assertFalse(notify_mod.notify("https://x/hook/abc", "t", ["x"]), payload)
 
+    def test_multiple_webhooks(self):
+        """webhook 写成数组时逐个群发送（多个群同时告警）。"""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"code": 0}
+        hooks = ["https://open.feishu.cn/open-apis/bot/v2/hook/aaa", "https://open.feishu.cn/open-apis/bot/v2/hook/bbb"]
+        with mock.patch.object(notify_mod.requests, "post", return_value=resp) as post:
+            self.assertTrue(notify_mod.notify(hooks, "t", ["x"]))
+        self.assertEqual([call.args[0] for call in post.call_args_list], hooks)
+
+    def test_multiple_webhooks_partial_failure(self):
+        """单个群失败不影响其它群，整体返回 False（告警失败不改主流程退出码）。"""
+        resp = mock.Mock(status_code=200)
+        resp.json.return_value = {"code": 0}
+
+        def post(url, **kwargs):
+            if url.endswith("/bad"):
+                raise RuntimeError("down")
+            return resp
+
+        with mock.patch.object(notify_mod.requests, "post", side_effect=post) as fake_post:
+            self.assertFalse(notify_mod.notify(["https://x/hook/bad", "https://x/hook/ok"], "t", ["x"]))
+        self.assertEqual(fake_post.call_count, 2)
+
+    def test_invalid_webhook_type_warns_and_skips(self):
+        """webhook 写成对象等非法类型时不能静默跳过告警（配置错要能看见）。"""
+        messages: list[str] = []
+        with mock.patch.object(notify_mod, "log", side_effect=lambda msg: messages.append(str(msg))):
+            self.assertFalse(notify_mod.notify({"url": "https://x/hook/abc"}, "t", ["x"]))
+        self.assertTrue(any("没有可用地址" in msg for msg in messages))
+
     def test_failure_does_not_raise_and_redacts_hook_id(self):
         messages: list[str] = []
         hook = "https://open.feishu.cn/open-apis/bot/v2/hook/deadbeef00cafe"
@@ -9018,9 +9173,30 @@ class TestFieldWatch(OfflineTestCase):
 class TestNotifyRedaction(OfflineTestCase):
     """webhook 是凭证：裸 hook id 纳入值级脱敏，/hook/<id> 形态也要遮。"""
 
+    def test_safe_label_escapes_control_and_backticks(self):
+        """外部字段名进日志/飞书卡片前转义：换行/控制字符/反引号不能原样拼入。"""
+        self.assertEqual(utils.safe_label("a`b\nc\x00d"), "a'b c d")
+        long = "x" * 100
+        shown = utils.safe_label(long)
+        self.assertEqual(len(shown), 81)
+        self.assertTrue(shown.endswith("…"))
+
     def test_webhook_hook_id_collected(self):
         job = {"notify": {"webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/0123abcd-0000-4ef0"}}
         self.assertIn("0123abcd-0000-4ef0", utils.collect_secret_values(job))
+
+    def test_webhook_array_hook_ids_collected(self):
+        job = {
+            "notify": {
+                "webhook": [
+                    "https://open.feishu.cn/open-apis/bot/v2/hook/hook-one-1111",
+                    "https://open.feishu.cn/open-apis/bot/v2/hook/hook-two-2222",
+                ]
+            }
+        }
+        values = utils.collect_secret_values(job)
+        self.assertIn("hook-one-1111", values)
+        self.assertIn("hook-two-2222", values)
 
     def test_redact_masks_hook_id_shape(self):
         text = "Max retries exceeded with url: /open-apis/bot/v2/hook/deadbeefcafe (Caused by ...)"
@@ -9232,6 +9408,21 @@ class TestRemainingProductBugs(OfflineTestCase):
             mock.patch.object(utils, "log"),
         ):
             self.assertTrue(utils._try_lock("fh"))
+
+    def test_missing_lock_module_fails_closed(self):
+        """平台没有 fcntl/msvcrt 时默认拒绝无锁执行；显式 API2ODS_ALLOW_NO_LOCK=1 才放行。"""
+        with mock.patch.object(utils, "fcntl", None), mock.patch.object(utils, "msvcrt", None):
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with self.assertRaises(SystemExit) as ctx:
+                    utils.RunLock(Path("x.lock")).__enter__()
+                self.assertIn("ALLOW_NO_LOCK", str(ctx.exception))
+            with (
+                mock.patch.dict(os.environ, {"API2ODS_ALLOW_NO_LOCK": "1"}, clear=True),
+                mock.patch.object(utils, "log"),
+            ):
+                lock = utils.RunLock(Path("x.lock"))
+                self.assertIs(lock.__enter__(), lock)
+                lock.__exit__(None, None, None)
 
     def test_try_lock_other_oserror_raises(self):
         fake_fcntl = mock.Mock()

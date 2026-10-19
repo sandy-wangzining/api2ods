@@ -159,7 +159,7 @@
   },
 
   "notify": {
-    "//": "可选：字段漂移等提醒的飞书群机器人（也可放共享 --config 文件的 notify 块，作业级覆盖）",
+    "//": "可选：字段漂移等提醒的飞书群机器人；支持字符串或字符串数组（多个群同时发）。也可放共享 --config 文件的 notify 块，作业级覆盖",
     "webhook": "https://open.feishu.cn/open-apis/bot/v2/hook/<id>",
     "enabled": true
   }

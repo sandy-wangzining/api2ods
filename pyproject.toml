@@ -33,7 +33,7 @@ dependencies = [
 ]
 
 [project.scripts]
-api2ods = "api2ods.cli:main"
+api2ods = "api2ods.cli:cli"
 
 [project.urls]
 Homepage = "https://github.com/sandy-wangzining/api2ods"

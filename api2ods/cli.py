@@ -59,6 +59,7 @@ from .utils import (
     redact,
     redact_secrets,
     reset_log_once,
+    safe_label,
     setup_console,
 )
 
@@ -297,10 +298,11 @@ def _redact_job(job: dict, text, config: dict | None = None) -> str:
 def _notifier(job: dict, args):
     """构造飞书通知函数：读合并后的 job.notify（见 main 的 resolve_notify），--no-notify 关闭。
 
+    webhook 支持字符串或字符串数组（多个群同时告警），归一化在 notify 模块内部完成。
     告警发送失败不影响退出码（notify 模块只记日志）；未配 webhook 时静默跳过。
     """
     cfg = job.get("notify") or {}
-    webhook = str(cfg.get("webhook") or "")
+    webhook = cfg.get("webhook") or ""
     enabled = as_bool(cfg.get("enabled"), default=True, field="notify.enabled") and not args.no_notify
     return lambda title, lines, footer="": notify(webhook, title, lines, footer, enabled=enabled)
 
@@ -486,7 +488,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             # 字段名来自接口键名（外部、数量不受控）：展示截断，避免日志行/飞书卡片超长被拒
             # （完整清单不影响入库，json 列原样保留）
             limit = 50
-            shown = "、".join(f"`{name}`" for name in new_fields[:limit])
+            shown = "、".join(f"`{safe_label(name)}`" for name in new_fields[:limit])
             if len(new_fields) > limit:
                 shown += f"…（共 {len(new_fields)} 个，仅显示前 {limit} 个）"
             log(
@@ -587,8 +589,10 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
                 lambda: spool.iter_batches(WRITE_BATCH_SIZE, MAX_BATCH_BYTES),
                 total=spool.count,
                 timeout=args.sql_timeout,
-                # 写库重试的报错也要按配置里的密钥值遮一道（Tunnel/SQL 报错里可能带签名 URL）
-                secrets=collect_secret_values(job),
+                # 写库重试的报错也要按配置里的密钥值遮一道（Tunnel/SQL 报错里可能带签名 URL）。
+                # 凭证可能只写在 --config（作业文件里是 ${secrets.x}），两份都要收——
+                # 与文件其它脱敏出口（_redact_job / main 兜底）同口径
+                secrets=collect_secret_values(job) + collect_secret_values(config),
             )
             log(f"已写入 pt={pt}：{spool.count:,} 行，耗时 {(time.time() - started_write) / 60:.1f} 分钟")
 
@@ -638,16 +642,23 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             log(f"  警告：清理落盘临时文件失败（{exc}）；不影响本次运行结果")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, hard_exit: bool = False) -> int:
     """命令行入口。返回退出码：0 成功 / 1 运行失败 / 2 参数问题 / 130 用户中断。
 
     调度系统按退出码判断成败，所以"拉取到 0 行""写后行数对不上"这类情况都返回非 0。
+    hard_exit=True（CLI 入口用）时失败分支会直接 os._exit，不等在飞请求；
+    库/嵌入调用默认 False，严格返回 int、不终止宿主进程。
     """
     setup_console()
     # 告警去重记录按"每次运行"清空：同一进程里 main 被调用多次（测试、嵌入）时，
     # 上一轮的告警会把这一轮同名的那条吞掉，用户看不到任何提示
     reset_log_once()
-    args = build_parser().parse_args(argv)
+    try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as exc:
+        # --help/--version（code 0）保持"打印后正常退出"语义；参数错误按"参数问题"返回 2。
+        # 不能让它冒泡：docstring 承诺返回 int，同进程嵌入调用 main 时宿主不应被直接终止
+        return 0 if exc.code == 0 else 2
 
     # 日志文件要先挂上：--init 的交互问答也值得留痕（原来它 return 在新挂载点之前）
     try:
@@ -771,7 +782,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 130
 
         def _exit_now(code: int) -> int:
-            """立即结束进程，不等在飞的请求。
+            """立即结束进程，不等在飞的请求；库调用（hard_exit=False）只返回退出码。
 
             不能只用 return / SystemExit：解释器退出前会 join 所有 ThreadPoolExecutor 的工作
             线程（threading._register_atexit），并发拉取时那些在飞请求（最长 180s 超时）会把
@@ -780,16 +791,22 @@ def main(argv: list[str] | None = None) -> int:
             这里跳过退出钩子直接 os._exit：走到这一步时 run_sync 已经清过临时文件、放过运行锁
             （写库是先删再填、幂等），日志每条都 flush，没有需要收尾的东西。
 
+            hard_exit=False（库/嵌入调用）时不硬退出：调用方拿到退出码自行决定，
+            但调用方需要自己保证没有在飞线程（否则解释器退出阶段仍会 join）。
             返回 code 只是为了让"被测试 mock 掉的 os._exit"还能拿到退出码；
             真实运行时这一行不会返回。
             """
+            if not hard_exit:
+                return code
             _detach_log_sink(log_handle)
             # 显式 flush：os._exit 不跑解释器退出流程，没 flush 的 stdout/stderr 缓冲
             # （重定向到文件时是块缓冲）会丢——日志每条自行 flush，但非 log() 的输出未必
             for stream in (sys.stdout, sys.stderr):
                 try:
                     stream.flush()
-                except (OSError, ValueError):
+                except (AttributeError, OSError, ValueError):
+                    # 极端形态（pythonw/GUI 下 sys.stdout 为 None）也要走到 os._exit，
+                    # 否则硬退出失效、进程仍会被在飞线程拖住
                     pass
             os._exit(code)
             return code
@@ -816,6 +833,12 @@ def main(argv: list[str] | None = None) -> int:
             # 准备阶段（还没进 run_sync）被 Ctrl+C：没有线程要等，但走同一条出口更省心
             log("已中断（尚未开始运行），退出")
             return _exit_now(130)
+        except Exception as exc:  # noqa: BLE001 - 未预期错误也要走脱敏日志，并保住返回 int 的契约
+            # run_sync 内部的未预期异常（快照 JSON 坏、磁盘满等）原来会以裸 traceback
+            # 冒泡出 main：既违背"返回退出码"的契约，也绕过所有脱敏出口；并发模式下
+            # 还有在飞请求要等，因此与其它失败分支一样走硬退出
+            log(f"❌ 运行失败（未预期错误）：{type(exc).__name__}: {_redact_job(job, exc, config)}")
+            return _exit_now(1)
     except SystemExit as exc:
         # 准备阶段的配置错（bizdate 畸形、缺 request.base_url、占位符写错、validate_job
         # 的各类报错、运行锁拿不到）原来直接冒泡出 main：退出码虽然是对的，但控制台那句
@@ -829,9 +852,22 @@ def main(argv: list[str] | None = None) -> int:
         else:
             log(f"❌ {redact(str(exc))}")
         return 1
+    except Exception as exc:  # noqa: BLE001 - 准备阶段的未预期错误：脱敏后给干净结论（保持退出码契约）
+        try:
+            secrets = collect_secret_values(job_raw) + collect_secret_values(config)
+            message = redact_secrets(secrets, str(exc))
+        except Exception:  # noqa: BLE001 - 兜底自身出错也不能把原始错误盖掉
+            message = redact(str(exc))
+        log(f"❌ 运行失败（未预期错误）：{type(exc).__name__}: {message}")
+        return 1
     finally:
         _detach_log_sink(log_handle)
 
 
+def cli() -> int:  # pragma: no cover - 进程入口（console script / 调度）
+    """命令行入口：保持硬退出语义（失败时不 join 在飞请求）。"""
+    return main(hard_exit=True)
+
+
 if __name__ == "__main__":  # pragma: no cover
-    sys.exit(main())
+    sys.exit(cli())

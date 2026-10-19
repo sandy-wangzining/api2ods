@@ -448,6 +448,10 @@ def _require_number(value, where: str, *, minimum=None, exclusive_min=None, inte
         return
     if isinstance(value, bool):
         raise SystemExit(f"{where} 必须是{'整数' if integer else '数字'}，实际 {_show(value)}")
+    if integer and isinstance(value, str) and not re.fullmatch(r"[+-]?\d+", value.strip()):
+        # 字符串只接受纯整数形态："2.0"/"1e3" 经 float() 后能通过原来的整值判断，
+        # 但运行期 int("2.0") 会抛 ValueError——配置阶段必须直接给出人话报错
+        raise SystemExit(f"{where} 必须是整数，实际 {_show(value)}")
     try:
         number = float(value)
     except (TypeError, ValueError, OverflowError):
@@ -493,10 +497,26 @@ def validate_job(job: dict) -> None:
             )
     notify_cfg = job.get("notify") or {}
     webhook = notify_cfg.get("webhook")
-    if webhook is not None and not isinstance(webhook, str):
-        raise SystemExit(
-            f"notify.webhook 必须是字符串（飞书群机器人地址），实际 {type(webhook).__name__}：{_show(webhook)}"
-        )
+    if webhook is not None:
+        if isinstance(webhook, str):
+            pass  # 允许空串（= 未配置，运行时静默跳过）
+        elif isinstance(webhook, list):
+            cleaned: list[str] = []
+            for index, item in enumerate(webhook, 1):
+                if not isinstance(item, str) or not item.strip():
+                    raise SystemExit(
+                        f"notify.webhook 数组第 {index} 项必须是非空字符串（飞书群机器人地址），"
+                        f"实际 {type(item).__name__}：{_show(item)}"
+                    )
+                item = item.strip()
+                if item not in cleaned:
+                    cleaned.append(item)
+            notify_cfg["webhook"] = cleaned
+        else:
+            raise SystemExit(
+                f"notify.webhook 必须是字符串或字符串数组（飞书群机器人地址），"
+                f"实际 {type(webhook).__name__}：{_show(webhook)}"
+            )
     if "enabled" in notify_cfg:
         as_bool(notify_cfg.get("enabled"), default=True, field="notify.enabled")
     if request.get("add_fields") is not None and not isinstance(request["add_fields"], dict):
