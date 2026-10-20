@@ -9,7 +9,8 @@ import re
 import time
 from pathlib import Path
 
-from .utils import ConfigError, log, progress_log, require_identifier, retry_call
+from . import _common
+from .utils import ConfigError, log, progress_log, redact, require_identifier, retry_call
 
 try:
     from odps import ODPS
@@ -146,34 +147,10 @@ def connect_odps(
 
 
 def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL"):
-    """提交 SQL 并等待完成：成功返回 / 失败抛错 / 超时主动 stop() 取消并抛 TimeoutError。"""
-    instance = o.run_sql(sql)
-    # 单调时钟：量"等了多久"不能用墙钟——NTP 校时/手动改时间会让 now - started
-    # 凭空多出/少掉一大截，误判超时并 stop() 掉正在跑的作业
-    started = time.monotonic()
-    last_log = started
-    while True:
-        if instance.is_successful():
-            return instance
-        if instance.is_terminated():
-            instance.wait_for_success(timeout=1)  # 触发一次，抛出带错误信息的异常
-            if not instance.is_successful():
-                # 不能无条件 return：wait_for_success 万一没抛（超时语义/实现差异），
-                # 终止但失败的实例会被当成成功，后续 DDL 在"其实没执行"的前提下继续跑
-                raise RuntimeError(f"{desc} 已终止但未成功（实例 {getattr(instance, 'id', '?')}）")
-            return instance
-        now = time.monotonic()
-        if timeout and timeout > 0 and now - started > timeout:
-            try:
-                instance.stop()
-            except Exception as exc:  # noqa: BLE001 - 取消失败不影响报错，但要留痕
-                # 云端可能还有悬挂的昂贵 SQL 在跑：静默 pass 会让超时事故无从回溯
-                log(f"    {desc} 取消失败（{type(exc).__name__}: {exc}），云端实例可能仍在运行")
-            raise TimeoutError(f"{desc} 执行超过 {timeout} 秒，已主动停止")
-        if timeout and timeout > 0 and now - last_log >= SQL_HEARTBEAT_SECONDS:
-            log(f"    {desc} 还在执行（已等待 {int(now - started)} 秒，超时阈值 {timeout} 秒）...")
-            last_log = now
-        time.sleep(1)
+    """通过公共实现等待 SQL，保留项目自身的时钟、脱敏日志与超时配置。"""
+    return _common.run_sql_with_timeout(
+        o, sql, timeout, desc, clock=time, log=lambda message: log(redact(message)), heartbeat=SQL_HEARTBEAT_SECONDS
+    )
 
 
 # =============================================================================
@@ -253,7 +230,7 @@ def ensure_target_table(
     """表不存在则自动按固定结构建表；存在则校验结构，返回 table 对象。"""
     ddl = build_target_ddl(project, table_name, column, comment, stored_as, lifecycle_days)
     run_sql_with_timeout(o, ddl, timeout=timeout, desc=f"建表 {table_name}")  # create if not exists
-    table = o.get_table(table_name)
+    table = o.get_table(f"{project}.{table_name}")
     verify_target_schema(table, table_name, column)
     return table
 
@@ -443,8 +420,5 @@ def count_partition(o, project: str, table_name: str, partition_value: str, time
                 return int(row["cnt"])
             except (TypeError, KeyError, IndexError):
                 return int(row[0])
-    # count(*) 必然返回一行：读不到行说明结果集为空（SQL 没真正执行/reader 异常；分区刚建好
-    # 时也出现过）。按 0 行返回保持既有行为（调用方依赖它），但必须留一条警告——
-    # 静默返回会把"没读到结果"和"分区确实 0 行"混为一谈，写后校验会被误导
-    log(f"  警告：分区 {table_name} pt={partition_value} 的 count 校验没读到结果，按 0 行处理")
-    return 0
+    # COUNT 必须返回一行；未知不能冒充零行，否则写空保护会允许清空已有数据。
+    raise RuntimeError(f"校验 SQL 未返回行，无法确认分区 {table_name} pt={partition_value} 的行数")

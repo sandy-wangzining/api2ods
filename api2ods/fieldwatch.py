@@ -47,7 +47,7 @@ def snapshot_path(job_path: Path) -> Path:
     带哈希：`jobs/a/task.json` 与 `jobs/b/task.json` 同名不同作业，不能互相覆盖。
     """
     stem = job_path.stem or "job"
-    digest = hashlib.sha1(str(job_path).encode("utf-8")).hexdigest()[:8]
+    digest = hashlib.sha1(os.fsencode(str(job_path))).hexdigest()[:8]
     return job_path.parent / STATE_DIR_NAME / f"{stem}-{digest}.json"
 
 
@@ -93,7 +93,7 @@ def save_snapshot(job_path: Path, fields, job_name: str) -> None:
                     pass
                 raise
             with tmp:
-                tmp.write(json.dumps(payload, ensure_ascii=False, indent=2))
+                tmp.write(json.dumps(payload, ensure_ascii=True, indent=2))
             os.replace(tmp_name, path)
         except Exception:
             try:
@@ -101,5 +101,5 @@ def save_snapshot(job_path: Path, fields, job_name: str) -> None:
             except OSError:
                 pass
             raise
-    except OSError as exc:
+    except (OSError, ValueError, TypeError) as exc:
         log(f"  警告：字段快照写入失败（{path}）：{exc}（不影响本次数据）")

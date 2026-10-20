@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 import json
@@ -131,6 +132,15 @@ def _marker_outside_quotes(line: str, marker: str, quoted: bool, delimiter: str 
     TSV 尤其多）只是普通字符，不能拿它翻转状态——否则标记会被误判成"在引号里"，
     文件有内容却报"找不到明细段"，还指不清方向。
     """
+    # 完整单行记录中的字段名可以加引号；跨行字段继续由下面的状态机跳过。
+    if not quoted and '"' in line:
+        try:
+            fields = next(csv.reader([line], delimiter=delimiter, strict=True))
+        except (csv.Error, StopIteration):
+            pass
+        else:
+            if marker in fields:
+                return True, False
     index = 0
     while index < len(line):
         char = line[index]
@@ -390,6 +400,26 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
     return records
 
 
+def _has_multiple_content_lines(data: bytes, encoding: str) -> bool:
+    """分块判断是否有两行非空正文；不保留大记录，也不把尾部换行当成第二条记录。"""
+    decoder = codecs.getincrementaldecoder(encoding)(errors="replace")
+    completed = False
+    pending = False
+    chunk_size = 65536
+    for offset in range(0, len(data), chunk_size):
+        text = decoder.decode(data[offset : offset + chunk_size], final=offset + chunk_size >= len(data))
+        for match in _LINE_RE.finditer(text):
+            segment = match.group(0)
+            if segment.strip("\ufeff \t\r\n"):
+                if completed:
+                    return True
+                pending = True
+            if pending and segment.endswith(("\r", "\n")):
+                completed = True
+                pending = False
+    return False
+
+
 def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str = "") -> None:
     """防呆：接口出错时经常用 HTTP 200 回一段 JSON，而不是文件流；这里给出可读报错。
 
@@ -447,26 +477,34 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
             # 宽表单行 >4KB 的 JSONL 会被误判成单行 JSON、照样整包解码（b"\n" in data 是
             # C 层线性扫描，不产生副本）
             if len(data) > _SNIFF_MAX_BYTES:
+                if str(parse_cfg.get("format") or "").lower() == "jsonl":
+                    if not as_bool(
+                        parse_cfg.get("allow_single_record"), default=False, field="parse.allow_single_record"
+                    ) and not _has_multiple_content_lines(data, name):
+                        raise RuntimeError(
+                            f"{label} {where}期望文件流，但响应只有一个 JSON 值（疑似错误体）；"
+                            "若确认这是单条记录，请设 parse.allow_single_record=true 显式放行"
+                        )
+                    continue
                 if b"\n" in data:
                     # 大且多行（如 pretty-printed 的大 JSON/错误体）：为内存不解码整包——
                     # 但"以 }/] 收尾"的错误体特征仍要拦（与小包同口径；只取尾部小样本，
                     # jsonl 格式不适用）。不拦会把 JSON 当 CSV 解析成垃圾记录写进 ODS
-                    if str(parse_cfg.get("format") or "").lower() != "jsonl":
-                        tail = data[-4096:]
-                        try:
-                            tail_text = tail.decode(name, "replace").lstrip("﻿").rstrip()
-                        except LookupError:
-                            continue
-                        if tail_text[-1:] in ("}", "]"):
-                            raise RuntimeError(
-                                f"{label} {where}期望文件流，但响应像一个无法解析的 JSON"
-                                f"（大响应按尾部采样判定：以 }} / ] 收尾）：{tail_text[-120:]!r}"
-                            )
+                    tail = data[-4096:]
+                    try:
+                        tail_text = tail.decode(name, "replace").lstrip("﻿").rstrip()
+                    except LookupError:
+                        continue
+                    if tail_text[-1:] in ("}", "]"):
+                        raise RuntimeError(
+                            f"{label} {where}期望文件流，但响应像一个无法解析的 JSON"
+                            f"（大响应按尾部采样判定：以 }} / ] 收尾）：{tail_text[-120:]!r}"
+                        )
                     continue
                 # 大且单行（如 300MB 单行 JSON 导出）：整包 decode 是 OOM 源——只按
                 # 首/尾字节判定「整包就是一个 JSON」（首 {/[ 且尾 }/]），宁失败勿 OOM
-                tail_bytes = data.rstrip(b"\r\n\t ")
-                if data[:1] in (b"{", b"[") and tail_bytes[-1:] in (b"}", b"]"):
+                tail_text = data[-4096:].decode(name, "replace").rstrip()
+                if stripped[:1] in ("{", "[") and tail_text[-1:] in ("}", "]"):
                     raise RuntimeError(
                         f"{label} {where}期望文件流，但响应像一个 JSON（大响应不整包解码：首尾字符与 JSON 一致）"
                     )

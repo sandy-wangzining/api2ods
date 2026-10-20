@@ -1613,6 +1613,21 @@ class TestHttp(OfflineTestCase):
 
 
 class TestFetcher(OfflineTestCase):
+    def test_zero_total_cannot_override_positive_end_marker(self):
+        for pages, items in ((0, 100), (3, 0)):
+            with self.subTest(pages=pages, items=items):
+                job = minimal_job(
+                    pagination={
+                        "type": "page",
+                        "total_pages_path": "data.pages",
+                        "total_items_path": "data.total",
+                    }
+                )
+                payload = {"data": {"list": [], "pages": pages, "total": items}}
+                with mock.patch.object(http_mod, "request_once", return_value=payload):
+                    with self.assertRaises(fetch_mod.UnconfirmedEndError):
+                        self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+
     def _fetcher(self, job: dict) -> fetch_mod.Fetcher:
         return fetch_mod.Fetcher(job, Path("."))
 
@@ -6838,6 +6853,48 @@ class TestFetchDefensiveBranches(OfflineTestCase):
 class TestFetchAllConcurrent(OfflineTestCase):
     """并发模式（--workers>1）：单元进线程池、逐个收尾、失败只影响自己那个单元。"""
 
+    def test_fetch_unit_after_fetch_all_has_its_own_stop_signal(self):
+        job = minimal_job(pagination={"type": "page", "total_pages_path": "data.pages"})
+        fetcher = fetch_mod.Fetcher(job, Path("."))
+        days = [date(2026, 9, 18)]
+        pages = [{"data": {"list": [{"id": i}], "pages": 2}} for i in (1, 2)]
+        with mock.patch.object(fetcher, "_do_request", side_effect=pages + pages):
+            stats, failures = fetcher.fetch_all(days, window_retries=0)
+            self.assertEqual(failures, [])
+            self.assertEqual(sum(count for _label, count in stats), 2)
+            self.assertTrue(fetcher._stop.is_set())
+            records = fetcher.fetch_unit(fetcher.build_units(days)[0])
+        self.assertEqual([record["id"] for record in records], [1, 2])
+
+    def test_pending_results_stay_bounded_when_spool_is_slow(self):
+        fetcher, _ = self._fetcher_and_days()
+        days = [date(2026, 9, 1) + timedelta(days=i) for i in range(20)]
+        submitted = consumed = 0
+        outstanding = []
+        pool_class = fetch_mod.ThreadPoolExecutor
+
+        class ObservedPool(pool_class):
+            def submit(self, *args, **kwargs):
+                nonlocal submitted
+                submitted += 1
+                return super().submit(*args, **kwargs)
+
+        def consume(_records):
+            nonlocal consumed
+            outstanding.append(submitted - consumed)
+            consumed += 1
+
+        with (
+            mock.patch.object(fetch_mod, "ThreadPoolExecutor", ObservedPool),
+            mock.patch.object(fetcher, "fetch_unit", side_effect=lambda *_args, **_kwargs: [{"id": 1}]),
+        ):
+            stats, failures = fetcher.fetch_all(days, workers=2, window_retries=0, on_records=consume)
+        self.assertEqual(failures, [])
+        self.assertEqual(len(stats), len(days))
+        self.assertEqual(sum(count for _label, count in stats), len(days))
+        self.assertEqual(consumed, len(days))
+        self.assertLessEqual(max(outstanding), 2)
+
     @staticmethod
     def _fetcher_and_days():
         job = minimal_job(
@@ -6938,6 +6995,7 @@ class TestMcDefensiveBranches(OfflineTestCase):
             o, "demo_project", "ods_x_json_df", "json", comment="备注", stored_as="aliorc", lifecycle_days=30
         )
         self.assertIs(got, table)
+        o.get_table.assert_called_once_with("demo_project.ods_x_json_df")
         ddl = o.run_sql.call_args.args[0]
         self.assertIn("create table if not exists demo_project.ods_x_json_df", ddl)
         self.assertIn("lifecycle 30", ddl)
@@ -6953,19 +7011,15 @@ class TestMcDefensiveBranches(OfflineTestCase):
             mc_mod.ensure_target_table(o, "demo_project", "ods_x", "json")
         self.assertIn("拒绝写入", str(ctx.exception))
 
-    def test_count_partition_with_no_rows_returns_zero(self):
-        """reader 一行都没读到（分区刚建好就查 count）：返回 0，不能抛 StopIteration，
-        但要留一条警告——静默返回会把"没读到结果"与"分区确实 0 行"混为一谈。"""
+    def test_count_partition_with_no_rows_fails(self):
+        """空结果不能冒充零行，否则写空保护会放行并清掉已有数据。"""
         reader = mock.MagicMock()
         reader.__enter__.return_value = iter([])
         instance = mock.Mock()
         instance.is_successful.return_value = True
         instance.open_reader.return_value = reader
-        logged: list = []
-        with mock.patch.object(mc_mod, "log", logged.append):
-            got = mc_mod.count_partition(self._odps(instance), "p", "t", "20260918")
-        self.assertEqual(got, 0)
-        self.assertTrue(any("没读到结果" in str(line) for line in logged), logged)
+        with self.assertRaisesRegex(RuntimeError, "未返回行"):
+            mc_mod.count_partition(self._odps(instance), "p", "t", "20260918")
 
     def test_terminated_but_failed_raises_even_if_wait_does_not(self):
         """已结束但不是成功态：先 wait 一次（真实环境会带出 SQL 错误信息），再显式判一次成功性。
@@ -7035,13 +7089,11 @@ class TestCliDefensiveBranches(OfflineTestCase):
             self.assertEqual(cli_mod._cred_source_label(config_file, job_file), "demo.json / config.json")
             self.assertEqual(cli_mod._cred_source_label(Path(tmp) / "无此文件.json", job_file), "demo.json")
 
-    def test_lock_path_falls_back_to_tempdir(self):
-        """工具目录与临时目录都建不了（只读安装）：退回系统临时目录，别让任务跑不起来。"""
+    def test_lock_path_refuses_unsafe_last_resort(self):
+        """两个目录都不可写时拒绝运行，不能把锁放到公共临时目录。"""
         with mock.patch.object(Path, "mkdir", side_effect=OSError("只读文件系统")):
-            path = cli_mod._lock_path(Path("jobs/demo.json"))
-        self.assertEqual(path.parent, Path(tempfile.gettempdir()))
-        self.assertTrue(path.name.startswith("api2ods-"))
-        self.assertTrue(path.name.endswith(".lock"))
+            with self.assertRaisesRegex(SystemExit, "API2ODS_LOCK_DIR"):
+                cli_mod._lock_path(Path("jobs/demo.json"))
 
 
 class TestRunSyncSetupAndFatalErrors(SyncFlowTestCase):
@@ -8586,6 +8638,16 @@ class TestTenthPassReview(OfflineTestCase):
         self.assertEqual(out, text)
         self.assertLess(elapsed, 1.0, f"脱敏耗时 {elapsed:.1f}s，JSON 规则可能又出现回溯爆炸")
 
+    def test_cursor_cycle_fails_before_accumulating_repeated_pages(self):
+        job = minimal_job(
+            pagination={"type": "cursor", "cursor_param": "c", "cursor_path": "data.next", "delay_seconds": 0}
+        )
+        pages = [{"data": {"list": [{"id": i}], "next": cursor}} for i, cursor in enumerate(("a", "b", "a"))]
+        with mock.patch.object(http_mod, "request_once", side_effect=pages) as request:
+            with self.assertRaisesRegex(utils.ConfigError, "循环"):
+                self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
+        self.assertEqual(request.call_count, 3)
+
     def test_cursor_stops_early_with_total_is_error(self):
         """cursor 模式配了 total_items_path 时，游标提前结束但总数没拉够 → 报错。
 
@@ -8606,6 +8668,11 @@ class TestTenthPassReview(OfflineTestCase):
             with self.assertRaises(RuntimeError) as ctx:
                 self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))
         self.assertIn("游标已结束", str(ctx.exception))
+        self.assertIsInstance(ctx.exception, fetch_mod.UnconfirmedEndError)
+        with mock.patch.object(http_mod, "request_once", return_value=payload):
+            label, count = self._fetcher(job).probe([date(2026, 9, 18)])
+        self.assertTrue(label)
+        self.assertEqual(count, 0)
 
     def test_page_and_size_param_same_name_rejected(self):
         """page_param 与 size_param 同名：页大小会覆盖页码，接口只回同一页（重复行静默入库）。"""
@@ -9141,8 +9208,99 @@ class TestNotifyModule(OfflineTestCase):
                 )
 
 
+class TestTimezoneSecretRendering(unittest.TestCase):
+    def test_secret_timezone_is_resolved_before_today(self):
+        job = {"window": {"date_tz": "${secrets.tz}"}, "secrets": {"tz": "UTC"}, "job": "${today}"}
+        shared = {"secrets": {"tz": "Asia/Shanghai"}}
+        with mock.patch.object(config_mod, "build_context", wraps=config_mod.build_context) as build:
+            rendered, _ = config_mod.render_job(job, shared, date(2026, 9, 18))
+        self.assertEqual(rendered["window"]["date_tz"], "UTC")
+        self.assertEqual(job["window"]["date_tz"], "${secrets.tz}")
+        self.assertEqual(shared["secrets"]["tz"], "Asia/Shanghai")
+        self.assertEqual(build.call_args.kwargs["tz"].key, "UTC")
+
+
+class TestLargeJsonResponse(OfflineTestCase):
+    def test_skip_until_accepts_quoted_header_fields(self):
+        for fmt, separator in (("csv", ","), ("tsv", "\t")):
+            text = '"report"\n"序号"' + separator + '"金额"\n"1"' + separator + '"100"\n'
+            with self.subTest(fmt=fmt):
+                rows = parsers._parse_text(text, {"format": fmt, "skip_until": "序号"}, label="test")
+                self.assertEqual(rows, [{"序号": "1", "金额": "100"}])
+
+    def test_large_jsonl_single_record_honors_explicit_opt_in(self):
+        body = {"value": "x" * (parsers._SNIFF_MAX_BYTES + 10) + "\u2028\u0a00中"}
+        text = json.dumps(body, ensure_ascii=False)
+        for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-32"):
+            for suffix in ("", "\n", "\r", "\r\n", "\n \r\n\t"):
+                with self.subTest(encoding=encoding, suffix=suffix):
+                    data = (text + suffix).encode(encoding)
+                    cfg = {"format": "jsonl", "encoding": encoding, "allow_single_record": True}
+                    self.assertEqual(parsers.parse_bytes(data, cfg, "test"), [body])
+                    cfg["allow_single_record"] = False
+                    with self.assertRaisesRegex(RuntimeError, "JSON"):
+                        parsers.parse_bytes(data, cfg, "test")
+
+    def test_large_jsonl_multiple_records_remain_supported(self):
+        rows = [{"value": "x" * (parsers._SNIFF_MAX_BYTES + 10)}, {"value": "second"}]
+        for encoding in ("utf-8", "utf-8-sig", "utf-16", "utf-32"):
+            for newline in ("\n", "\r", "\r\n"):
+                with self.subTest(encoding=encoding, newline=newline):
+                    text = newline.join(json.dumps(row) for row in rows) + newline
+                    cfg = {"format": "jsonl", "encoding": encoding}
+                    self.assertEqual(parsers.parse_bytes(text.encode(encoding), cfg, "test"), rows)
+
+    def test_single_record_sniff_decodes_in_bounded_chunks(self):
+        sizes = []
+        real_factory = parsers.codecs.getincrementaldecoder
+
+        def factory(encoding):
+            def decoder(**kwargs):
+                actual = real_factory(encoding)(**kwargs)
+
+                def decode(chunk, **options):
+                    sizes.append(len(chunk))
+                    return actual.decode(chunk, **options)
+
+                return type("Decoder", (), {"decode": staticmethod(decode)})()
+
+            return decoder
+
+        data = ('{"value":"' + "x" * (parsers._SNIFF_MAX_BYTES + 10) + '"}\r\n').encode()
+        with mock.patch.object(parsers.codecs, "getincrementaldecoder", side_effect=factory):
+            self.assertFalse(parsers._has_multiple_content_lines(data, "utf-8"))
+        self.assertGreater(len(sizes), 1)
+        self.assertLessEqual(max(sizes), 65536)
+
+    def test_large_json_with_bom_or_whitespace_is_rejected(self):
+        text = '{"value":"' + "x" * (parsers._SNIFF_MAX_BYTES + 10) + '"}'
+        payloads = [("  " + text).encode(), b"\xef\xbb\xbf" + text.encode()]
+        payloads.extend(text.encode(encoding) for encoding in ("utf-16", "utf-32"))
+        for payload in payloads:
+            with self.subTest(prefix=payload[:4]), self.assertRaisesRegex(RuntimeError, "JSON"):
+                parsers._reject_json_error_body(payload, {"format": "csv"}, "test")
+
+
 class TestFieldWatch(OfflineTestCase):
     """字段快照：观察并集、读写往返、同名不同作业互不串。"""
+
+    @unittest.skipUnless(os.name == "posix", "POSIX surrogateescape 文件名")
+    def test_non_utf8_job_path_roundtrips_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp) / os.fsdecode(b"job-\xff.json")
+            try:
+                job.write_bytes(b"{}")
+            except OSError as exc:
+                if exc.errno != errno.EILSEQ:
+                    raise
+                self.skipTest("当前文件系统不支持非 UTF-8 文件名（如 macOS APFS）")
+            fieldwatch_mod.save_snapshot(job, ["a"], job.stem)
+            self.assertEqual(fieldwatch_mod.load_snapshot(job), {"a"})
+
+    @unittest.skipUnless(os.name == "posix", "POSIX surrogateescape 文件名")
+    def test_non_utf8_job_path_can_acquire_lock_location(self):
+        job = Path(os.fsdecode(b"job-\xff.json"))
+        self.assertEqual(cli_mod._lock_path(job), cli_mod._lock_path(job))
 
     def test_observer_union(self):
         observer = fieldwatch_mod.FieldObserver()
@@ -9158,6 +9316,20 @@ class TestFieldWatch(OfflineTestCase):
             self.assertEqual(fieldwatch_mod.load_snapshot(job), {"a", "b"})
             fieldwatch_mod.snapshot_path(job).write_text("{broken", encoding="utf-8")
             self.assertIsNone(fieldwatch_mod.load_snapshot(job))
+
+    def test_surrogate_field_name_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp) / "demo.json"
+            fieldwatch_mod.save_snapshot(job, ["\ud800"], "demo")
+            self.assertEqual(fieldwatch_mod.load_snapshot(job), {"\ud800"})
+
+    def test_snapshot_serialization_failure_does_not_fail_job(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(fieldwatch_mod, "log") as log:
+            job = Path(tmp) / "demo.json"
+            fieldwatch_mod.save_snapshot(job, ["a"], object())
+            log.assert_called_once()
+            self.assertFalse(fieldwatch_mod.snapshot_path(job).exists())
+            self.assertEqual(list((Path(tmp) / ".field-state").glob("*.tmp")), [])
 
     def test_same_named_jobs_do_not_share_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
