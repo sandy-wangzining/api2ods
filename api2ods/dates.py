@@ -10,9 +10,10 @@ from datetime import date, datetime, timedelta, timezone
 from datetime import time as dtime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ._common import default_bizdate
 from .utils import ConfigError, log, log_once
 
-DEFAULT_DATE_TZ = "Asia/Shanghai"
+DEFAULT_DATE_TZ = "America/New_York"
 DEFAULT_API_TZ = "+08:00"
 DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 _OFFSET_RE = re.compile(r"^([+-])(\d{1,2})(?::?(\d{2}))?$")
@@ -226,7 +227,7 @@ def env_bizdate(strict: bool = True) -> date | None:
 def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
     """命令行参数 → 待拉取的日期列表（升序）。
 
-    优先级：--dates > --start-date/--end-date > --bizdate（或环境变量）> 默认（时区昨天）。
+    优先级：--dates > --start-date/--end-date > --bizdate（或环境变量）> 默认（美东昨天）。
     回拉天数：--days 覆盖配置 window.days（默认 1），语义 = 含基准日的最近 N 天。
 
     bizdate：调用方（main）已经定好的业务日；给了它就别再自己读时钟——原来这里和
@@ -234,7 +235,6 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
     pt 且先删后填）。不传时保持旧行为（独立可用、测试友好）。
     """
     window = job.get("window") or {}
-    tz = date_tz_of(job)
 
     if getattr(args, "days", None) is not None and (
         getattr(args, "dates", "") or getattr(args, "start_date", "") or getattr(args, "end_date", "")
@@ -281,7 +281,7 @@ def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
             base = bizdate
         else:
             from_env = env_bizdate(strict=not getattr(args, "check", False))
-            base = from_env if from_env is not None else datetime.now(tz).date() - timedelta(days=1)
+            base = from_env if from_env is not None else default_bizdate()
         from_cli = getattr(args, "days", None) is not None
         try:
             if from_cli:

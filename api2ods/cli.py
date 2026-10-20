@@ -19,11 +19,10 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import VERSION, fieldwatch
-from ._common import private_lock_dir
+from ._common import default_bizdate, private_lock_dir
 from .config import (
     build_context_doc,
     check_block_types,
@@ -36,7 +35,7 @@ from .config import (
     resolve_target,
     validate_job,
 )
-from .dates import date_tz_of, env_bizdate, parse_day_arg, resolve_days
+from .dates import env_bizdate, parse_day_arg, resolve_days
 from .fetch import Fetcher
 from .mc import (
     MAX_BATCH_BYTES,
@@ -743,21 +742,20 @@ def main(argv: list[str] | None = None, *, hard_exit: bool = False) -> int:
 
         job_path = Path(args.job)
         job_raw = load_json_file(job_path, "作业配置文件")
-        # 类型检查提到最前面：下面第一句 date_tz_of 就要取 window.date_tz，
-        # 而 window 写成字符串时那是 'str' object has no attribute 'get' 的裸 traceback
+        # 类型检查提到最前面：后续取 window.date_tz 时，
+        # window 写成字符串会抛 'str' object has no attribute 'get' 的裸 traceback
         check_block_types(job_raw)
 
-        # 业务日：--bizdate > 环境变量（DataWorks） > 时区昨天
+        # 业务日：--bizdate > 环境变量（DataWorks） > 美东昨天
         # 顺序要紧：先看显式 --bizdate，没有才读环境变量。反过来写的话，调度环境变量
         # 写坏时运维连"--bizdate 强制指定业务日重跑"这条自救路都走不了。
         # 环境变量畸形本身必须报错（静默回退昨天会写错分区还显示成功）——
         # 唯一的例外是只读体检 --check：它不写库，脏环境变量不该连"看一眼"都挡掉
-        tz = date_tz_of(job_raw)
         if args.bizdate is not None:
             bizdate = parse_day_arg(args.bizdate)
         else:
             from_env = env_bizdate(strict=not args.check)
-            bizdate = from_env if from_env is not None else datetime.now(tz).date() - timedelta(days=1)
+            bizdate = from_env if from_env is not None else default_bizdate()
 
         # 替换 ${secrets.x}/${bizdate} 等占位符；--config 的 maxcompute/profiles 用返回的副本
         # （render_job 不改写入参，同一进程复用同一份 config 时不会串上一次替换过的密钥）

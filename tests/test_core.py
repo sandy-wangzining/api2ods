@@ -518,6 +518,11 @@ class TestResolveDays(OfflineTestCase):
             days = dates_mod.resolve_days(make_args(), {})
         self.assertEqual([d.isoformat() for d in days], ["2026-09-18"])
 
+    def test_default_bizdate_is_us_eastern(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            days = dates_mod.resolve_days(make_args(), {})
+        self.assertEqual(days, [dates_mod.default_bizdate()])
+
     def test_malformed_env_bizdate_errors(self):
         """环境变量畸形必须报错：静默回退"昨天"会把数据写进错的分区（还是先删再填）。"""
         with mock.patch.dict(os.environ, {"bizdate": "2026-09-1"}, clear=False):
