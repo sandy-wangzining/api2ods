@@ -259,7 +259,10 @@ class RunLock:
         if not locked:
             self.fh.close()
             self.fh = None
-            raise SystemExit(f"已有任务在运行（锁文件 {self.path}），本次退出；确认没有任务在跑时可删除该文件后重试。")
+            raise SystemExit(
+                f"已有任务在运行（锁文件 {self.path}），本次退出；请等它结束或按锁文件里的 pid/机器排查持有者，"
+                f"不要直接删除锁文件——POSIX 上新进程会在新 inode 上加锁，仍可能与持旧锁的实例并发"
+            )
         try:
             # 拿到锁之后才截断+写自己的 pid：拿不到锁时绝不能动内容，
             # 否则每一次被拦下的启动都会把持锁进程的标记清掉
@@ -493,32 +496,38 @@ _QUERY_RE = re.compile(r"(?i)(?<![A-Za-z0-9_])([A-Za-z0-9_.\-]{1,64})(['\"]?)([:
 # `"secret_key": "***", "page": 2` 整行再吞一遍）；未闭合引号（password="abc 被日志
 # 截断）或「带引号的键」+ 不带引号的值（\"password\": my secret）必须走这条兜底——
 # 否则 KV/JSON 要收尾引号、常规 QUERY 的值类不吃引号，三套规则全绕过
-_QUERY_SPACE_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.\-]{1,64})(?P<q>[\"']?)(?P<sep>\s*[:=]\s*)(?!\s*[\"']?\s*\*\*\*)(?P<val>[^&\n]+)"
+_QUERY_SPACE_KEY_RE = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?P<key>[A-Za-z0-9_.\-]{1,64})(?P<q>[\"']?)(?P<sep>\s*[:=]\s*)(?!\s*[\"']?\s*\*\*\*)"
 )
 
 
 def _mask_spaced_values(text: str) -> str:
     """敏感键 + 无引号值遮到行尾/`&`（口令短语含空格不被第一个词截断）。
 
-    用扫描器而不是一次 sub：非敏感键的贪婪值会吞掉其后的 k=v（sub 不重叠），
-    这里非敏感只前移到"值起点"继续扫，后续键照常处理。
+    只匹配"键+分隔符"、值按需扫到行尾/`&`：非敏感键不消费值，后续 k=v 照常处理。
+    原实现让非敏感键的贪婪值反复扫到行尾，长单行文本会退化成 O(n²)（100KB 要 20 秒）。
     """
     parts: list[str] = []
     pos = 0
-    while True:
-        match = _QUERY_SPACE_RE.search(text, pos)
-        if not match:
-            parts.append(text[pos:])
-            break
+    for match in _QUERY_SPACE_KEY_RE.finditer(text):
+        if match.start() < pos:
+            continue  # 已落在上一个敏感值被遮罩的区间里
+        value_start = match.end()
+        if value_start >= len(text) or text[value_start] in "&\n":
+            continue  # key= 后面没有值（行尾/分隔符）：不是要遮的形态
         parts.append(text[pos : match.start()])
         head = f"{match.group('key')}{match.group('q')}{match.group('sep')}"
         if _is_sensitive_key(match.group("key")):
+            next_amp = text.find("&", value_start)
+            next_nl = text.find("\n", value_start)
+            ends = [index for index in (next_amp, next_nl) if index != -1]
+            value_end = min(ends) if ends else len(text)
             parts.append(head + "***")
-            pos = match.end()
+            pos = value_end
         else:
             parts.append(head)
-            pos = match.start("val")
+            pos = value_start
+    parts.append(text[pos:])
     return "".join(parts)
 
 
@@ -828,6 +837,15 @@ def collect_secret_values(job: dict) -> list[str]:
         for key, val in maxcompute.items():
             if _is_sensitive_key(str(key)):
                 values += _leaf_strings(val)
+    # profiles.<名> 是 README/模板支持的凭证来源（job 与 --config 都可能有）：
+    # 不收集的话，SDK/Tunnel 报错里裸回显的 AK/SK 会绕过值级脱敏进日志
+    profiles = job.get("profiles")
+    if isinstance(profiles, dict):
+        for entry in profiles.values():
+            if isinstance(entry, dict):
+                for key, val in entry.items():
+                    if _is_sensitive_key(str(key)):
+                        values += _leaf_strings(val)
     notify_cfg = job.get("notify")
     if isinstance(notify_cfg, dict):
         values += _webhook_values(notify_cfg.get("webhook"))
@@ -876,7 +894,12 @@ def redact_secrets(values, text: str) -> str:
             # 含孤立代理字符的密钥（surrogateescape 解出的路径名被登记为敏感值）：
             # quote 内部 strict 编码会抛——跳过编码变体，绝不让脱敏反过来打崩业务
             encoded_forms = ()
-        for variant in (secret, *encoded_forms, aggressive):
+        encoded_variants = {encoded for encoded in (*encoded_forms, aggressive) if encoded}
+        # 有些网关/日志会把百分号编码的十六进制小写化（%2f、%3d）：只遮大写形态会漏
+        encoded_variants |= {
+            re.sub(r"%[0-9A-F]{2}", lambda match: match.group(0).lower(), variant) for variant in encoded_variants
+        }
+        for variant in (secret, *encoded_variants):
             if variant:
                 text = text.replace(variant, "***")
     return redact(text)

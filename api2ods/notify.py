@@ -45,12 +45,17 @@ def notify(
     sent = 0
     for hook in targets:
         try:
-            resp = requests.post(hook, json=card, timeout=timeout)
-            data = resp.json()
+            resp = requests.post(hook, json=card, timeout=timeout, allow_redirects=False)
         except Exception as exc:  # noqa: BLE001 - 告警失败不影响主流程
             # requests 的异常消息里带完整 URL，末段 hook id 就是凭证：必须脱敏后再进日志
             log(f"  警告：飞书通知发送失败：{type(exc).__name__}: {redact(str(exc))}")
             continue
+        try:
+            data = resp.json()
+        except ValueError:
+            # 空 body / 非 JSON：不能把 resp.json() 的异常和"请求没发出去"混成同一条，
+            # 但也不能按成功处理——缺 code 的 200 响应本来就不能确认告警已送达
+            data = None
         # isinstance 判断不能省：非对象响应（JSON 数组/字符串/null，网关错误页等）没有 .get，
         # 直接调用会抛 AttributeError 打断主流程（告警失败不影响业务是函数的约定）
         # 只有显式的成功码才算成功（int 0 与字符串 "0" 都认，避免网关把状态码序列化成字符串
@@ -67,5 +72,6 @@ def notify(
                 log("飞书通知已发送（响应为空，按 HTTP 200 判定）")
                 sent += 1
                 continue
-        log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {redact(str(data)[:200])}")
+        detail = data if data is not None else (getattr(resp, "text", "") or "")
+        log(f"  警告：飞书通知发送失败：HTTP {resp.status_code} {redact(str(detail))[:200]}")
     return sent == len(targets)

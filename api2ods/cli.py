@@ -35,7 +35,7 @@ from .config import (
     resolve_target,
     validate_job,
 )
-from .dates import env_bizdate, parse_day_arg, resolve_days
+from .dates import DEFAULT_DATE_TZ, env_bizdate, parse_day_arg, resolve_days
 from .fetch import Fetcher
 from .mc import (
     MAX_BATCH_BYTES,
@@ -88,6 +88,17 @@ def _sql_timeout_arg(value: str) -> int:
     return number
 
 
+def _workers_arg(value: str) -> int:
+    """--workers 参数校验：1~32，防止手误创建大量线程/放大接口限流。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"必须是整数，实际 {value!r}") from None
+    if not 1 <= number <= 32:
+        raise argparse.ArgumentTypeError(f"应在 1~32 之间，实际 {number}")
+    return number
+
+
 def build_parser() -> argparse.ArgumentParser:
     """命令行参数定义（help 文案就是用户文档的第一入口，改参数时同步改 README）。"""
     parser = argparse.ArgumentParser(
@@ -124,7 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         # 默认必须是 None 而不是 ""：空串无法区分"没传 --bizdate"与"显式传了空值"
         # （调度脚本 `--bizdate "$pt"` 且 $pt 未定义）——后者要报错，不能静默回退昨天
-        help="业务日期 yyyyMMdd 或 yyyy-MM-dd（默认时区昨天）",
+        help="业务日期 yyyyMMdd 或 yyyy-MM-dd（默认 ODS_BIZDATE_TZ 时区的昨天，未设置时美东）",
     )
     parser.add_argument("--days", type=int, default=None, help="回拉天数（含基准日），覆盖作业配置 window.days")
     parser.add_argument(
@@ -140,7 +151,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="覆盖分区值；不指定时 target.pt 必须是 8 位业务日 yyyyMMdd，"
         "显式指定时可写特殊分区（如测试用 test_20260921——注意调度与 DWD 只自动读 yyyyMMdd 分区）",
     )
-    parser.add_argument("--workers", type=int, default=1, help="并发按天/按区间拉取，默认 1；回补历史可用 2~4")
+    parser.add_argument(
+        "--workers", type=_workers_arg, default=1, help="并发按天/按区间拉取，默认 1，范围 1~32；回补历史可用 2~4"
+    )
     parser.add_argument("--dry-run", action="store_true", help="只拉取统计，不写数仓")
     parser.add_argument("--allow-empty", action="store_true", help="本次 0 行时也清空并写空分区（默认拒绝）")
     parser.add_argument(
@@ -319,7 +332,7 @@ def _job_summary(job: dict, config: dict | None = None) -> list[str]:
     window_text = (
         (
             f"{window.get('mode', 'per_day')} × {window.get('days', 1)} 天，"
-            f"date_tz={window.get('date_tz') or 'Asia/Shanghai'}"
+            f"date_tz={window.get('date_tz') or DEFAULT_DATE_TZ}"
         )
         if window
         else "无（单次请求）"
@@ -437,7 +450,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     if len(days) > 30:
         log("提示：回补天数较多，耗时较长（受接口限速影响）；可 Ctrl+C 中断后重跑（先删再填，重复跑幂等）。")
 
-    started = time.time()
+    started = time.monotonic()
     try:
         spool = SpoolWriter()  # 记录边拉边落盘（大数据量不占内存）
     except OSError as exc:
@@ -476,7 +489,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
 
         log(
             f"拉取完成：{spool.count:,} 条记录（{len(stats)} 个请求单元），约 {spool.bytes / 1024 / 1024:.2f} MB，"
-            f"耗时 {(time.time() - started) / 60:.1f} 分钟"
+            f"耗时 {(time.monotonic() - started) / 60:.1f} 分钟"
         )
 
         # 字段漂移检测：与上次成功运行的快照对比，出现新字段只提醒、不阻塞（json 列原样落库）。
@@ -493,7 +506,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             log(
                 f"⚠️ 接口记录出现 {len(new_fields)} 个新增字段：{shown}"
                 + (
-                    "（已照常入库，如需使用请更新 DWD 提取口径）"
+                    "（本次会照常入库，如需使用请更新 DWD 提取口径）"
                     if not args.dry_run
                     else "（本次为 --dry-run，未写库；正式运行会自动入库）"
                 )
@@ -505,9 +518,10 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
                 [
                     f"**新增字段**：{shown}（共 {len(new_fields)} 个）",
                     f"**本次窗口**：{days[0]} ~ {days[-1]}",
-                    # dry-run 未写库：不能照抄"数据已写入"的结论，否则下游按卡片以为分区已就绪
+                    # 通知在写库之前发出：不能断言"已写入"，写入结果以退出码/日志为准
                     (
-                        "数据已照常写入 ODS（json 原样保留、新字段自动包含，无需改表）。请人工确认："
+                        "本次运行会把新字段照常写入 ODS（json 原样保留、无需改表；"
+                        "写入结果以退出码/日志为准）。请人工确认："
                         if not args.dry_run
                         else "（试跑）本次未写库；正式运行时新字段会自动入库（json 原样保留、无需改表）。请人工确认："
                     ),
@@ -578,7 +592,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             )
             log(f"表就绪：{project}.{table_name}（{column} + {PARTITION_COLUMN}）")
 
-            started_write = time.time()
+            started_write = time.monotonic()
             write_partition(
                 o,
                 table,
@@ -593,7 +607,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
                 # 与文件其它脱敏出口（_redact_job / main 兜底）同口径
                 secrets=collect_secret_values(job) + collect_secret_values(config),
             )
-            log(f"已写入 pt={pt}：{spool.count:,} 行，耗时 {(time.time() - started_write) / 60:.1f} 分钟")
+            log(f"已写入 pt={pt}：{spool.count:,} 行，耗时 {(time.monotonic() - started_write) / 60:.1f} 分钟")
 
             actual = count_partition(o, project, table_name, pt, timeout=args.sql_timeout)
             if actual != spool.count:
@@ -618,7 +632,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             log(f"  警告：字段快照未更新（{exc}），不影响本次入库；下次运行会重复提醒新增字段")
 
         log(f"校验通过：pt={pt} 共 {actual:,} 行")
-        log(f"全部完成（总耗时 {(time.time() - started) / 60:.1f} 分钟）。")
+        log(f"全部完成（总耗时 {(time.monotonic() - started) / 60:.1f} 分钟）。")
         return 0
     except FatalApiError as exc:
         # 4xx（密钥错/参数错/没权限）：不写库、不打整窗重试，直接把接口给的原因打出来。
@@ -746,7 +760,7 @@ def main(argv: list[str] | None = None, *, hard_exit: bool = False) -> int:
         # window 写成字符串会抛 'str' object has no attribute 'get' 的裸 traceback
         check_block_types(job_raw)
 
-        # 业务日：--bizdate > 环境变量（DataWorks） > 美东昨天
+        # 业务日：--bizdate > 环境变量（DataWorks） > 默认业务日（ODS_BIZDATE_TZ 的昨天）
         # 顺序要紧：先看显式 --bizdate，没有才读环境变量。反过来写的话，调度环境变量
         # 写坏时运维连"--bizdate 强制指定业务日重跑"这条自救路都走不了。
         # 环境变量畸形本身必须报错（静默回退昨天会写错分区还显示成功）——

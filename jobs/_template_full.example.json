@@ -29,6 +29,8 @@
     "//body_type": "POST 时的请求体格式：json（默认）或 form",
     "timeout_seconds": 30,
     "//timeout_seconds": "单次请求超时秒数；文件导出类接口可调大（如 180）",
+    "max_response_bytes": 1073741824,
+    "//max_response_bytes": "单次响应体上限（解压后字节，默认 1GiB）；大文件导出接口按需调大",
 
     "headers": { "Content-Type": "application/json" },
     "params": { "appId": "xxx" },
@@ -60,7 +62,7 @@
     "response_type": "json",
     "//response_type": "json（默认）/ bytes（文件流：ZIP/CSV/JSONL，需配下面的 parse 且不能分页）",
     "json_encoding": "",
-    "//json_encoding": "JSON 接口不是 UTF-8（如 GBK）时显式指定编码；不写则按 UTF-8 → 响应头声明严格解码，解不出直接报错。显式编码与 UTF-8 键名不同会报配置错；仅值不同按显式编码处理并告警",
+    "//json_encoding": "JSON 接口不是 UTF-8（如 GBK）时显式指定编码；不写则按 响应头声明的 charset → UTF-8(sig) 严格解码，解不出直接报错。声明编码解不出 JSON、UTF-8 能解出时自动改用 UTF-8；两者都能解出但内容不同会报配置错（用 json_encoding 明确指定）；显式编码与 UTF-8 键名不同会报配置错，仅值不同按显式编码处理并告警",
 
     "fail_if": [
       { "path": "code", "not_equals": "0", "message_path": "message", "retry": true }
@@ -77,12 +79,12 @@
 
   "window": {
     "//mode": "per_day（每天一次请求，推荐）/ range（一次请求覆盖整个区间）",
-    "//defaults": "start_param 默认 startTime、end_param 默认 endTime；date_tz 默认 Asia/Shanghai、api_tz 默认 +08:00、pad_hours 默认 0",
+    "//defaults": "start_param 默认 startTime、end_param 默认 endTime；date_tz 默认 America/New_York、api_tz 默认 +08:00、pad_hours 默认 0",
     "mode": "per_day",
     "days": 15,
     "//days": "每次回拉最近几天（含基准日）；命令行 --days 可覆盖",
-    "date_tz": "Asia/Shanghai",
-    "//date_tz": "业务日期的时区（决定“最近 N 天”怎么切）；数仓按美东，现有作业都写 America/New_York",
+    "date_tz": "America/New_York",
+    "//date_tz": "窗口时区（决定“最近 N 天”怎么切）；按源方时区配置，不传默认 America/New_York；缺省业务日取 ODS_BIZDATE_TZ 时区的昨天（默认美东），不受此字段影响",
     "api_tz": "+08:00",
     "//api_tz": "接口认哪个时区的时间：固定偏移（+08:00 / +0800 / +08）或时区名（America/New_York，自动处理夏令时）",
     "pad_hours": 0,

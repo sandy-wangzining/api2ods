@@ -18,13 +18,11 @@ import tempfile
 import urllib.parse
 from pathlib import Path
 
+from .dates import DEFAULT_API_TZ, DEFAULT_DATE_TZ, DEFAULT_TIME_FORMAT
 from .utils import redact
 
 # 常见默认值（都可在提问时直接回车采纳）
 DEFAULT_METHOD = "GET"
-DEFAULT_DATE_TZ = "Asia/Shanghai"
-DEFAULT_API_TZ = "+08:00"
-DEFAULT_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 DEFAULT_ENDPOINT = "https://service.us-west-1.maxcompute.aliyun.com/api"
 DEFAULT_START_PARAM = "startTime"
 DEFAULT_END_PARAM = "endTime"
@@ -167,8 +165,10 @@ def _atomic_write_job(target_path: Path, job: dict, on_replaced=None) -> None:
     if os.name != "nt":
         try:
             # 最后一次收紧失败（不支持 chmod 的文件系统）只跳过：文件已经写好，
-            # 不能把"已生成成功"误报成"写文件失败"
-            os.chmod(target_path, 0o600)
+            # 不能把"已生成成功"误报成"写文件失败"。跳过软链：chmod 会跟随链接
+            # 改到共享目录里另一用户指向的真实文件（replace 后到 chmod 之间的极小窗口）。
+            if not target_path.is_symlink():
+                os.chmod(target_path, 0o600)
         except OSError:
             pass
 
@@ -382,7 +382,11 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo("")
         echo("=== MaxCompute 目标 ===")
         project = _ask(ask, "⑨ 项目名", "my_project")
-        table = _ask(ask, "   表名（建议 <层级>_<业务域>_<过程>_json_di）", f"ods_{job_name}_json_di")
+        table = _ask(
+            ask,
+            "   表名（建议 <层级>_<业务域>_<过程>_json_di）",
+            f"ods_{re.sub(r'[^0-9A-Za-z_]', '_', job_name)}_json_di",
+        )
         ak = _ask(ask, "   阿里云 AccessKeyId")
         sk = _ask_secret(ask_secret, "   阿里云 AccessKeySecret（输入不回显）")
         endpoint = _ask(ask, "   endpoint", DEFAULT_ENDPOINT)
@@ -408,7 +412,7 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             job["request"]["response_type"] = "bytes"
             job["parse"] = parse
 
-        target_path = Path(out_path) if out_path else root / "jobs" / f"{job_name}.json"
+        target_path = Path(out_path).expanduser() if out_path else root / "jobs" / f"{job_name}.json"
         if not target_path.is_absolute():
             target_path = root / target_path
         if target_path.is_dir():
@@ -443,10 +447,14 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
         echo(f"  3) 试跑：  api2ods --job {target_path.name} --days 1 --dry-run")
         echo(f"  4) 正式：  api2ods --job {target_path.name} --bizdate ${{bizdate}}")
         return 0
-    except (KeyboardInterrupt, EOFError):
+    except (KeyboardInterrupt, EOFError, ValueError) as exc:
         # stdin 被关闭（`api2ods --init <&-`、CI 里没接管道）时 input() 抛的是
         # ValueError / RuntimeError，不是 EOFError；ValueError 只认"关闭的 stdin"，
         # 其余是真实缺陷（json.dumps / 组装逻辑），一律上抛
+        if isinstance(exc, ValueError):
+            message = str(exc).lower()
+            if "closed" not in message and "i/o operation" not in message:
+                raise
         if generated_path is not None or (
             # os.replace 已完成、收尾阶段被中断：文件已写全且是本次新建的，如实上报。
             # write_started 门控：没进过写盘流程时（旧文件还在）不能报"已生成"
@@ -455,13 +463,6 @@ def run_init(out_path: str = "", ask=input, echo=print, workdir: Path | None = N
             echo("")
             echo(f"✅ 已生成：{generated_path or target_path}（中断发生在收尾阶段，文件已写全）")
             return 0
-        echo("")
-        echo("已取消，未生成任何文件。")
-        return 1
-    except ValueError as exc:
-        message = str(exc).lower()
-        if "closed" not in message and "i/o operation" not in message:
-            raise
         echo("")
         echo("已取消，未生成任何文件。")
         return 1

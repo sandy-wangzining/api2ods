@@ -126,8 +126,11 @@ def parse_offset(text: str) -> timezone:
         raise SystemExit(f"无法解析时区偏移：{text!r}（应形如 +08:00 或 -05:00）")
     sign, hours, minutes = match.groups()
     hour_value, minute_value = int(hours), int(minutes or 0)
-    if hour_value > 14 or minute_value > 59:
-        raise SystemExit(f"时区偏移超出范围：{text!r}（应形如 +08:00 或 -05:00）")
+    total_minutes = hour_value * 60 + minute_value
+    # 现实中的 UTC 偏移：东侧最远 +14:00，西侧最远 -12:00；+14:59 / -13:30 这类
+    # 不存在的偏移会让整个窗口静默平移，必须在配置阶段拒绝
+    if minute_value > 59 or total_minutes > (14 * 60 if sign == "+" else 12 * 60):
+        raise SystemExit(f"时区偏移超出范围：{text!r}（应在 -12:00 ~ +14:00 之间）")
     delta = timedelta(hours=hour_value, minutes=minute_value)
     if sign == "-":
         delta = -delta
@@ -159,7 +162,7 @@ def load_zone(name: str) -> ZoneInfo:
 
 
 def date_tz_of(job: dict) -> ZoneInfo:
-    """窗口/业务日按配置时区解释（默认 Asia/Shanghai）。"""
+    """窗口按配置时区解释（默认 America/New_York）；缺省业务日取 ODS_BIZDATE_TZ 时区的昨天（默认美东），不由本字段决定。"""
     return load_zone(str((job.get("window") or {}).get("date_tz") or DEFAULT_DATE_TZ))
 
 
@@ -227,7 +230,7 @@ def env_bizdate(strict: bool = True) -> date | None:
 def resolve_days(args, job: dict, bizdate: date | None = None) -> list[date]:
     """命令行参数 → 待拉取的日期列表（升序）。
 
-    优先级：--dates > --start-date/--end-date > --bizdate（或环境变量）> 默认（美东昨天）。
+    优先级：--dates > --start-date/--end-date > --bizdate（或环境变量）> 默认（ODS_BIZDATE_TZ 的昨天，默认美东）。
     回拉天数：--days 覆盖配置 window.days（默认 1），语义 = 含基准日的最近 N 天。
 
     bizdate：调用方（main）已经定好的业务日；给了它就别再自己读时钟——原来这里和

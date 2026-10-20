@@ -40,6 +40,7 @@ REQUEST_KEYS = {
     "method",
     "body_type",
     "timeout_seconds",
+    "max_response_bytes",
     "headers",
     "params",
     "params_in",
@@ -85,6 +86,7 @@ PARSE_KEYS = {
     "strict_encoding",
     "allow_multi_entry",
     "allow_single_record",
+    "allow_single_line",
 }
 TARGET_KEYS = {"project", "table", "column", "pt", "comment", "allow_empty", "profile", "stored_as", "lifecycle_days"}
 NOTIFY_KEYS = {"webhook", "enabled"}
@@ -154,8 +156,9 @@ def _as_secrets(value, where: str) -> dict:
 def build_context(config: dict, bizdate: date, job_secrets: dict | None = None, tz: ZoneInfo | None = None) -> dict:
     """运行时上下文：secrets（作业内优先）+ 日期。
 
-    ${today} 与 ${bizdate} 用同一个时区口径（window.date_tz，默认 Asia/Shanghai）：
-    按运行机器的本地日期算，服务器时区是 UTC 时会比北京时间早一天。
+    ${today} 按 window.date_tz（默认 America/New_York）取运行时的“今天”；
+    ${bizdate} 是调用方传入的业务日（缺省为 ODS_BIZDATE_TZ 时区的昨天，默认美东，优先级见 README）。
+    两者含义不同：作业显式配置了其它 date_tz 时，${today} 与缺省 ${bizdate} 可能不在同一天。
     """
     secrets = _as_secrets(config.get("secrets"), "--config 文件里的 secrets")
     secrets.update(_as_secrets(job_secrets, "作业配置的 secrets"))
@@ -446,7 +449,9 @@ def collect_warnings(job: dict) -> list[str]:
     return warnings
 
 
-def _require_number(value, where: str, *, minimum=None, exclusive_min=None, integer: bool = False) -> None:
+def _require_number(
+    value, where: str, *, minimum=None, exclusive_min=None, maximum=None, integer: bool = False
+) -> None:
     """可选数值配置项的范围校验：写错在配置阶段就报，别拖到发请求时抛裸异常。
 
     原来 page_size/retry_times 这类只在 fetch/http 里做类型转换：写成 0/负数/浮点、
@@ -474,6 +479,8 @@ def _require_number(value, where: str, *, minimum=None, exclusive_min=None, inte
         raise SystemExit(f"{where} 不能小于 {minimum:g}，实际 {_show(value)}")
     if exclusive_min is not None and number <= exclusive_min:
         raise SystemExit(f"{where} 必须大于 {exclusive_min:g}，实际 {_show(value)}")
+    if maximum is not None and number > maximum:
+        raise SystemExit(f"{where} 不能大于 {maximum:g}，实际 {_show(value)}")
 
 
 def validate_job(job: dict) -> None:
@@ -590,6 +597,7 @@ def validate_job(job: dict) -> None:
     # 数值配置的取值范围在配置阶段就校验：写成 0/-1/浮点/非数字时，原来要拖到
     # Fetcher 构造甚至真正发请求时才报，且 page_size=0 会被 `or 100` 静默吞掉
     _require_number(request.get("timeout_seconds"), "request.timeout_seconds", exclusive_min=0)
+    _require_number(request.get("max_response_bytes"), "request.max_response_bytes", minimum=1, integer=True)
     _require_number(request.get("retry_times"), "request.retry_times", minimum=0, integer=True)
     _require_number(request.get("retry_delay"), "request.retry_delay", minimum=0)
 
@@ -621,7 +629,7 @@ def validate_job(job: dict) -> None:
             # 在 --check 里会伪装成"请求失败"、正式跑时在 Windows 裸崩溃（glibc 则把
             # %Q 当参数值发出去），而 --log-file 一个字都看不到
             check_format_string(fmt)
-        _require_number(window.get("days"), "window.days", exclusive_min=0, integer=True)
+        _require_number(window.get("days"), "window.days", exclusive_min=0, maximum=3660, integer=True)
         _require_number(window.get("pad_hours"), "window.pad_hours", minimum=0)
         extra_params = window.get("extra_params")
         if extra_params is not None:
@@ -642,6 +650,14 @@ def validate_job(job: dict) -> None:
                 # 与 window.format 同口径把校验值写回：' %Y-%m-%d' 这类带首尾空白的写法
                 # 不能"过了校验、运行时却按含空白的字面量格式化"（发出去的参数带空格）
                 extra_params[extra_name] = text
+        for key in ("start_param", "end_param"):
+            if key in window and window[key] is not None:
+                value = window[key]
+                if not isinstance(value, str) or not value.strip():
+                    # 空串会被运行期的 truthy 判断当成"未配置"：只发一半边界，
+                    # 请求可能拉回全部历史并先删后填写入 pt；要表示未配置请省略或写 null
+                    raise SystemExit(f"window.{key} 必须是非空字符串（不要用空串表示未配置，直接省略或写 null）")
+                window[key] = value.strip()
 
     pagination = job.get("pagination") or {}
     # 与 normalize_job 同一套推断：单独调用 validate_job（库调用方）时不能把
@@ -725,7 +741,7 @@ def validate_job(job: dict) -> None:
             raise SystemExit(f"parse.format 不支持：{parse_format}（可用 {'/'.join(ALLOWED_PARSE_FORMATS)}）")
     # 这些开关在解析阶段才用 as_bool，且 allow_single_record 只在"整包恰好一条 JSON"
     # 这条分支上检查：多记录 JSONL 配成 "flase" 会静默当没开，必须提前统一校验。
-    for bool_key in ("unzip", "strict_encoding", "allow_multi_entry", "allow_single_record"):
+    for bool_key in ("unzip", "strict_encoding", "allow_multi_entry", "allow_single_record", "allow_single_line"):
         if bool_key in parse:
             as_bool(parse.get(bool_key), default=False, field=f"parse.{bool_key}")
     if parse.get("entry_field") and not as_bool(parse.get("unzip"), default=False, field="parse.unzip"):
@@ -760,6 +776,9 @@ def validate_job(job: dict) -> None:
         require_identifier(target["column"], "target.column")
     if target.get("stored_as"):
         require_identifier(target["stored_as"], "target.stored_as")
+    # 布尔笔误（"flase"）原来要等整轮 API 拉完、写库前才报：配置阶段先拦
+    if target.get("allow_empty") is not None:
+        as_bool(target.get("allow_empty"), default=False, field="target.allow_empty")
     # lifecycle_days 原来拖到"拉完所有数据、准备写库"时才校验：配置写错要先白跑一整轮
     # API 拉取。这里提到配置阶段（cli 里那道检查保留作兜底）
     raw_lifecycle = target.get("lifecycle_days")
@@ -849,8 +868,8 @@ def resolve_target(job: dict, config: dict, args, bizdate: date) -> tuple[str, s
         # （test_20260921、cmp_*、backfill_*），不能一律按业务日卡死。
         # 这里只要求值本身是合法分区名；特殊分区不会被调度/DWD 自动读到，
         # 那是使用者自己的责任（报错与文档里都会提醒）
-        if not _PT_ANY_RE.match(explicit_pt):
-            raise SystemExit(f"--pt 值不合法（分区名只允许字母数字下划线中划线）：{explicit_pt!r}")
+        if not _PT_ANY_RE.match(explicit_pt) or len(explicit_pt) > 64:
+            raise SystemExit(f"--pt 值不合法（分区名只允许字母数字下划线中划线，且不超过 64 字符）：{explicit_pt!r}")
         pt = explicit_pt
     else:
         pt = str(target.get("pt") or bizdate.strftime("%Y%m%d"))

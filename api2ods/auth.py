@@ -59,7 +59,11 @@ class AuthApplier:
 
     def __init__(self, request_cfg: dict, job_dir: Path):
         """job_dir 用于定位自定义签名文件 signers.py（相对路径按作业文件所在目录解析）。"""
-        self.cfg = request_cfg.get("auth") or {}
+        auth_cfg = request_cfg.get("auth") or {}
+        if not isinstance(auth_cfg, dict):
+            # 库调用方绕过 validate_job 时也要给配置错，不能在这里裸 AttributeError
+            raise ConfigError(f"request.auth 必须是对象（键值对），实际 {type(auth_cfg).__name__}")
+        self.cfg = auth_cfg
         self.type = str(self.cfg.get("type") or "none").lower()
         self.job_dir = job_dir
         self._custom_func = None

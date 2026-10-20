@@ -15,7 +15,7 @@ import tempfile
 import threading
 from pathlib import Path
 
-from .utils import progress_log, redact
+from .utils import log, progress_log, redact
 
 # JSON 序列化参数：紧凑（不产生多余空格）、中文不转义（和后端存储口径一致）、
 # allow_nan=False：NaN/Infinity 不是合法 JSON，落盘后 MaxCompute 侧取不到值
@@ -153,8 +153,10 @@ class SpoolWriter:
                 if not keep:
                     try:
                         self.path.unlink()
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        # 删除失败（Windows 上句柄仍被占用等）：临时文件里是 API 原始数据，
+                        # 不能静默留在磁盘；任务已写完，只告警不报错
+                        log(f"⚠️ 临时数据文件清理失败（{exc}）：{self.path}")
 
     def __enter__(self):
         """支持 with 写法（目前调用方是按需 close，见 __exit__ 注释）。"""
