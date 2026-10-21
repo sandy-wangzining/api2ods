@@ -138,6 +138,8 @@ def connect_odps(
     ak_id, secret, source = load_mc_credentials(profile, source_label, cli_profile)
     log(f"MaxCompute 凭证来源：{source}")
     endpoint = endpoint or str((profile or {}).get("endpoint") or DEFAULT_ENDPOINT)
+    if str(endpoint).lower().startswith("http://"):
+        log("  警告：maxcompute.endpoint 是 http:// 明文地址：AK/SK 签名与查询结果会明文传输，建议改 https")
     return ODPS(ak_id, secret, project, endpoint=endpoint)
 
 

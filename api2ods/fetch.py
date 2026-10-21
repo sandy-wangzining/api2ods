@@ -25,9 +25,13 @@ from typing import Callable
 
 from .auth import AuthApplier
 from .dates import window_param_sets
-from .http import request_with_retry
+from .http import DEFAULT_MAX_RESPONSE_BYTES, request_with_retry
 from .parsers import ensure_object_records, extract_json_records, get_path, parse_payload
 from .utils import ConfigError, FatalApiError, as_bool, check_header_values, collect_secret_values, log, redact_secrets
+
+# 单个请求单元最多在内存里累积多少条记录：range 模式（一个单元 = 整个区间）分页时
+# 全量驻留会 OOM；超过就 fail-closed，提示改用 per_day 或拆小区间
+MAX_UNIT_RECORDS = 200_000
 
 # HTTP 方法按 RFC 7230 的 token 形态（字母数字与 !#$%&'*+-.^_`|~）：任意字符串原样写进
 # request.method 会把换行等拼进请求行，或者让 requests 报难以归类的底层错误
@@ -206,6 +210,12 @@ class Fetcher:
             # requests 对 timeout<=0 会在连接前抛裸 ValueError（"Attempted to set connect
             # timeout to 0"），落到重试分类里被当成网络抖动白退避十几分钟；配置错要立刻报
             raise SystemExit(f"request.timeout_seconds 必须大于 0（秒），实际 {self.timeout:g}")
+        raw_max_bytes = _as_number(
+            request_cfg.get("max_response_bytes"), float(DEFAULT_MAX_RESPONSE_BYTES), "request.max_response_bytes"
+        )
+        if raw_max_bytes <= 0 or raw_max_bytes != int(raw_max_bytes):
+            raise SystemExit(f"request.max_response_bytes 必须是正整数，实际 {raw_max_bytes:g}")
+        self.max_response_bytes = int(raw_max_bytes)
         # 非 UTF-8（如 GBK）的 JSON 接口用显式编码；不配则按 UTF-8/响应头声明，解不出直接报错
         self.json_encoding = str(request_cfg.get("json_encoding") or "").strip() or None
         self.response_type = str(request_cfg.get("response_type") or "json").lower()
@@ -227,7 +237,10 @@ class Fetcher:
         # records_missing=empty：接口用"空对象"表示无数据（如阿里云 Items: {}）时不报错
         self.records_missing = str(request_cfg.get("records_missing") or "error").lower()
         # add_fields：给每条记录追加固定字段（多账号打来源标记）
-        self.add_fields = dict(request_cfg.get("add_fields") or {})
+        raw_add_fields = request_cfg.get("add_fields")
+        if raw_add_fields is not None and not isinstance(raw_add_fields, dict):
+            raise ConfigError(f"request.add_fields 必须是对象（键值对），实际 {type(raw_add_fields).__name__}")
+        self.add_fields = dict(raw_add_fields or {})
         self.base_params = dict(request_cfg.get("params") or {})
         self.base_headers = {str(k): str(v) for k, v in (request_cfg.get("headers") or {}).items()}
         # params_in=headers：请求参数（含窗口参数）最终放进请求头而不是 URL（Onerway 结算文件接口）
@@ -376,6 +389,7 @@ class Fetcher:
             desc=desc,
             json_encoding=self.json_encoding,
             redactor=self.redact,
+            max_response_bytes=self.max_response_bytes,
         )
 
     def fetch_unit(
@@ -555,6 +569,13 @@ class Fetcher:
             # 只在单页路径拦得住的话，分页接口会把它原样写进 json 列
             page_records = ensure_object_records(page_records, unit.label)
             records.extend(page_records)
+            if len(records) > MAX_UNIT_RECORDS:
+                # 普通失败会被整窗重试、继续堆内存；这里直接按配置错终止
+                raise ConfigError(
+                    f"{unit.label} 单个请求单元已累积 {len(records):,} 条记录"
+                    f"（内存保护上限 {MAX_UNIT_RECORDS:,}）：请缩小窗口（--start-date/--end-date）"
+                    f"或改用 window.mode=per_day 按天拉取"
+                )
 
             # ③ 判断是否翻完
             if page_type == "page":

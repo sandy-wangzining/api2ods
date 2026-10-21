@@ -111,13 +111,15 @@ def _json_snippet(payload, limit: int = 300) -> str:
     chunks, size = [], 0
     try:
         for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(payload):
+            remaining = limit - size
+            if len(chunk) >= remaining:
+                chunks.append(chunk[:remaining])
+                break
             chunks.append(chunk)
             size += len(chunk)
-            if size >= limit:
-                break
     except (TypeError, ValueError, RecursionError):
         return str(payload)[:limit]
-    return "".join(chunks)[:limit]
+    return "".join(chunks)
 
 
 def _marker_outside_quotes(line: str, marker: str, quoted: bool, delimiter: str = ",") -> tuple[bool, bool]:
@@ -370,7 +372,7 @@ def _parse_text(text: str, parse_cfg: dict, entry: str = "", label: str = "") ->
                 continue
             try:
                 item = loads_json(line)
-            except ValueError as exc:  # 含 NaN/Infinity 的非法数值
+            except (ValueError, RecursionError) as exc:  # 非法数值 / 深层嵌套脏行
                 raise RuntimeError(f"JSONL 解析失败（{exc}）；行片段：{line[:120]!r}")
             # JSONL 的定义是「每行一个 JSON 对象」：数组/数字/字符串行会原样落进
             # ODS 的 json 列，下游 get_json_object 解不出来（静默变 NULL）
@@ -543,16 +545,21 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
     for text in texts:
         try:
             payload = loads_json(text)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
         parsed = True
         break
     if not parsed:
-        if scalar_candidate:
-            # 单行、无列分隔符、又解不出来：纯文本错误体（"503 Service Unavailable" 这类，
-            # 注释里举的"错误消息"正是此形态）。当 CSV 解析会静默产出 0 行（唯一"列名"
-            # 就是错误消息本身）——直接拦下；能解析成 JSON 标量的在下面 parsed 分支拦
-            raise RuntimeError(f"{label} {where}期望文件流，但响应是单行文本（疑似纯文本错误体）：{texts[0][:200]!r}")
+        if scalar_candidate and not as_bool(
+            parse_cfg.get("allow_single_line"), default=False, field="parse.allow_single_line"
+        ):
+            # 单行、无列分隔符、又解不出来：纯文本错误体（"503 Service Unavailable" 这类）。
+            # 当 CSV 解析会静默产出 0 行（唯一"列名"就是错误消息本身）——直接拦下；
+            # 单列 CSV 的"只有表头"文件确实可以是合法零数据，用 allow_single_line 显式放行。
+            raise RuntimeError(
+                f"{label} {where}期望文件流，但响应是单行文本（疑似纯文本错误体）：{texts[0][:200]!r}；"
+                f"若确认这是单列 CSV 的表头（零数据），请设 parse.allow_single_line=true"
+            )
         # 解不出来又以 }/] 收尾：大概率是含 NaN/被截断的 JSON 错误体。
         # 尾字符判断用解码后的文本：utf-16 的 } 不是单字节 0x7d。
         # jsonl 不走这一支：多行 JSONL 本来就不是一个 JSON 值，整包解不出来是正常的
@@ -731,5 +738,5 @@ def parse_payload(payload, request_cfg: dict, parse_cfg: dict, label: str, missi
     if response_type == "bytes":
         if not isinstance(payload, (bytes, bytearray)):
             raise RuntimeError(f"{label} 期望二进制响应，实际拿到 {type(payload).__name__}")
-        return parse_bytes(bytes(payload), parse_cfg or {}, label)
+        return parse_bytes(payload, parse_cfg or {}, label)
     return extract_json_records(payload, request_cfg, label, missing_ok=missing_ok)

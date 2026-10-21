@@ -8,6 +8,14 @@
 **原样**写进 MaxCompute ODS（每条记录一行 JSON + `pt` 业务日分区），DWD 层再解 JSON、
 按主键取最新。接一个新数据源 ≈ 写一份配置文件。
 
+> REST API → MaxCompute ODS sync tool. 同系列：[feishu2ods](https://github.com/sandy-wangzining/feishu2ods)（飞书多维表格） · [sftp2ods](https://github.com/sandy-wangzining/sftp2ods)（SFTP 文件）
+
+**最短路径：** 安装 → `--init` 生成配置 → `--check` 体检 → `--dry-run` 试跑 → 正式同步。
+
+**导航：** [快速开始](#快速开始) · [它是怎么工作的](#它是怎么工作的) · [配置参考](#配置参考) · [行为与保护](#行为与保护) · [常见问题](#常见问题)
+
+适合把有 REST API 的数据源按天/按窗口原样落到 MaxCompute ODS；不适合增量 CDC、实时同步或非 MaxCompute 数仓。
+
 - 配置驱动：地址、参数、鉴权、分页、时间窗口、目标表都在一个 JSON 里
 - 写入幂等：每次按窗口拉数，**先删再填** `pt` 分区，重复跑/补数不会重复
 - 自动建表：目标表不存在时按 `json string + pt string` 建表，存在则校验结构
@@ -32,8 +40,9 @@
 
 ```bash
 # 方式一：pip（建议放虚拟环境）
-python3 -m venv venv && ./venv/bin/pip install api2ods    # 发布到 PyPI 后
-./venv/bin/pip install .                                    # 或在源码目录本地安装
+python3 -m venv venv
+./venv/bin/pip install .                                    # 在源码目录本地安装
+./venv/bin/pip install api2ods                              # 发布到 PyPI 后
 api2ods --version
 
 # 方式二：pipx（全局命令行工具，隔离环境）
@@ -47,8 +56,9 @@ python -m api2ods --job jobs/xxx.json --check
 ```
 
 Windows / macOS / Linux 通用；Windows 会自动带上 `tzdata` 依赖（时区数据）。
+没准备好 MaxCompute / 飞书凭证时，先跑 `python -m unittest discover -s tests -v` 验证安装（离线，不连任何外部服务）。
 
-## 三分钟上手
+## 快速开始
 
 ```bash
 # 1) 生成一份作业配置（交互式问答，密钥直接写进文件、输入时不回显；也可复制 jobs/_template_simple.example.json 手工改）
@@ -76,10 +86,12 @@ api2ods --job jobs/my_api.json --bizdate 20260920 --dates 2026-09-01,2026-09-05 
 api2ods --job jobs/my_api.json --bizdate 20260920 --start-date 2026-07-01 --end-date 2026-09-20 --workers 3
 ```
 
+> `--workers` 范围 1~32（默认 1）；回补历史建议 2~4。并发只并行网络等待，写库仍是单线程。
+
 > **一次运行只写一个 `pt`**（这是设计：一个分区＝一次运行的一份快照，DWD 再按源数据里的
 > 日期字段重新分区）。`--dates` / `--start-date`+`--end-date` 只决定"拉哪些天"，
 > **不决定"写进哪个分区"**，所以补数时不给业务日就会把整段窗口全写进默认业务日分区
-> （`pt=<美东昨天>`）、并先删后填覆盖掉调度刚写进去的数据。为此补数**必须**跟着 `--bizdate`：
+> （`pt=<默认业务日，默认美东昨天>`）、并先删后填覆盖掉调度刚写进去的数据。为此补数**必须**跟着 `--bizdate`：
 > `--bizdate 20260920` 表示整段补数数据写进 `pt=20260920` —— 分区口径和日常调度完全一致，
 > DWD 不用区分"正式"和"补数"两种分区。缺了 `--bizdate` 会直接报错退出，不会静默写错分区。
 
@@ -146,12 +158,13 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | `method` | GET | GET / POST / PUT / PATCH / DELETE |
 | `body_type` | json | POST 请求体格式：`json` / `form` |
 | `timeout_seconds` | 30 | 单次请求超时 |
+| `max_response_bytes` | 1073741824 | 单次响应体上限（解压后字节，默认 1GiB）；导出大文件时按需调大，超过直接报错 |
 | `headers` / `params` | {} | 静态请求头 / 参数 |
 | `params_in` | query | `query`（默认）/ `headers`（参数全放请求头，部分文件接口要求） |
 | `auth` | none | 见下表（`bearer` 最常用） |
 | `records_path` | 空 | 记录数组路径（如 `data.list`）；留空=整个返回就是数组 |
 | `response_type` | json | `json` / `bytes`（文件流，配 `parse`，不支持分页） |
-| `json_encoding` | 空 | JSON 接口不是 UTF-8（如 GBK）时显式指定编码；不写则按 UTF-8 → 响应头声明的 charset 严格解码，解不出直接报错（不静默变乱码写库）。若显式编码与 UTF-8 都能解出但键名不同，会直接报配置错；键名一致、只有值不同（GBK 字节恰好也是合法 UTF-8）时按显式编码处理并告警 |
+| `json_encoding` | 空 | JSON 接口不是 UTF-8（如 GBK）时显式指定编码；不写则按 响应头声明的 charset → UTF-8(sig) 严格解码，解不出直接报错（不静默变乱码写库）。声明编码解不出 JSON、UTF-8 能解出时自动改用 UTF-8；两者都能解出但内容不同会拒绝猜测（报配置错，可用 `json_encoding` 明确指定）；显式编码与 UTF-8 键名不同会报配置错，键名一致、只有值不同时按显式编码处理并告警 |
 | `records_missing` | error | `empty`：路径取不到时按空数据（零数据日接口） |
 | `add_fields` | {} | 每条记录追加固定字段（多账号打来源标记） |
 | `fail_if` | [] | 业务错误判定，如 `[{"path":"code","not_equals":"0","retry":true}]`（`response_type=bytes` 时自动跳过） |
@@ -177,7 +190,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 |---|---|---|
 | `mode` | per_day | `per_day` 每天一次请求（推荐）/ `range` 整区间一次。会先去掉首尾空白再匹配、只认这两个值——拼错或带空格（`"range "`）直接报错，不会静默按 `per_day` 跑 |
 | `days` | 1 | 回拉天数（含基准日）；`--days` 可覆盖 |
-| `date_tz` | America/New_York | 窗口起止（“最近 N 天”）按哪个时区切；不传业务日时的默认业务日固定取美东昨天，不受此字段影响 |
+| `date_tz` | America/New_York | 窗口起止（“最近 N 天”）和 `${today}` 占位符按哪个时区切；不传业务日时的默认业务日取 `ODS_BIZDATE_TZ` 时区的昨天（默认美东），不受此字段影响 |
 | `api_tz` | +08:00 | 传给接口的时间按哪个时区算：固定偏移（`+08:00` / `+0800` / `+08`）或时区名（`America/New_York`，自动处理夏令时） |
 | `pad_hours` | 0 | 窗口前后多拉几小时（防边界丢数），取值 0~24。**只要 >0，相邻两天的窗口就会重合 2×pad_hours 小时**（同一笔数据拉两遍，靠 DWD 按主键去重兜底）。`format` 只到日期时本项**被忽略并告警**：日期参数减 pad 不是多拉一段，而是把日期整体顶到前一天。写布尔（YAML 里当开关写 `true`）与 NaN/超范围都会报错，不会被当成 1 小时 |
 | `start_param` / `end_param` | startTime / endTime | 起止时间参数名。**两个都不写**才启用默认；自定义了 `start_param` 就不补 `end_param`（只要开始时间只写 `start_param`，不要结束时间写 `"end_param": null`） |
@@ -197,8 +210,8 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 >   数据不缺但跟源方的账期对不上；DWD 层按源数据里的日期字段重新分区可以规避这个影响；
 > - `format` 只到日期时（`%Y-%m-%d` / `%Y%m%d`）不参与时区换算，直接就是那一天的日期。
 >
-> **统一口径**：不带 `--bizdate` 且没有环境变量时，默认业务日统一取美东昨天
-> （`America/New_York`，三个 ODS 工具共用公共运行层实现）；`date_tz` 只负责窗口起止怎么切成“一天”，
+> **统一口径**：不带 `--bizdate` 且没有环境变量时，默认业务日统一取业务日时区的昨天
+> （默认 `America/New_York`，可用 `ODS_BIZDATE_TZ` 覆盖；三个 ODS 工具共用公共运行层实现）；`date_tz` 只负责窗口起止怎么切成“一天”，
 > 不改变默认业务日。`pt` 永远是业务日 `bizdate` 本身。`format` 只到日期时（阿里云 `BillingDate`），
 > `date_tz` **完全不影响**发给接口的参数；`format` 带时分秒 / `unix` 时（DeepSeek），`date_tz`
 > 决定窗口的实际起止，换时区会改变每个 `pt` 里装的是哪段时间（同一 `pt` 的内容整体平移，
@@ -276,7 +289,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 4. **跑 `--check`**：它会真实请求一次并打印返回顶层字段，帮你确认 `records_path`；
 5. **跑 `--days 1 --dry-run`** 看条数对不对，然后就可以配调度了。
 
-## 行为与保护（为什么可以放心跑调度）
+## 行为与保护
 
 1. 拉取有任何失败 → 不写库（旧分区保持原样），退出码 1；
 2. 写库先删分区再写、整段失败自动重试（每次重试用**全新的 Tunnel 会话**，不会把上次残留的块
@@ -372,10 +385,13 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 ## 开发与测试
 
 ```bash
-python -m unittest discover -s tests -v    # 726 个离线用例：不访问网络、不连数仓
-pip install -e ".[dev]" && ruff check .    # 代码检查（配置在 pyproject.toml，当前 0 告警）
-ruff format --check .                      # 格式检查（CI 门禁；需要时先跑 ruff format .）
+python -m pip install -e ".[dev]"          # 开发依赖（ruff）
+python -m unittest discover -s tests -v    # 离线用例：不访问网络、不连数仓
+ruff check .                               # 代码检查
+ruff format --check .                      # 格式检查（需要时先跑 ruff format .）
 ```
+
+`review_ignore.json` 是代码审查工具的误报抑制名单，不参与运行。测试按模块拆分（`tests/test_*.py`），公共替身在 `tests/_helpers.py`。
 
 CI 在 ubuntu / windows / macos × Python 3.9 / 3.10 / 3.11 / 3.12 / 3.13 / 3.14
 十八种组合上跑同一套用例（见 `.github/workflows/tests.yml`）。想改代码或加数据源，先看 `CONTRIBUTING.md`
@@ -402,7 +418,7 @@ CI 在 ubuntu / windows / macos × Python 3.9 / 3.10 / 3.11 / 3.12 / 3.13 / 3.14
 
 ## License
 
-MIT（见 `LICENSE`）。
+MIT（见 [LICENSE](LICENSE)）。
 
 ## 公共源码维护
 

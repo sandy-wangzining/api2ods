@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import codecs
 import math
+import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -19,6 +20,9 @@ except ImportError:  # pragma: no cover - 单元测试/--dry-run 可以不装
     requests = None
 
 MAX_RETRY_AFTER = 180
+# 单次响应体上限（解压后字节）：默认 1GiB，和 ZIP 解压总上限一致。导出接口可以调大，
+# 但不能没有上限——requests 默认会把整个响应读进内存，一个异常大包会直接打爆进程。
+DEFAULT_MAX_RESPONSE_BYTES = 1024 * 1024 * 1024
 
 
 class RetryLater(RuntimeError):
@@ -74,6 +78,37 @@ def _is_latin1_alias(encoding) -> bool:
         return False
 
 
+def _is_utf8_family(encoding) -> bool:
+    """编码名是否 UTF-8（含 utf-8-sig / utf8 等别名）。认不出的返回 False。"""
+    try:
+        return codecs.lookup(str(encoding or "").strip()).name in ("utf-8", "utf-8-sig")
+    except (LookupError, TypeError, ValueError):
+        return False
+
+
+def _header_charset(response) -> str:
+    """服务端在 Content-Type 里显式声明的 charset；没有声明返回空串。
+
+    requests 的 `response.encoding` 对 JSON 默认是 utf-8、对 text/* 默认是 ISO-8859-1，
+    这些只是库的默认值，不能当成"服务端声明"来否定用户的显式 json_encoding。
+    """
+    headers = getattr(response, "headers", None) or {}
+    content_type = headers.get("Content-Type") if hasattr(headers, "get") else None
+    if not content_type:
+        return ""
+    match = re.search(r"charset\s*=\s*([^\s;]+)", str(content_type), re.I)
+    return match.group(1).strip().strip("\"'") if match else ""
+
+
+def _json_parses(text: str) -> bool:
+    """文本是否是合法 JSON（用于编码歧义时判断哪一侧才是真身）。"""
+    try:
+        loads_json(text)
+        return True
+    except ValueError:
+        return False
+
+
 def _json_key_set(text: str) -> set[str] | None:
     """解析 JSON 并收集所有对象键；解析失败返回 None。
 
@@ -99,14 +134,18 @@ def _json_key_set(text: str) -> set[str] | None:
     return keys
 
 
-def _decode_json_body(response, json_encoding: str | None) -> str:
-    """JSON 响应体 → 文本：显式配置 > UTF-8(sig) > 响应头声明的 charset，全都解不出就报错。
+def _decode_json_body(response, json_encoding: str | None = None, *, raw: bytes | None = None) -> str:
+    """JSON 响应体 → 文本：显式配置 > 响应头声明的 charset > UTF-8(sig)，全都解不出就报错。
 
     不能用 errors="replace" 兜底：GBK 等非 UTF-8 接口的中文会静默变成 U+FFFD 写进 ODS，
     条数与写后校验全过（违反"宁可失败不可静默写坏数据"）。原实现固定 utf-8+replace，
     连响应头里声明的编码都不看。
+
+    声明编码与 UTF-8 都能解出合法 JSON 但内容不同时无法判定真实编码（服务端把 UTF-8
+    误声明成 GBK，或 GBK 字节恰好是合法 UTF-8），此时拒绝猜测，要求显式 json_encoding。
     """
-    raw = response.content
+    if raw is None:
+        raw = response.content
     candidates: list[str] = []
     if json_encoding:
         # latin-1 能把任何字节序列解成"看起来成功"的乱码，和响应头声明一样要挡掉：
@@ -128,23 +167,27 @@ def _decode_json_body(response, json_encoding: str | None) -> str:
                 f"常见取值：utf-8 / utf-8-sig / gbk / gb18030 / utf-16"
             ) from None
         candidates.append(encoding_name)
+    declared = str(getattr(response, "encoding", "") or "").strip()
+    # requests 对 text/* 默认给 ISO-8859-1（HTTP 规范默认值，不是服务端声明）：
+    # 它能把任何字节序列解成"看起来成功"的乱码，绝不能进候选。
+    # 显式声明的 charset 要排在 utf-8-sig 猜测之前：GBK 字节恰好也能被 UTF-8 解成
+    # 合法 JSON 时，先猜 UTF-8 会得到乱码键名且校验全过。
+    if declared and not _is_latin1_alias(declared):
+        candidates.append(declared)
     # utf-8-sig：有些源会在 JSON 最前面带 BOM，按 utf-8 解出来是 "﻿{"，
     # loads_json 会一直解析失败并重试到耗尽
     candidates.append("utf-8-sig")
-    declared = str(getattr(response, "encoding", "") or "").strip()
-    # requests 对 text/* 默认给 ISO-8859-1（HTTP 规范默认值，不是服务端声明）：
-    # 它能把任何字节序列解成"看起来成功"的乱码，绝不能进候选
-    if declared and not _is_latin1_alias(declared):
-        candidates.append(declared)
     seen: set[str] = set()
     last_exc: Exception | None = None
     resolved: str | None = None
+    resolved_encoding: str | None = None
     for encoding in candidates:
         if encoding.lower() in seen:
             continue
         seen.add(encoding.lower())
         try:
             resolved = raw.decode(encoding).lstrip("﻿")
+            resolved_encoding = encoding
             break
         except (LookupError, UnicodeDecodeError) as exc:
             last_exc = exc
@@ -153,42 +196,172 @@ def _decode_json_body(response, json_encoding: str | None) -> str:
             f"接口 JSON 响应按 {'/'.join(candidates)} 都解不出来（{last_exc}）；"
             f'源是 GBK 等非 UTF-8 编码时，请给 request 加 json_encoding（如 "gbk"）'
         )
+    fallback: str | None = None
+    if json_encoding or (resolved_encoding and not _is_utf8_family(resolved_encoding)):
+        try:
+            fallback = raw.decode("utf-8-sig").lstrip("﻿")
+        except UnicodeDecodeError:
+            fallback = None
+        # UTF-16/UTF-32 的字节串按 UTF-8 也能"解出来"（一堆 \x00 夹杂），
+        # 那不是"源是 UTF-8"的证据；与原文相同时也无需再判。
+        if fallback is not None and ("\x00" in fallback or fallback == resolved):
+            fallback = None
+
     if json_encoding:
         # 显式配置与 utf-8-sig 都能解出来、但内容不一致：多半是把 UTF-8 接口错配成了
         # gbk 之类——解出来的是乱码键名，JSON 照样解析成功、写库也照样校验通过，下游
         # get_json_object 全取空。原来只打一条警告就照写，属于"静默写坏数据"，这里改成
         # 直接报配置错（ConfigError 不可重试，快速暴露）。
-        #
-        # 但 UTF-16/UTF-32 这类定宽编码会产出含 \x00 的字节串，它同样能被 utf-8-sig
-        # "解出来"（内容是一堆 \x00 夹杂）——那不是"源是 UTF-8"的证据，要排除掉，
-        # 否则合法的 UTF-16 源会被这条冲突检查误杀。
-        try:
-            fallback = raw.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            fallback = None
-        if fallback is not None and "\x00" in fallback:
-            fallback = None
-        if fallback is not None and fallback != resolved:
-            configured_keys = _json_key_set(resolved)
-            utf8_keys = _json_key_set(fallback)
-            if configured_keys is not None and utf8_keys is not None and configured_keys != utf8_keys:
-                # 键名完全不同是很强的信号：UTF-8 的键名被按 GBK 解成了另一组汉字，
-                # 下游 get_json_object('$.原键名') 会全取空。
+        if fallback is not None:
+            resolved_ok = _json_parses(resolved)
+            fallback_ok = _json_parses(fallback)
+            if not resolved_ok and fallback_ok:
+                # 显式编码解出来根本不是 JSON，而 UTF-8 是合法 JSON：配置的编码错了
                 raise ConfigError(
-                    f"request.json_encoding={json_encoding!r} 解出的 JSON 键名与 utf-8-sig "
-                    f"不一致（{sorted(configured_keys)[:5]} vs {sorted(utf8_keys)[:5]}），"
-                    f"无法确定接口真实编码；按 json_encoding 写库可能是乱码键名。若接口是 UTF-8，"
-                    f"请删掉 request.json_encoding；若接口确实是 {json_encoding!r}，请核对源编码"
+                    f"request.json_encoding={json_encoding!r} 解出的内容不是合法 JSON，"
+                    f"而同一份响应体按 utf-8-sig 能解出合法 JSON；配置的编码很可能不对。"
+                    f"若接口是 UTF-8，请删掉 request.json_encoding"
                 )
-            # 键名一致、只有值不同：GBK 双字节序列恰好也是合法 UTF-8 的情况真实存在
-            # （例如 '一'.encode('gbk') 能被 utf-8-sig 解成 'һ'）。显式 json_encoding
-            # 是用户最强的信号，不能因为这种歧义直接拒绝合法 GBK 数据；打一条告警留痕。
+            if resolved_ok and fallback_ok:
+                configured_keys = _json_key_set(resolved)
+                utf8_keys = _json_key_set(fallback)
+                if configured_keys is not None and utf8_keys is not None and configured_keys != utf8_keys:
+                    # 键名完全不同是很强的信号：UTF-8 的键名被按 GBK 解成了另一组汉字，
+                    # 下游 get_json_object('$.原键名') 会全取空。
+                    #
+                    # 例外：响应头显式声明的 charset 与显式配置一致时，这是"声明的编码本身有歧义"，
+                    # 用户已按提示显式指定；不能再拒绝（否则声明分支让用户配 json_encoding、
+                    # 这里又报错，合法 GBK 源永远跑不了）。响应头没声明 charset 时，
+                    # requests 给的 encoding 只是默认值，更不能拿来否定用户的显式配置。只告警。
+                    header_charset = _header_charset(response)
+                    if header_charset:
+                        try:
+                            agrees_with_header = (
+                                codecs.lookup(str(json_encoding).strip()).name == codecs.lookup(header_charset).name
+                            )
+                        except LookupError:
+                            agrees_with_header = False
+                    else:
+                        agrees_with_header = True
+                    if not agrees_with_header:
+                        raise ConfigError(
+                            f"request.json_encoding={json_encoding!r} 解出的 JSON 键名与 utf-8-sig "
+                            f"不一致（{sorted(configured_keys)[:5]} vs {sorted(utf8_keys)[:5]}），"
+                            f"无法确定接口真实编码；按 json_encoding 写库可能是乱码键名。若接口是 UTF-8，"
+                            f"请删掉 request.json_encoding；若接口确实是 {json_encoding!r}，请核对源编码"
+                        )
+                    if header_charset:
+                        log_once(
+                            f"  警告：响应头声明 charset={header_charset!r} 与 request.json_encoding 一致，"
+                            f"但按 UTF-8 也能解出另一组键名；已按显式配置处理。若接口其实是 UTF-8，"
+                            f"请修服务端 Content-Type 并删掉 request.json_encoding"
+                        )
+                    else:
+                        log_once(
+                            f"  警告：响应头未声明 charset，request.json_encoding={json_encoding!r} "
+                            f"与 UTF-8 解出的键名不同；已按显式配置处理。若接口其实是 UTF-8，"
+                            f"请删掉 request.json_encoding"
+                        )
+                else:
+                    # 键名一致、只有值不同：GBK 双字节序列恰好也是合法 UTF-8 的情况真实存在
+                    # （例如 '一'.encode('gbk') 能被 utf-8-sig 解成 'һ'）。显式 json_encoding
+                    # 是用户最强的信号，不能因为这种歧义直接拒绝合法 GBK 数据；打一条告警留痕。
+                    log_once(
+                        f"  警告：request.json_encoding={json_encoding!r} 解出的内容与 utf-8-sig "
+                        f"不一致，但两者都是合法 JSON；已优先按显式 json_encoding 处理。若接口其实是 "
+                        f"UTF-8，请删掉 request.json_encoding，否则下游可能取不到字段"
+                    )
+    elif fallback is not None:
+        # 响应头声明了非 UTF-8 编码，但同一份字节按 UTF-8 也能解开：
+        # 先看哪一侧才是合法 JSON；两侧都合法时猜错会把乱码写进 ODS，拒绝猜测。
+        resolved_ok = _json_parses(resolved)
+        fallback_ok = _json_parses(fallback)
+        if not resolved_ok and fallback_ok:
+            # 声明编码解出来不是 JSON（如把 UTF-8 误声明成 utf-16）：UTF-8 才是真身，
+            # 不能返回乱码让上层按"不是 JSON"白重试几分钟
             log_once(
-                f"  警告：request.json_encoding={json_encoding!r} 解出的内容与 utf-8-sig "
-                f"不一致，但两者都是合法 JSON；已优先按显式 json_encoding 处理。若接口其实是 "
-                f"UTF-8，请删掉 request.json_encoding，否则下游可能取不到字段"
+                f"  警告：响应头声明 charset={resolved_encoding!r} 解不出合法 JSON，"
+                f"但按 UTF-8 能解出；已按 UTF-8 处理（建议修服务端 Content-Type）"
+            )
+            return fallback
+        if resolved_ok and fallback_ok:
+            raise ConfigError(
+                f"响应头声明 charset={resolved_encoding!r}，但同一份响应体按 UTF-8 也能解出"
+                f"另一份合法 JSON，无法确定真实编码（猜错会把乱码写进 ODS）。若接口是 UTF-8，"
+                f'请修服务端的 Content-Type（或在 request 里配 json_encoding="utf-8"）；'
+                f"若接口确实是 {resolved_encoding!r}，请给 request 加 json_encoding={resolved_encoding!r}"
             )
     return resolved
+
+
+def _read_body(response, max_bytes: int, *, truncate: bool = False) -> bytes | bytearray:
+    """读响应体，超过 max_bytes 直接失败；truncate=True 时只返回前 max_bytes 字节。
+
+    优先按块读，避免整个大包先驻留内存。truncate 用于 4xx 错误体：只需要开头一段
+    定位原因，大错误页不能整包读入，也不该整段丢弃。测试替身没有 iter_content 时
+    退回 response.content（一次性读入后再检查/截断，只有测试会走到）。
+    注意：上限保护的是"不会读进无限大的包"，不是进程峰值内存——解析阶段仍会
+    decode 成 str 或建 JSON 对象，大包需要按实际上限预留内存。
+    """
+    close = getattr(response, "close", None)
+    headers = getattr(response, "headers", None) or {}
+    declared = headers.get("Content-Length") if hasattr(headers, "get") else None
+    if declared and not truncate:
+        try:
+            if int(declared) > max_bytes:
+                if close is not None:
+                    close()
+                raise ConfigError(f"响应体 {int(declared):,} 字节，超过 request.max_response_bytes={max_bytes:,}")
+        except (TypeError, ValueError):
+            pass
+    # 只有类上真的定义了 iter_content 才按块读（requests.Response / 测试替身）；
+    # mock.Mock 会自动生成任意属性，直接 getattr 会拿到一个不可迭代的 Mock
+    streaming = callable(getattr(type(response), "iter_content", None))
+    try:
+        if not streaming:
+            raw = response.content
+            if truncate:
+                return raw[:max_bytes]
+            if len(raw) > max_bytes:
+                raise ConfigError(f"响应体超过 request.max_response_bytes={max_bytes:,} 字节（实际 {len(raw):,}）")
+            return raw
+        buffer = bytearray()
+        total = 0
+        for chunk in response.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            if truncate:
+                remaining = max_bytes - total
+                if len(chunk) >= remaining:
+                    buffer.extend(chunk[:remaining])
+                    return buffer
+            total += len(chunk)
+            if total > max_bytes:
+                raise ConfigError(f"响应体超过 request.max_response_bytes={max_bytes:,} 字节（已读取 {total:,}）")
+            buffer.extend(chunk)
+        return buffer
+    finally:
+        if close is not None:
+            close()
+
+
+def _decode_error_body(response, raw: bytes | bytearray) -> str:
+    """4xx 错误体解码：过滤 latin-1 默认值，声明编码优先，其次 UTF-8。
+
+    charset 拼错（LookupError）或字节不合法时继续尝试，最终 replace 兜底，
+    保证 4xx 始终能收口成 FatalApiError，而不是把裸 LookupError 抛给上层。
+    """
+    candidates: list[str] = []
+    declared = str(getattr(response, "encoding", "") or "").strip()
+    if declared and not _is_latin1_alias(declared):
+        candidates.append(declared)
+    candidates.extend(["utf-8-sig", "utf-8"])
+    for encoding in dict.fromkeys(candidates):
+        try:
+            return raw.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return raw.decode("utf-8", "replace")
 
 
 def request_once(
@@ -202,6 +375,8 @@ def request_once(
     verify: bool,
     proxies: dict | None,
     json_encoding: str | None = None,
+    *,
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
 ):
     """发一次 HTTP 请求（不含重试；单元测试会替换本函数）。
 
@@ -213,7 +388,9 @@ def request_once(
     if requests is None:
         raise FatalApiError("缺少 requests，请先 pip install requests")
     method = method.upper()
-    kwargs = {"headers": headers, "timeout": timeout, "verify": verify}
+    # stream=True：requests 默认会在 send() 里把整个响应体读进内存，那时候再检查
+    # max_response_bytes 已经晚了；必须让 _read_body 从连接里按块读。
+    kwargs = {"headers": headers, "timeout": timeout, "verify": verify, "stream": True}
     if proxies:
         kwargs["proxies"] = proxies
     if method == "GET":
@@ -262,14 +439,17 @@ def request_once(
         response.close()
         raise RetryLater(retry_after, f"HTTP {status}")
     if 400 <= status < 500:
-        detail = redact(response.text[:300])
-        response.close()
+        # 错误体只保留前 64KB：4xx 页面也可能异常大，不能整包读进内存，
+        # 也不能整段丢弃——开头通常就写着真实原因（如 page size 不合法）
+        raw_detail = _read_body(response, 64 * 1024, truncate=True)
+        detail = redact(_decode_error_body(response, raw_detail)[:300])
         raise FatalApiError(f"HTTP {status}：{detail}")
     response.raise_for_status()
 
     if not expect_json:
-        return response.content
-    text = _decode_json_body(response, json_encoding)
+        return _read_body(response, max_response_bytes)
+    raw = _read_body(response, max_response_bytes)
+    text = _decode_json_body(response, json_encoding, raw=raw)
     try:
         # 返回值带 NaN/Infinity 时在 loads_json 里挡住
         return loads_json(text)
@@ -305,10 +485,17 @@ def _normalize_compare(value):
             try:
                 number = float(text)
             except ValueError:
-                return value
-            return number if math.isfinite(number) else value
+                return text  # 返回 strip 后的值：CHAR 列定长补齐的尾部空格不能影响 equals
+            return number if math.isfinite(number) else text
         return float(number) if abs(number) <= _SAFE_INT else number
     return value
+
+
+def _compare_equal(left, right) -> bool:
+    """fail_if 相等判断：浮点用容差，避免 0.1+0.2 这类序列化误差把业务错误漏判。"""
+    if isinstance(left, float) and isinstance(right, float):
+        return math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-12)
+    return left == right
 
 
 def check_fail_if(payload, fail_if: list | None) -> None:
@@ -322,8 +509,8 @@ def check_fail_if(payload, fail_if: list | None) -> None:
         return
     for cond in fail_if or []:
         value = _normalize_compare(get_path(payload, cond.get("path", ""), default=None))
-        bad = ("equals" in cond and value == _normalize_compare(cond["equals"])) or (
-            "not_equals" in cond and value != _normalize_compare(cond["not_equals"])
+        bad = ("equals" in cond and _compare_equal(value, _normalize_compare(cond["equals"]))) or (
+            "not_equals" in cond and not _compare_equal(value, _normalize_compare(cond["not_equals"]))
         )
         if not bad:
             continue
@@ -356,6 +543,7 @@ def request_with_retry(
     desc: str = "请求",
     json_encoding: str | None = None,
     redactor=None,
+    max_response_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
 ):
     """带长冷却重试的请求；业务错误按 fail_if 判定。
 
@@ -390,7 +578,17 @@ def request_with_retry(
         try:
             params, headers = build_request()
             payload = request_once(
-                method, url, params, headers, body_type, timeout, expect_json, verify, proxies, json_encoding
+                method,
+                url,
+                params,
+                headers,
+                body_type,
+                timeout,
+                expect_json,
+                verify,
+                proxies,
+                json_encoding,
+                max_response_bytes=max_response_bytes,
             )
             check_fail_if(payload, fail_if)  # 200 也可能是业务错误（如 code != 0）
             return payload

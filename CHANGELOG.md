@@ -10,15 +10,37 @@
   单个群发送失败不影响其它群，也不改变任务退出码。脱敏/密钥收集对数组同样生效（每个地址都会遮）。
   向后兼容：原来的字符串写法不变。
 
+- **`ODS_BIZDATE_TZ` 可覆盖缺省业务日时区**（默认 `America/New_York`）：不传 `--bizdate`、
+  也没有业务日环境变量时，按该时区的昨天取业务日；非法时区直接报错。
+
 ### 变更
 
 - **不传业务日默认取美东昨天（行为变更）**：`--bizdate`、环境变量 `bizdate`/`SKYNET_BIZDATE`
-  都没有时，默认业务日取 `America/New_York` 的昨天；该逻辑收敛到公共运行层
+  都没有时，默认业务日取 `America/New_York` 的昨天（可用 `ODS_BIZDATE_TZ` 覆盖）；该逻辑收敛到公共运行层
   `shared/runtime.py`，三个 ODS 项目共用同一份实现。`window.date_tz` 仍负责窗口构造。
 - `window.date_tz` 未配置时的默认值由 `Asia/Shanghai` 改为 `America/New_York`。
 
 ### 修复
 
+- 新增 `request.max_response_bytes`（默认 1GiB）：响应体按块读取并限制大小，避免超大导出或错误页把进程内存打爆。
+- 响应头声明的编码与 UTF-8 都能解出合法 JSON 但内容不同时不再擅自选择：报配置错并要求用 `request.json_encoding` 指定；声明编码解不出 JSON 而 UTF-8 能解出时自动改用 UTF-8。响应头未显式声明 charset 时，显式 `json_encoding` 优先（requests 的默认 encoding 不作为服务端声明）。
+- 4xx 错误体超过 64KB 时保留前 64KB（原来整段丢弃），“page size must be &gt;= 10”这类原因与体检的页大小回退不再丢失。
+- 值级脱敏补收 `profiles.<名>` 里的 AK/SK，并同时遮蔽百分号编码的小写十六进制形态（`%2f`），避免 SDK 自由文本回显时漏遮。
+- 单列 CSV 只有表头（合法零数据）可用 `parse.allow_single_line=true` 显式放行；默认仍拦纯文本错误体，避免把错误页当零数据。
+- `--init` 默认表名把作业名里的 `-` 等非法字符替换成 `_`，避免生成过不了校验的配置；`--init-out` 支持 `~` 展开。
+- `--days`/`--pt` 的长度上限前移到配置校验；`target.allow_empty` 类型错误在拉取前就报，不再白跑一整轮 API。
+- 共享运行层的 `safe_label` 覆盖 C1/Unicode 控制符并中和 Markdown 链接与 `<at>` 语法，外部错误文本进日志/告警卡片时不会渲染成钓鱼链接；`with_scheme_bare` 支持任意空白切分。
+- 飞书告警 POST 不再跟随重定向（307 会把卡片重发到别的地址、302/303 会丢 body）。
+- 临时数据文件清理失败时留一条告警，不再静默把 API 原始数据留在磁盘。
+- 时区偏移限制在 -12:00 ~ +14:00（拒绝 `+14:59`/`-13:30` 这类不存在的偏移）。
+- `_json_snippet` 按剩余额度截断，避免超长错误体字段先整体物化再拼接。
+- `window.start_param`/`end_param` 的空串在配置阶段拒绝（运行期会当成“未配置”只发一半边界，可能拉回全部历史）。
+- `fail_if` 比较先对字符串去首尾空白，浮点用容差，CHAR 定长补齐与 `0.1+0.2` 不会漏判业务错误。
+- 单个请求单元累积超过 20 万条记录时 fail-closed，提示改用 `per_day` 或拆分区间，避免 range 模式分页 OOM。
+- 深度嵌套的 JSONL/错误体捕获 `RecursionError` 并转成清晰的解析错误；共享 `feishu_card` 对单个字符串/None 做归一化。
+- 配置的 MaxCompute endpoint 是 `http://` 时打一条明文传输告警。
+- `--workers` 限制在 1~32，防止手误创建大量线程、放大接口限流。
+- `--init` 向导默认窗口时区改为 `America/New_York`，作业概要在未配置 `date_tz` 时也按实际默认显示（原来显示 `Asia/Shanghai`）。
 - 自主复核补齐：大单条 JSONL 的尾随换行/空行不再绕过错误体拦截；分块识别有效行，保留多记录、UTF-16/32 和显式单条放行。
 - API 作业路径含 POSIX 非 UTF-8 字节时，运行锁与字段快照统一按文件系统编码计算摘要，避免启动或写后快照崩溃。
 
