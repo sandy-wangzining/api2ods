@@ -8,6 +8,7 @@ import math
 import re
 import time
 from datetime import datetime, timezone
+from decimal import Decimal
 from email.utils import parsedate_to_datetime
 
 from .parsers import get_path
@@ -493,6 +494,9 @@ def _normalize_compare(value):
 
 def _compare_equal(left, right) -> bool:
     """fail_if 相等判断：浮点用容差，避免 0.1+0.2 这类序列化误差把业务错误漏判。"""
+    if isinstance(left, Decimal) or isinstance(right, Decimal):
+        if isinstance(left, (Decimal, int, float)) and isinstance(right, (Decimal, int, float)):
+            return Decimal(str(left)) == Decimal(str(right))
     if isinstance(left, float) and isinstance(right, float):
         return math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-12)
     return left == right

@@ -9,11 +9,12 @@
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 import threading
 from pathlib import Path
+
+import simplejson as json
 
 from .utils import log, progress_log, redact
 
@@ -34,13 +35,13 @@ def _reject_constant(name: str):
 
 def loads_json(text: str):
     """解析接口返回的 JSON（拒绝 NaN/Infinity）。"""
-    return json.loads(text, parse_constant=_reject_constant)
+    return json.loads(text, use_decimal=True, parse_constant=_reject_constant)
 
 
-def dump_record(record) -> str:
+def dump_record(record, *, sort_keys: bool = False) -> str:
     """一条记录 → 单行 JSON（全工具唯一的序列化出口）。"""
     try:
-        return json.dumps(record, **_JSON_KWARGS)
+        return json.dumps(record, use_decimal=True, sort_keys=sort_keys, **_JSON_KWARGS)
     except (TypeError, ValueError) as exc:
         # TypeError 与 ValueError 都要接：不可序列化的对象（datetime/set/自定义对象）抛的是
         # TypeError，只接 ValueError 会让它绕过本处的脱敏与中文报错、变成裸 traceback

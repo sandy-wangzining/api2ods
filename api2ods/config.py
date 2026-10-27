@@ -67,6 +67,7 @@ PAGINATION_KEYS = {
     "total_items_path",
     "stop_when_short",
     "strict",
+    "allow_repeated_pages",
     "cursor_param",
     "cursor_path",
     "cursor_start",
@@ -669,6 +670,7 @@ def validate_job(job: dict) -> None:
     _require_number(pagination.get("max_pages"), "pagination.max_pages", exclusive_min=0, integer=True)
     _require_number(pagination.get("delay_seconds"), "pagination.delay_seconds", minimum=0)
     _require_number(pagination.get("window_retries"), "pagination.window_retries", minimum=0, integer=True)
+    as_bool(pagination.get("allow_repeated_pages"), default=False, field="pagination.allow_repeated_pages")
     if page_type == "none" and ("page_size" in pagination or pagination.get("size_param") is not None):
         # 只配了"页大小"没有页码/终点：请求里会带上 size 但永远只拉一页，
         # 数据量一大就静默少拿（看着像配了分页）。

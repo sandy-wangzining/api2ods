@@ -106,6 +106,8 @@
     "size_param": "size",
     "page_size": 100,
     "param_as_string": false,
+    "allow_repeated_pages": false,
+    "//allow_repeated_pages": "页码分页默认拒绝整页重复；仅源数据没有唯一标识且确实允许相同页面时设 true",
     "//param_as_string": "页码/页大小是否需要按字符串传（有些接口要求 true，如 Onerway）",
     "total_pages_path": "data.totalPages",
     "total_items_path": "data.totalCount",

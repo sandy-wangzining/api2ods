@@ -4,6 +4,13 @@
 
 ## [Unreleased]
 
+### 通用同步完整性
+
+- JSON/JSONL 使用 Decimal + simplejson>=4.2 无损读写小数，保留 JSON 数字类型；拒绝 NaN/Infinity。修复大金额舍入、极小数下溢为零的问题。
+- 页码分页默认检测重复页面，不能再用重复第一页凑够 total；确实允许整页相同的源可显式配置 pagination.allow_repeated_pages=true。
+- 与另外两个工具共用按 project.table 归一化的目标表锁，不同配置文件或安装目录不能在同一目标交错删写。多用户可用 ODS_TARGET_LOCK_DIR 固定共享目录，升级前需停止旧进程。
+- README 补充独立安装、地域/时区、权限与升级说明；新增公共锁、精度和分页回归测试。
+
 ### 新增
 
 - **`notify.webhook` 支持多个群（字符串或字符串数组）**：一条告警可同时发到多个飞书群；

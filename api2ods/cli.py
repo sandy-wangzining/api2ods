@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 from . import VERSION, fieldwatch
-from ._common import default_bizdate, private_lock_dir
+from ._common import default_bizdate, private_lock_dir, target_lock_path
 from .config import (
     build_context_doc,
     check_block_types,
@@ -825,7 +825,12 @@ def main(argv: list[str] | None = None, *, hard_exit: bool = False) -> int:
 
         try:
             with RunLock(_lock_path(job_path.resolve())):  # 同机同一作业互斥；不同作业可并行
-                rc = run_sync(job, config, config_path, args, bizdate, job_path.resolve())
+                if args.dry_run:
+                    rc = run_sync(job, config, config_path, args, bizdate, job_path.resolve())
+                else:
+                    project, table_name, _, _ = resolve_target(job, config, args, bizdate)
+                    with RunLock(target_lock_path(project, table_name)):
+                        rc = run_sync(job, config, config_path, args, bizdate, job_path.resolve())
             if rc == 130:
                 # 拉取/写库阶段的 Ctrl+C 走的是 run_sync 的 return 130（它要先清临时文件、
                 # 放运行锁），异常不会传到这里；只看异常的话这道保险等于不存在

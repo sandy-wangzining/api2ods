@@ -6,9 +6,10 @@ from __future__ import annotations
 import codecs
 import csv
 import io
-import json
 import re
 import zipfile
+
+import simplejson as json
 
 from .spool import loads_json
 from .utils import ConfigError, as_bool, log
