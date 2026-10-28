@@ -3,7 +3,7 @@
 
 一次运行的完整流程（run_sync）：
     1) 解析参数 → 计算要拉哪几天（resolve_days）
-    2) 拉取：Fetcher 并发跑所有请求单元，记录边拉边写本地 Spool 临时文件（不占内存）
+    2) 拉取：Fetcher 并发跑所有请求单元，记录边拉边写本地 Spool 临时文件（按页/批次限制内存）
     3) 拉取有任何失败 → 不写库直接退出（防止分区缺数；重跑即可）
     4) 写库：自动建表 → 删分区 → Tunnel 分批写入 → count(*) 核对行数
     5) 全程日志带时间戳，密钥/签名/token 已脱敏
@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     """命令行参数定义（help 文案就是用户文档的第一入口，改参数时同步改 README）。"""
     parser = argparse.ArgumentParser(
         prog="api2ods",
-        description="通用 REST API → MaxCompute ODS（裸 json 列 + pt 分区，先删再填）",
+        description="通用 REST API → MaxCompute ODS（裸 json 列 + pt 分区，暂存校验后原子发布）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "常用示例：\n"
@@ -417,7 +417,7 @@ def run_check(job: dict, config: dict, config_path: Path, args, bizdate, job_pat
 
 
 def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path: Path) -> int:
-    """正式同步：拉取（落盘 Spool）→ 建表 → 先删再填 pt 分区 → 行数校验。"""
+    """正式同步：拉取（落盘 Spool）→ 建表 → 暂存校验后原子发布 pt 分区 → 行数校验。"""
     job_dir = job_path.parent
     project, table_name, column, pt = resolve_target(job, config, args, bizdate)
     target_cfg = job.get("target") or {}
@@ -448,11 +448,11 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
         )
     )
     if len(days) > 30:
-        log("提示：回补天数较多，耗时较长（受接口限速影响）；可 Ctrl+C 中断后重跑（先删再填，重复跑幂等）。")
+        log("提示：回补天数较多，耗时较长（受接口限速影响）；可 Ctrl+C 中断后重跑（暂存校验后原子发布，重复跑幂等）。")
 
     started = time.monotonic()
     try:
-        spool = SpoolWriter()  # 记录边拉边落盘（大数据量不占内存）
+        spool = SpoolWriter()  # 单元按页暂存成功后，分批并入主文件
     except OSError as exc:
         # 临时目录不可写/磁盘满：给一句人话，而不是裸 traceback（否则 --log-file 里一个字都没有）
         log(f"❌ 无法创建落盘临时文件（检查系统临时目录是否可写/磁盘是否已满）：{exc}")
@@ -463,8 +463,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
     observer = fieldwatch.FieldObserver()  # 字段漂移检测：逐批并集，内存只跟字段数有关
 
     def _on_records(records):
-        # workers>1 时本回调由多个工作线程并发执行：SpoolWriter.write_records 与
-        # FieldObserver.update 内部都自带锁（各自的类注释有说明），这里直接调用即可
+        # 单元完整成功后由消费者线程分批交付；字段观察与主文件写入保持同批口径。
         observer.update(records)
         spool.write_records(records)
 
@@ -506,7 +505,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             log(
                 f"⚠️ 接口记录出现 {len(new_fields)} 个新增字段：{shown}"
                 + (
-                    "（本次会照常入库，如需使用请更新 DWD 提取口径）"
+                    "（原始 JSON 将保留这些字段；写库结果以最终校验为准）"
                     if not args.dry_run
                     else "（本次为 --dry-run，未写库；正式运行会自动入库）"
                 )
@@ -552,7 +551,7 @@ def run_sync(job: dict, config: dict, config_path: Path, args, bizdate, job_path
             )
             return 1
 
-        # ③ 写库：自动建表 → 先删再填 → Tunnel 写入 → 行数与 count(*) 双重校验
+        # ③ 写库：自动建表 → 暂存校验后原子发布 → Tunnel 写入 → 行数与 count(*) 双重校验
         try:
             lifecycle_days = None
             raw_lifecycle = target_cfg.get("lifecycle_days")
@@ -801,7 +800,7 @@ def main(argv: list[str] | None = None, *, hard_exit: bool = False) -> int:
             进程拖住最长几分钟——调度侧看到的就是"Ctrl+C 之后赖着不走"，4xx 快速失败也只快在
             函数层面、进程仍要等（实测 rc=1 仍被一个 5s 的在飞请求拖了 6 秒）。
             这里跳过退出钩子直接 os._exit：走到这一步时 run_sync 已经清过临时文件、放过运行锁
-            （写库是先删再填、幂等），日志每条都 flush，没有需要收尾的东西。
+            （写库是暂存校验后原子发布、幂等），日志每条都 flush，没有需要收尾的东西。
 
             hard_exit=False（库/嵌入调用）时不硬退出：调用方拿到退出码自行决定，
             但调用方需要自己保证没有在飞线程（否则解释器退出阶段仍会 join）。
