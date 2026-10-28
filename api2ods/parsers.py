@@ -6,10 +6,10 @@ from __future__ import annotations
 import codecs
 import csv
 import io
+import json
 import re
 import zipfile
-
-import simplejson as json
+from decimal import Decimal
 
 from .spool import loads_json
 from .utils import ConfigError, as_bool, log
@@ -111,7 +111,8 @@ def _json_snippet(payload, limit: int = 300) -> str:
         return str(payload)[:limit]
     chunks, size = [], 0
     try:
-        for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(payload):
+        # 标准库编码器逐项生成；simplejson 的 C 编码器会先编码完整响应。
+        for chunk in json.JSONEncoder(ensure_ascii=False, default=str).iterencode(payload):
             remaining = limit - size
             if len(chunk) >= remaining:
                 chunks.append(chunk[:remaining])
@@ -184,7 +185,7 @@ def ensure_object_records(records, label: str) -> list[dict]:
     cleaned: list[dict] = []
     for index, item in enumerate(records):
         if not isinstance(item, dict):
-            snippet = json.dumps(item, ensure_ascii=False)[:120] if not isinstance(item, str) else item[:120]
+            snippet = _json_snippet(item, 120)
             raise RuntimeError(
                 f"{label} records_path 指向的数组第 {index} 个元素不是对象"
                 f"（是 {type(item).__name__}：{snippet!r}）；这种记录写进 ODS 后下游取不到任何字段"
@@ -571,7 +572,7 @@ def _reject_json_error_body(data: bytes, parse_cfg: dict, label: str, where: str
                 f"{stripped[:200]!r}"
             )
         return
-    if scalar_candidate and (payload is None or isinstance(payload, (str, int, float, bool))):
+    if scalar_candidate and (payload is None or isinstance(payload, (str, int, float, Decimal, bool))):
         # 单行无分隔符、又能解析成一个 JSON 标量：不是文件流该有的形态，按错误体拦下——
         # 静默产出 0 行比报错危险得多
         raise RuntimeError(

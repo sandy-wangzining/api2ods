@@ -464,7 +464,7 @@ _SAFE_INT = 2**53
 
 
 def _normalize_compare(value):
-    """fail_if 比较用：布尔转 'true'/'false'；数字统一按 float，数字样字符串也按 float。
+    """fail_if 比较用：布尔转文本；小整数/数字样字符串按 float，Decimal 保持精度。
 
     原实现把数字 str() 后比：接口返回 0.0（浮点序列化）与配置 0 会判成"不相等"——
     equals 方向漏判（把业务错误当成功继续写库）、not_equals 方向误杀；
@@ -496,7 +496,16 @@ def _compare_equal(left, right) -> bool:
     """fail_if 相等判断：浮点用容差，避免 0.1+0.2 这类序列化误差把业务错误漏判。"""
     if isinstance(left, Decimal) or isinstance(right, Decimal):
         if isinstance(left, (Decimal, int, float)) and isinstance(right, (Decimal, int, float)):
-            return Decimal(str(left)) == Decimal(str(right))
+            left, right = Decimal(str(left)), Decimal(str(right))
+            if left == right:
+                return True
+            # 大数仍精确比较，不能用相对容差把相邻订单号或高精度金额合并。
+            if not left.is_finite() or not right.is_finite():
+                return False
+            magnitude = max(left.copy_abs(), right.copy_abs())
+            if magnitude > _SAFE_INT:
+                return False
+            return abs(left - right) <= max(Decimal("1e-12"), Decimal("1e-9") * magnitude)
     if isinstance(left, float) and isinstance(right, float):
         return math.isclose(left, right, rel_tol=1e-9, abs_tol=1e-12)
     return left == right

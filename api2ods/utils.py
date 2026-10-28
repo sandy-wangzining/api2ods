@@ -14,6 +14,7 @@ from pathlib import Path
 from urllib.parse import parse_qsl, quote, quote_plus, unquote, urlparse
 
 from ._common import leaf_strings as _leaf_strings
+from ._common import open_run_lock
 from ._common import safe_label as safe_label
 from ._common import webhook_targets as webhook_targets
 from ._common import with_scheme_bare as _with_scheme_bare
@@ -233,15 +234,7 @@ class RunLock:
                 "确认无人并发时设置 API2ODS_ALLOW_NO_LOCK=1"
             )
         try:
-            # "a+" 而不是 "w"：w 会在打开时把文件截断，持锁进程刚写进去的 pid 就被抹掉了
-            # （锁本身是文件区域锁，与文件内容无关，互斥不受影响；丢的是排障用的"谁在跑"）
-            # POSIX 上 O_NOFOLLOW：锁路径若是符号链接就拒绝跟随，新建按 0600
-            # （与 sftp2ods / feishu2ods 的锁同口径）
-            open_kwargs: dict = {"encoding": "utf-8", "errors": "replace"}
-            nofollow = getattr(os, "O_NOFOLLOW", 0)
-            if nofollow:
-                open_kwargs["opener"] = lambda path, flags, _nf=nofollow: os.open(path, flags | _nf, 0o600)
-            self.fh = open(self.path, "a+", **open_kwargs)
+            self.fh = open_run_lock(self.path)
         except (OSError, UnicodeError) as exc:
             # 父目录被删/路径过长（Windows MAX_PATH）时给一句人话，
             # 而不是让 FileNotFoundError 以裸 traceback 的形式糊在用户脸上

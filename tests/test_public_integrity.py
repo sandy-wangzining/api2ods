@@ -1,15 +1,17 @@
 """公开安装的数值精度与分页完整性回归。"""
 
+import tempfile
+import tracemalloc
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from unittest import mock
 
-from _helpers import OfflineTestCase, minimal_job
+from _helpers import OfflineTestCase, make_args, minimal_job
 
-from api2ods import config, http, parsers, spool
+from api2ods import cli, config, http, parsers, spool
 from api2ods.fetch import Fetcher
-from api2ods.utils import ConfigError
+from api2ods.utils import ConfigError, FatalApiError
 
 
 class TestPublicIntegrity(OfflineTestCase):
@@ -30,6 +32,71 @@ class TestPublicIntegrity(OfflineTestCase):
 
     def test_business_condition_compares_decimal_and_config_number(self):
         http.check_fail_if(spool.loads_json('{"code":0.1}'), [{"path": "code", "not_equals": 0.1}])
+
+    def test_decimal_error_body_is_rejected_even_with_single_line_opt_in(self):
+        for raw in (b"0.0", b"-0.1", b"1e0", b"1e-400", b"0.0\n"):
+            for fmt in ("csv", "tsv", "jsonl"):
+                with self.subTest(raw=raw, fmt=fmt), self.assertRaisesRegex(RuntimeError, "JSON 标量"):
+                    parsers.parse_bytes(raw, {"format": fmt, "allow_single_line": True}, "export")
+
+    def test_decimal_error_body_cannot_clear_partition_when_empty_is_allowed(self):
+        job = minimal_job()
+        job["request"]["response_type"] = "bytes"
+        job["pagination"]["window_retries"] = 0
+        job["parse"] = {"format": "csv"}
+        job["target"]["allow_empty"] = True
+        job = config.normalize_job(config.render_job(job, {}, date(2026, 10, 26))[0])
+        config.validate_job(job)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(Fetcher, "_do_request", return_value=b"0.0"),
+            mock.patch.object(cli, "connect_odps") as connect,
+            mock.patch.object(cli, "ensure_target_table"),
+            mock.patch.object(cli, "write_partition") as write,
+            mock.patch.object(cli, "count_partition", return_value=0),
+        ):
+            root = Path(tmp)
+            result = cli.run_sync(job, {}, root / "config.json", make_args(), date(2026, 10, 26), root / "job.json")
+        self.assertEqual(result, 1)
+        connect.assert_not_called()
+        write.assert_not_called()
+
+    def test_fail_if_keeps_tolerance_after_decimal_json_parsing(self):
+        for raw, expected in (
+            ('{"code":0.30000000000000004}', 0.3),
+            ('{"code":-0.30000000000000004}', "-0.3"),
+            ('{"code":1e-13}', 0),
+        ):
+            with self.subTest(raw=raw):
+                payload = spool.loads_json(raw)
+                with self.assertRaises(FatalApiError):
+                    http.check_fail_if(payload, [{"path": "code", "equals": expected}])
+                http.check_fail_if(payload, [{"path": "code", "not_equals": expected}])
+
+    def test_fail_if_still_distinguishes_outside_tolerance_and_large_numbers(self):
+        for raw, expected in (
+            ('{"code":0.3001}', 0.3),
+            ('{"code":9007199254740993.0}', 9007199254740992),
+            ('{"code":9007199254740993.01}', Decimal("9007199254740993.02")),
+            ('{"code":1e999999999}', 0),
+        ):
+            with self.subTest(raw=raw):
+                payload = spool.loads_json(raw)
+                http.check_fail_if(payload, [{"path": "code", "equals": expected}])
+                with self.assertRaises(FatalApiError):
+                    http.check_fail_if(payload, [{"path": "code", "not_equals": expected}])
+
+    def test_error_snippet_does_not_encode_the_whole_response(self):
+        payload = {"code": Decimal("0.3"), "items": ["x" * 1000] * 20000}
+        tracemalloc.start()
+        try:
+            snippet = parsers._json_snippet(payload)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(snippet), 300)
+        self.assertIn("0.3", snippet)
+        self.assertLess(peak, 1024 * 1024)
 
     def test_http_response_keeps_decimal_precision(self):
         response = http.requests.Response()
