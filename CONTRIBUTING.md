@@ -57,7 +57,7 @@ ruff format .                             # 统一格式（ruff 锁 ==0.16.9；C
 - 每个模块头部写清职责；对外函数写 docstring，说明参数含义与失败行为。
 - 行宽 120；`ruff` 配置只选"能发现真问题"的规则（`E4/E7/E9/F/W/I/UP`），
   风格类规则故意没开——格式统一交给 `ruff format`（CI 有 `--check` 门禁），lint 不重复管风格。
-- 不引入新依赖：核心只用 `requests` + `pyodps`。确有必要的依赖请先在 Issue 里讨论。
+- 依赖保持精简：核心使用 `requests` + `pyodps` + `simplejson`（无损 Decimal 编码）。确有必要的依赖请先在 Issue 里讨论。
 
 ## 提交 PR
 

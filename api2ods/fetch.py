@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import decimal
+import hashlib
 import math
 import re
 import threading
@@ -27,6 +28,7 @@ from .auth import AuthApplier
 from .dates import window_param_sets
 from .http import DEFAULT_MAX_RESPONSE_BYTES, request_with_retry
 from .parsers import ensure_object_records, extract_json_records, get_path, parse_payload
+from .spool import dump_record
 from .utils import ConfigError, FatalApiError, as_bool, check_header_values, collect_secret_values, log, redact_secrets
 
 # 单个请求单元最多在内存里累积多少条记录：range 模式（一个单元 = 整个区间）分页时
@@ -501,6 +503,10 @@ class Fetcher:
         # 默认严格：空页但总数没够 = 接口有问题，宁可整窗失败。确实遇到 TotalCount 不准的
         # 接口（数据翻页期间仍在增长）才关掉，关掉后仍会打警告日志留痕
         strict = as_bool(page_cfg.get("strict"), default=True, field="pagination.strict")
+        allow_repeated = as_bool(
+            page_cfg.get("allow_repeated_pages"), default=False, field="pagination.allow_repeated_pages"
+        )
+        seen_pages: set[bytes] = set()
         # 接口不返回总数时的翻页终点：本页条数 < 请求的 page_size 即判末页（短页=最后一页）。
         # 与 total_pages_path/total_items_path 互斥（validate_job 已拦），这里默认关闭
         stop_when_short = False
@@ -568,6 +574,19 @@ class Fetcher:
             # 分页路径同样要校验元素类型：records_path 指向的数组里混进数字/字符串，
             # 只在单页路径拦得住的话，分页接口会把它原样写进 json 列
             page_records = ensure_object_records(page_records, unit.label)
+            if page_type == "page" and page_records and not allow_repeated:
+                fingerprint = hashlib.sha256()
+                for record in page_records:
+                    fingerprint.update(dump_record(record, sort_keys=True).encode("utf-8"))
+                    fingerprint.update(b"\n")
+                digest = fingerprint.digest()
+                if digest in seen_pages:
+                    raise ConfigError(
+                        f"{unit.label} 第 {current} 页与之前某页完全重复，接口可能忽略了页码；"
+                        "已中止以免重复/漏数。确认源数据确实允许整页相同时，"
+                        "可设 pagination.allow_repeated_pages=true 显式放行"
+                    )
+                seen_pages.add(digest)
             records.extend(page_records)
             if len(records) > MAX_UNIT_RECORDS:
                 # 普通失败会被整窗重试、继续堆内存；这里直接按配置错终止

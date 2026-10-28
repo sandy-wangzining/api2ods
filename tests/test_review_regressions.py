@@ -558,7 +558,8 @@ class TestSeventhPassDataPath(OfflineTestCase):
 
         def fake(*args, **kwargs):
             calls.append(args[2]["page"])
-            return {"data": {"list": [{"id": 1}, {"id": 2}], "totalPages": 2}}
+            page = args[2]["page"]
+            return {"data": {"list": [{"id": page * 2 - 1}, {"id": page * 2}], "totalPages": 2}}
 
         with mock.patch.object(http_mod, "request_once", side_effect=fake):
             records = self._fetcher(job).fetch_unit(fetch_mod.FetchUnit("d", date(2026, 9, 18), None))

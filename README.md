@@ -36,6 +36,23 @@
 | Bearer Token + ZIP 内含 CSV | DeepSeek 用量导出 |
 | 自定义 md5 签名 + POST JSON + 无总数短页分页 | XMP（Mobvista）Open API |
 
+## 独立使用与部署前准备
+
+本项目可独立从 GitHub 下载并安装，不需要其它 ODS 项目或团队内部服务。支持 Windows、macOS、Linux；使用前需要源端读取权限和目标 MaxCompute 项目的凭证与读写权限。
+
+- Python 3.9+；依赖由 `pip install .` 自动安装。建议为工具创建虚拟环境，或使用 pipx。
+- 请按目标项目的真实地域设置 `maxcompute.endpoint`（可用 `--endpoint` 覆盖）。默认 us-west-1 仅适用于该地域，不能用于任意项目。
+- 业务日默认按 `America/New_York` 的昨天计算；可用 `ODS_BIZDATE_TZ=Asia/Shanghai`、`UTC` 等 IANA 时区名覆盖，也可显式传 `--bizdate`。数据窗口/源文件时区按各自配置设置，不必采用同一地域。
+- 从 `jobs/*.example.json` 复制配置并填入自己的源地址、项目和凭证；真实配置不要提交到 Git。首次接入先运行 `--check` 和 `--dry-run`。
+
+```bash
+git clone https://github.com/sandy-wangzining/api2ods.git
+cd api2ods
+python -m venv .venv
+# Windows PowerShell：.\.venv\Scripts\python.exe -m pip install .
+.venv/bin/python -m pip install .
+```
+
 ## 安装
 
 ```bash
@@ -316,8 +333,8 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
     同机同一作业互斥、不同作业可并行，同名不同目录的作业文件不会互相阻塞）；
     锁目录默认在工具目录 `.run-locks/`（不可写时退回当前用户的私有临时目录）；同一作业会以不同身份或
     不同 `TMPDIR` 跑（root 手动补数与普通用户调度混用）时，用环境变量 `API2ODS_LOCK_DIR`
-    把锁目录钉在固定位置——否则两个实例锁在不同文件上、互斥静默失效（指到共享存储时多机也能
-    互斥；文件系统不支持锁会告警并降级）；
+    把锁目录钉在固定位置，并按[多用户权限说明](docs/shared-runtime.md#多用户共享锁目录)配置共用组。
+    跨主机互斥取决于共享文件系统的锁支持；不支持文件锁时默认拒绝运行；
     Ctrl+C 不写库（退出码 130），并发拉取时进程立即结束、不等在飞的请求跑完
     （拉取阶段返回的 130 会在 `main` 里转成 `os._exit`——光靠 `shutdown(wait=False)`，
     解释器退出时仍会 join 工作线程；代价是本次的临时 spool 文件可能留在系统 temp）；
@@ -376,7 +393,7 @@ DWD 层：解 JSON、按主键取最新一条（跨 pt 去重）
 | 配置文件报 `不是合法 JSON` 但内容看着没问题 | 多半是文件存成了「UTF-8 with BOM」；新版已自动兼容，升级后仍报错再查逗号/引号 |
 | `pagination.page_size 必须是数字` / `window.days 必须是整数` | 配置里写成了带引号的字符串或带了单位，改成纯数字 |
 | `表结构与框架要求不一致` | 目标表是宽表/事务表：换表名（建议 `ods_xxx_json_di`）或先 drop 重建 |
-| 时区不对/跨天差一小时 | 检查 `window.date_tz`（怎么切天）与 `api_tz`（怎么传给接口）。两者都可以写 IANA 名称（如 `America/New_York`），`api_tz` 写时区名会自动处理夏令时（见上方「时区怎么配」）。数仓按美东，现有作业一律 `date_tz: America/New_York` |
+| 时区不对/跨天差一小时 | 检查 `window.date_tz`（怎么切天）与 `api_tz`（怎么传给接口）。两者都可以写 IANA 名称（如 `America/New_York`），`api_tz` 写时区名会自动处理夏令时（见上方「时区怎么配」）。请按数据源的业务日口径设置 `date_tz`，例如 `America/New_York`、`Asia/Shanghai` 或 `UTC` |
 | `pagination.strict=false` 的警告日志 | 接口给的 `TotalCount` 不准（翻页期间数据还在涨）；警告里会写明"已拉到多少条就收尾了" |
 | `记录里有无法序列化的值 ... NaN` | 接口返回了 `NaN`/`Infinity`（非法 JSON），落库后下游取不到值，已在拉取阶段中止 |
 | `环境变量 bizdate/SKYNET_BIZDATE 的值不是合法日期` | 调度传下来的业务日格式不对（应为 `YYYYMMDD`）。**不会**回退成"昨天"——那会先删再填写错分区、退出码还是 0；先 `unset bizdate` 或显式 `--bizdate` |
@@ -427,3 +444,25 @@ MIT（见 [LICENSE](LICENSE)）。
 
 三个项目保持独立安装；SQL 等待、告警和部分脱敏工具维护一份源码并同步，详见
 [公共源码说明](docs/shared-runtime.md)。贡献前请运行 `python tools/sync_common.py --check`。
+
+## 数值精度、分页与并发保护
+
+JSON 和 JSONL 中的十进制数字使用 Decimal 解析，并通过 simplejson 保留为 JSON 数字写入；大整数、高精度金额和极小非零数不会先转换成二进制浮点数。输出的空白、指数大小写等文本形式可以变化，数字的值和类型保持不变。`simplejson>=4.2` 已列入安装依赖，源码运行时也需安装 requirements.txt。
+
+页码分页默认检测整页重复；即使累计条数达到 total，也不能靠重复第一页冒充拉取完整。发现重复立即失败，本次不写库。没有唯一标识、且源数据确实允许完全相同页面的接口，可以显式配置：
+
+```json
+"pagination": {
+  "type": "page",
+  "total_items_path": "data.totalCount",
+  "allow_repeated_pages": true
+}
+```
+
+该开关只用于已确认的源端语义，不会替接口补齐缺失数据。检测比较整页内容并忽略对象键顺序；它不代替业务主键去重，也不保证上游在分页期间被编辑时仍能获得一致快照。
+
+正式运行在作业锁之外，还会取得按 `project.table` 归一化的目标表锁。同一用户的三个 ODS 工具、不同虚拟环境和不同配置文件写同一张表时互斥；不同表可并行，争用锁的任务以失败退出而非无限等待。它仍不能消除直接覆盖分区失败后需要重跑的限制。
+
+默认目标锁位于系统临时目录的 `ods-target-locks[-UID]`。多用户、不同 TMPDIR 或容器运行同一目标时，用 `ODS_TARGET_LOCK_DIR` 指向同一固定目录，并确认文件系统提供有效的文件锁。仅设置共享路径不能保证跨主机互斥；推荐固定调度机器。升级前停止旧进程，并更新所有可能写同一目标的工具。原有 `*_LOCK_DIR` 继续只控制各工具的作业锁。
+
+POSIX 跨用户部署需将共享目录设为共用组所有的 `2770` setgid 目录，运行锁会继承组并以 `0660` 供组内账号复用；默认私有目录仍使用 `0600`。Windows 需配置继承的读写 ACL。完整示例和旧锁权限迁移步骤见[多用户共享锁目录](docs/shared-runtime.md#多用户共享锁目录)。
