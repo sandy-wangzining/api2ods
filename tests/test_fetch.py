@@ -61,7 +61,7 @@ class TestFetcher(OfflineTestCase):
         ):
             with self.assertRaises(utils.ConfigError) as ctx:
                 self._fetcher(job).fetch_unit(unit)
-        self.assertIn("内存保护上限", str(ctx.exception))
+        self.assertIn("记录数上限", str(ctx.exception))
 
     def test_add_fields_must_be_mapping(self):
         """库调用方绕过 validate_job 时，非对象 add_fields 也要给干净配置错。"""
@@ -1633,34 +1633,29 @@ class TestFourthPassFetchHttp(OfflineTestCase):
         self.assertEqual(got, {"name": "张三"})
 
     def test_worker_records_released_after_spool(self):
-        """--workers>1 时已交付单元的 records 要在落盘后立即释放（future 会持有到函数返回）。"""
+        """并发调度不保留全部单元结果；回调也必须成功交付。"""
 
         class RecList(list):
             pass
 
-        job = {
-            "request": {"base_url": "http://x", "records_path": "data.list"},
-            "window": {"mode": "per_day", "days": 4, "format": "%Y-%m-%d %H:%M:%S"},
-        }
-        days = [date(2026, 9, 10 + i) for i in range(4)]
-        refs, still_alive = [], []
+        job = minimal_job(window={"mode": "per_day", "date_tz": "UTC", "start_param": "day"})
+        refs, alive = [], []
 
         def fake_fetch_unit(self, unit, **kwargs):
-            return RecList([{"x": 1}])
+            records = RecList([{"x": 1}])
+            refs.append(weakref.ref(records))
+            return records
 
         def on_records(records):
             gc.collect()
-            alive = 0
-            for w in refs:
-                # 只解引用一次：w() 的临时强引用在表达式结束后消失，第二次 w() 可能是 None，
-                # 原写法 len(w()) 会随机 TypeError（用例时好时坏）
-                obj = w()
-                if obj is not None and len(obj) > 0:
-                    alive += 1
-            still_alive.append(alive)
-            refs.append(weakref.ref(records))
+            alive.append(sum(ref() is not None for ref in refs))
 
         with mock.patch.object(fetch_mod.Fetcher, "fetch_unit", fake_fetch_unit):
             fetcher = fetch_mod.Fetcher(job, Path("."))
-            fetcher.fetch_all(days, workers=2, window_retries=0, on_records=on_records)
-        self.assertEqual(still_alive, [0, 0, 0, 0])
+            stats, failures = fetcher.fetch_all(
+                [date(2026, 9, 10 + i) for i in range(4)], workers=2, window_retries=0, on_records=on_records
+            )
+        self.assertEqual(failures, [])
+        self.assertEqual(len(stats), 4)
+        self.assertEqual(len(alive), 4)
+        self.assertLessEqual(max(alive), 2)

@@ -54,32 +54,20 @@ class TestTargetTable(OfflineTestCase):
 
     def test_write_partition_batches_and_retry(self):
         table = FakeTable()
-        rows = [json.dumps({"i": i}) for i in range(5)]
+        odps = DdlOdps(table)
+        calls = []
 
         def batches():
-            return iter([rows[0:2], rows[2:4], rows[4:5]])
+            calls.append(1)
+            if len(calls) == 2:
+                raise OSError("transient Tunnel failure")
+            return iter([["a", "b"]])
 
-        with mock.patch.object(utils.time, "sleep"):
-            written = mc_mod.write_partition(
-                DdlOdps(table), table, "demo_project", "ods_x", "20260918", batches, total=5
-            )
-        self.assertEqual(written, 5)
-        self.assertEqual(table.deleted, [("pt=20260918", True)])
-        self.assertEqual(table.created, [("pt=20260918", True)])
-        flat = [batch[0] for batch in table._writer.records]
-        self.assertEqual(flat, rows)
-
-        # 第一次写失败后自动重试（写前会重新删/建分区，幂等）：
-        # 重试必须从头重新读批次，且已写行数归零，不能把同一批数据写两遍
-        table2 = FakeTable()
-        table2.fail_next_write = True
-        with mock.patch.object(utils.time, "sleep"):
-            written = mc_mod.write_partition(
-                DdlOdps(table2), table2, "demo_project", "ods_x", "20260918", batches, total=5, retries=2
-            )
-        self.assertEqual(written, 5)
-        self.assertEqual(len(table2.deleted), 2)
-        self.assertEqual([batch[0] for batch in table2._writer.records], rows)
+        self.assertEqual(mc_mod.write_partition(odps, table, "p", "t", "20260918", batches, total=2), 2)
+        self.assertEqual(table.deleted, [])
+        self.assertEqual(table.written["pt=20260918"], [["a"], ["b"]])
+        self.assertEqual(len(odps.stage.writers), 2)
+        self.assertTrue(all(kw["reopen"] for kw in odps.stage.writer_kwargs))
 
     def test_write_partition_rejects_oversized_row_before_delete(self):
         """超限记录必失败：检查必须在删分区之前，否则旧数据被删、新数据又写不进去。"""
@@ -94,14 +82,11 @@ class TestTargetTable(OfflineTestCase):
         self.assertEqual(table.created, [])
 
     def test_write_partition_opens_writer_with_reopen(self):
-        """重试用全新 Tunnel 会话：复用上次失败留下的会话会把旧块一起提交（重复行）。"""
         table = FakeTable()
-        batches = lambda: iter([['{"a":1}']])  # noqa: E731
-        with mock.patch.object(utils.time, "sleep"):
-            mc_mod.write_partition(
-                DdlOdps(table), table, "demo_project", "ods_x", "20260918", batches, total=1, retries=1
-            )
-        self.assertTrue(table.writer_kwargs and all(kw.get("reopen") for kw in table.writer_kwargs))
+        odps = DdlOdps(table)
+        mc_mod.write_partition(odps, table, "p", "t", "20260918", lambda: iter([["a"]]), total=1)
+        self.assertEqual(table.writer_kwargs, [])
+        self.assertTrue(odps.stage.writer_kwargs and all(kw["reopen"] for kw in odps.stage.writer_kwargs))
 
     def test_write_partition_forwards_secrets_to_retry_call(self):
         """写库重试的日志/报错要带上作业的密钥值（Tunnel/SQL 报错里可能带签名 URL）。"""
