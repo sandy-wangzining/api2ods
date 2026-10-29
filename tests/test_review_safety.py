@@ -1,5 +1,6 @@
 """分页完整性、内存边界和安全发布回归。"""
 
+import tempfile
 import threading
 import time
 import tracemalloc
@@ -34,6 +35,42 @@ class TestMissingRecordsTotals(OfflineTestCase):
         for mode in ("page", "cursor"):
             with self.subTest(mode=mode), self.assertRaises(RuntimeError):
                 self.fetch({"Items": {}, "TotalCount": 9}, mode)
+
+    def test_missing_records_with_next_cursor_cannot_be_empty(self):
+        for cursor in ("page2", 0, False, []):
+            for extra in ({}, {"TotalCount": 0}):
+                with self.subTest(cursor=cursor, extra=extra), self.assertRaises(RuntimeError):
+                    self.fetch({"Items": {}, "NextToken": cursor, **extra}, "cursor")
+
+    def test_missing_records_without_next_cursor_remains_empty(self):
+        for cursor in (None, ""):
+            with self.subTest(cursor=cursor):
+                self.assertEqual(self.fetch({"Items": {}, "NextToken": cursor}, "cursor"), [])
+
+    def test_next_cursor_cannot_clear_existing_partition_even_when_empty_is_allowed(self):
+        from _helpers import make_args
+
+        from api2ods import cli, config
+
+        job = minimal_job(pagination={"type": "cursor", "cursor_path": "NextToken", "window_retries": 0})
+        job["request"].update(records_path="Items.Item", records_missing="empty")
+        job["target"]["allow_empty"] = True
+        day = date(2026, 9, 20)
+        job = config.normalize_job(config.render_job(job, {}, day)[0])
+        config.validate_job(job)
+        target = FakeTable()
+        target.written["pt=20260920"] = [["old-good-snapshot"]]
+        odps = DdlOdps(target)
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.object(Fetcher, "_do_request", return_value={"Items": {}, "NextToken": "page2"}),
+            mock.patch.object(cli, "connect_odps", return_value=odps) as connect,
+        ):
+            root = Path(tmp)
+            rc = cli.run_sync(job, {}, root / "config.json", make_args(bizdate="20260920"), day, root / "job.json")
+        self.assertEqual(rc, 1)
+        connect.assert_not_called()
+        self.assertEqual(target.written["pt=20260920"], [["old-good-snapshot"]])
 
     def test_missing_records_before_last_page_is_not_an_empty_snapshot(self):
         with self.assertRaises(RuntimeError):
@@ -95,7 +132,10 @@ class TestAtomicPublication(OfflineTestCase):
             if sql.startswith("insert overwrite"):
                 publications.append(sql)
                 if len(publications) == 1:
-                    raise TimeoutError("response lost after commit")
+                    result.id = "completed-publish"
+                    result.is_successful = mock.Mock(side_effect=TimeoutError("response lost after commit"))
+                    result.is_terminated = mock.Mock(return_value=True)
+                    result.stop = mock.Mock()
             return result
 
         with mock.patch.object(self.odps, "run_sql", side_effect=run_sql):
@@ -110,7 +150,12 @@ class TestAtomicPublication(OfflineTestCase):
 
         def run_sql(sql):
             if sql.startswith("insert overwrite"):
-                raise RuntimeError("publish rejected")
+                result = mock.Mock()
+                result.id = "rejected-publish"
+                result.is_successful.return_value = False
+                result.is_terminated.return_value = True
+                result.wait_for_success.side_effect = RuntimeError("publish rejected")
+                return result
             return original(sql)
 
         with mock.patch.object(self.odps, "run_sql", side_effect=run_sql):
@@ -119,6 +164,35 @@ class TestAtomicPublication(OfflineTestCase):
         self.assert_old_target()
         self.assertEqual(len(self.odps.stage.writers), 1)
         self.assertTrue(self.odps.stages)
+
+    def test_unknown_publication_blocks_retry_and_a_later_writer(self):
+        from api2ods import _common
+
+        original = self.odps.run_sql
+        instance = mock.Mock()
+        instance.id = "pending-publish"
+        instance.is_successful.side_effect = ConnectionError("poll failed")
+        instance.is_terminated.return_value = False
+        instance.stop.side_effect = ConnectionError("cancel failed")
+        publications = []
+
+        def run_sql(sql):
+            if sql.startswith("insert overwrite"):
+                publications.append(sql)
+                return instance
+            return original(sql)
+
+        self.odps.get_instance = mock.Mock(return_value=instance)
+        with mock.patch.object(self.odps, "run_sql", side_effect=run_sql):
+            with self.assertRaises(_common.UnresolvedSqlError):
+                self.write()
+            with self.assertRaises(_common.UnresolvedSqlError):
+                self.write()
+        self.assertEqual(len(publications), 1)
+        self.assert_old_target()
+        instance.is_terminated.return_value = True
+        self.assertEqual(self.write(), 2)
+        self.assertEqual(self.table.written["pt=20260920"], self.expected)
 
     def test_cleanup_failure_does_not_fail_published_partition(self):
         original = self.odps.run_sql
@@ -134,6 +208,54 @@ class TestAtomicPublication(OfflineTestCase):
         ddl = next(sql for sql in self.odps.sqls if sql.startswith("create table"))
         self.assertIn("'lifecycle.deletemeta'='true'", ddl)
         self.assertIn("lifecycle 1", ddl)
+
+    def test_cleanup_log_redacts_supplied_secret_values(self):
+        secret = "dummy-cleanup-credential-79431"
+        original = self.odps.run_sql
+
+        def run_sql(sql):
+            if sql.startswith("drop table"):
+                raise RuntimeError("provider rejected " + secret)
+            return original(sql)
+
+        with mock.patch.object(self.odps, "run_sql", side_effect=run_sql), mock.patch.object(mc, "log") as log:
+            self.assertEqual(self.write(secrets=[secret]), 2)
+        self.assertNotIn(secret, str(log.call_args_list))
+        self.assertIn("***", str(log.call_args_list))
+
+    def test_cancellation_logs_use_known_secrets_in_every_staging_phase(self):
+        from api2ods import _common
+
+        secret = "dummy-staging-credential-79431"
+        for prefix in ("create table", "alter table", "select count"):
+            with self.subTest(prefix=prefix):
+                table = FakeTable()
+                odps = DdlOdps(table)
+                original = odps.run_sql
+                instance = mock.Mock()
+                instance.id = "staging-failure"
+                instance.is_successful.side_effect = RuntimeError("poll " + secret)
+                instance.is_terminated.return_value = False
+                instance.stop.side_effect = RuntimeError("cancel " + secret)
+
+                def run_sql(sql):
+                    return instance if sql.startswith(prefix) else original(sql)
+
+                with mock.patch.object(odps, "run_sql", side_effect=run_sql), mock.patch.object(mc, "log") as log:
+                    with self.assertRaises((RuntimeError, _common.UnresolvedSqlError)):
+                        mc.write_partition(
+                            odps,
+                            table,
+                            "p",
+                            "t",
+                            "20260920",
+                            lambda: iter([["new"]]),
+                            total=1,
+                            retries=1,
+                            secrets=[secret],
+                        )
+                self.assertNotIn(secret, str(log.call_args_list))
+                self.assertIn("***", str(log.call_args_list))
 
     def test_interrupt_preserves_old_target(self):
         original = self.odps.get_table

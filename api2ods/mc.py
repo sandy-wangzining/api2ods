@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from . import _common
-from .utils import ConfigError, log, progress_log, redact, require_identifier, retry_call
+from .utils import ConfigError, log, progress_log, redact_secrets, require_identifier, retry_call
 
 try:
     from odps import ODPS
@@ -149,10 +149,19 @@ def connect_odps(
 # =============================================================================
 
 
-def run_sql_with_timeout(o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL"):
+def run_sql_with_timeout(
+    o, sql: str, timeout: int = SQL_TIMEOUT_SECONDS, desc: str = "SQL", *, publication=None, secrets=()
+):
     """通过公共实现等待 SQL，保留项目自身的时钟、脱敏日志与超时配置。"""
     return _common.run_sql_with_timeout(
-        o, sql, timeout, desc, clock=time, log=lambda message: log(redact(message)), heartbeat=SQL_HEARTBEAT_SECONDS
+        o,
+        sql,
+        timeout,
+        desc,
+        clock=time,
+        log=lambda message: log(redact_secrets(secrets, str(message))),
+        heartbeat=SQL_HEARTBEAT_SECONDS,
+        publication=publication,
     )
 
 
@@ -271,7 +280,9 @@ def _sql_spec(spec: str) -> str:
     return f"{key}='{escaped}'"
 
 
-def drop_partition(o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
+def drop_partition(
+    o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS, *, secrets=()
+) -> None:
     """删除分区（DDL，走超时保护；分区不存在也不报错，与旧口径的 if_exists=True 一致）。
 
     走 DDL 而不是 pyodps 的 `table.delete_partition`（同步、不限时）：云端分区元数据操作
@@ -285,10 +296,13 @@ def drop_partition(o, project: str, table_name: str, spec: str, timeout: int = S
         f"alter table {project}.{table_name} drop if exists partition ({_sql_spec(spec)})",
         timeout=timeout,
         desc=f"删分区 {table_name}",
+        secrets=secrets,
     )
 
 
-def add_partition(o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS) -> None:
+def add_partition(
+    o, project: str, table_name: str, spec: str, timeout: int = SQL_TIMEOUT_SECONDS, *, secrets=()
+) -> None:
     """新增分区（DDL，走超时保护；分区已存在不报错，与旧口径的 if_not_exists=True 一致）。"""
     project = require_identifier(project, "target.project")
     table_name = require_identifier(table_name, "target.table")
@@ -297,6 +311,7 @@ def add_partition(o, project: str, table_name: str, spec: str, timeout: int = SQ
         f"alter table {project}.{table_name} add if not exists partition ({_sql_spec(spec)})",
         timeout=timeout,
         desc=f"建分区 {table_name}",
+        secrets=secrets,
     )
 
 
@@ -319,6 +334,7 @@ def write_partition(
     """
     project = require_identifier(project, "target.project")
     table_name = require_identifier(table_name, "target.table")
+    _common.ensure_no_pending_publication(o, project, table_name)
     partition_value = _partition_literal(partition_value)
     spec = f"{PARTITION_COLUMN}={partition_value}"
     columns = [col for col in table.table_schema.columns if str(col.name).lower() != PARTITION_COLUMN]
@@ -347,15 +363,15 @@ def write_partition(
     verified = published = False
     written = 0
     try:
-        run_sql_with_timeout(o, stage_ddl, timeout=timeout, desc=f"建暂存表 {stage_name}")
+        run_sql_with_timeout(o, stage_ddl, timeout=timeout, desc=f"建暂存表 {stage_name}", secrets=secrets)
         stage = o.get_table(f"{project}.{stage_name}")
         verify_target_schema(stage, stage_name, str(columns[0].name))
 
         def publish() -> int:
             nonlocal verified, published, written
             if not verified:
-                drop_partition(o, project, stage_name, spec, timeout=timeout)
-                add_partition(o, project, stage_name, spec, timeout=timeout)
+                drop_partition(o, project, stage_name, spec, timeout=timeout, secrets=secrets)
+                add_partition(o, project, stage_name, spec, timeout=timeout, secrets=secrets)
                 written = 0
                 with stage.open_writer(partition=spec, reopen=True) as writer:
                     for rows in batches_factory():
@@ -364,7 +380,7 @@ def write_partition(
                         progress_log(f"{stage_name} pt={partition_value} 暂存", written, "行")
                 if total is not None and written != total:
                     raise RuntimeError(f"暂存写入行数异常：计划 {total:,}，实际 {written:,}")
-                actual = count_partition(o, project, stage_name, partition_value, timeout=timeout)
+                actual = count_partition(o, project, stage_name, partition_value, timeout=timeout, secrets=secrets)
                 if actual != written:
                     raise RuntimeError(f"暂存校验行数不一致：写入 {written:,}，查询 {actual:,}")
                 verified = True
@@ -375,6 +391,8 @@ def write_partition(
                 f"where {PARTITION_COLUMN} = '{partition_value}'",
                 timeout=timeout,
                 desc=f"发布分区 {table_name} pt={partition_value}",
+                publication=(project, table_name),
+                secrets=secrets,
             )
             published = True
             return written
@@ -397,10 +415,16 @@ def write_partition(
         if published:
             try:
                 run_sql_with_timeout(
-                    o, f"drop table if exists {project}.{stage_name}", timeout=timeout, desc="清理暂存表"
+                    o,
+                    f"drop table if exists {project}.{stage_name}",
+                    timeout=timeout,
+                    desc="清理暂存表",
+                    secrets=secrets,
                 )
-            except Exception as exc:
-                log(f"  警告：暂存表 {project}.{stage_name} 清理失败，将由生命周期回收：{redact(exc)}")
+            except (Exception, _common.UnresolvedSqlError) as exc:
+                log(
+                    f"  警告：暂存表 {project}.{stage_name} 清理失败，将由生命周期回收：{redact_secrets(secrets, str(exc))}"
+                )
         else:
             log(f"  提示：暂存表 {project}.{stage_name}（如已创建）已保留；正式分区未提前删除")
 
@@ -417,14 +441,16 @@ def _partition_literal(partition_value) -> str:
     return text.replace("'", "''")
 
 
-def count_partition(o, project: str, table_name: str, partition_value: str, timeout: int = SQL_TIMEOUT_SECONDS) -> int:
+def count_partition(
+    o, project: str, table_name: str, partition_value: str, timeout: int = SQL_TIMEOUT_SECONDS, *, secrets=()
+) -> int:
     """SELECT COUNT(*) 校验分区行数（用于写后核对）。"""
     # 表名同样是拼进 SQL 的标识符：再校验一道，挡住注入与拼错的表名
     project = require_identifier(project, "target.project")
     table_name = require_identifier(table_name, "target.table")
     literal = _partition_literal(partition_value)
     sql = f"select count(*) as cnt from {project}.{table_name} where {PARTITION_COLUMN} = '{literal}'"
-    instance = run_sql_with_timeout(o, sql, timeout=timeout, desc=f"校验 {table_name} 行数")
+    instance = run_sql_with_timeout(o, sql, timeout=timeout, desc=f"校验 {table_name} 行数", secrets=secrets)
     with instance.open_reader() as reader:
         for row in reader:
             # reader 的行既可能是"按列名取值"的对象（pyodps 的 Record），也可能是元组

@@ -576,9 +576,14 @@ class Fetcher:
                 if first_page and self.records_missing == "empty":
                     raw_items = get_path(payload, total_items_path) if total_items_path else None
                     raw_pages = get_path(payload, total_pages_path) if total_pages_path else None
-                    if _positive_int(raw_items) is not None or (_positive_int(raw_pages) or 0) > current:
+                    next_cursor = get_path(payload, cursor_path) if page_type == "cursor" else None
+                    if (
+                        _positive_int(raw_items) is not None
+                        or (_positive_int(raw_pages) or 0) > current
+                        or (next_cursor is not None and next_cursor != "")
+                    ):
                         raise RuntimeError(
-                            f"{unit.label} records_path 未命中，但接口总数仍报告有数据，不能按空结果处理"
+                            f"{unit.label} records_path 未命中，但接口总数或下一页游标仍报告有数据，不能按空结果处理"
                         )
                     log(f"  {unit.label}：records_path 未命中，按空结果处理（records_missing=empty）")
                     return []
