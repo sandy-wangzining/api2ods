@@ -4,11 +4,11 @@
 数据流：
     Fetcher.build_units(days)      把"要拉哪几天"展开成请求单元（每天一个 / 整区间一个）
     Fetcher.fetch_unit(unit)       单个单元：拼参数 → 鉴权 → 翻页 → 取出记录列表
-    Fetcher.fetch_all(...)         并发跑所有单元；每个单元一拉完就通过 on_records 回调交出去
-                                   （调用方写 Spool 落盘，避免全量数据堆在内存里）
+    Fetcher.fetch_all(...)         并发跑所有单元；每个单元按页落盘，完整成功后通过 on_records 分批交付
+                                   （失败尝试只清理本单元暂存，不向主 Spool 交付）
 
 失败策略：单个单元失败会整窗重试 N 次（window_retries），最终仍失败则记入 failures；
-只要还有失败单元，调用方就不写库（防止分区缺数）；重跑整条命令即可（写库是"先删再填"幂等）。
+只要还有失败单元，调用方就不写库（防止分区缺数）；重跑整条命令即可（写库通过暂存核对后原子发布，重跑幂等）。
 """
 
 from __future__ import annotations
@@ -28,11 +28,10 @@ from .auth import AuthApplier
 from .dates import window_param_sets
 from .http import DEFAULT_MAX_RESPONSE_BYTES, request_with_retry
 from .parsers import ensure_object_records, extract_json_records, get_path, parse_payload
-from .spool import dump_record
+from .spool import SpoolWriter, dump_record, loads_json
 from .utils import ConfigError, FatalApiError, as_bool, check_header_values, collect_secret_values, log, redact_secrets
 
-# 单个请求单元最多在内存里累积多少条记录：range 模式（一个单元 = 整个区间）分页时
-# 全量驻留会 OOM；超过就 fail-closed，提示改用 per_day 或拆小区间
+# 单元记录数兜底上限；正式同步按页写入单元暂存，内存随单页和回调批次大小变化。
 MAX_UNIT_RECORDS = 200_000
 
 # HTTP 方法按 RFC 7230 的 token 形态（字母数字与 !#$%&'*+-.^_`|~）：任意字符串原样写进
@@ -401,6 +400,7 @@ class Fetcher:
         max_pages_override: int | None = None,
         stop_after_first_page: bool = False,
         _stop: threading.Event | None = None,
+        _on_records: Callable[[list], None] | None = None,
     ) -> list[dict]:
         """执行一个请求单元，返回该单元的记录列表。
 
@@ -419,7 +419,11 @@ class Fetcher:
             records = parse_payload(
                 payload, self.request_cfg, self.parse_cfg, unit.label, missing_ok=self.records_missing == "empty"
             )
-            return self._decorate(records)
+            records = self._decorate(records)
+            if _on_records is not None:
+                _on_records(records)
+                return []
+            return records
         return self._decorate(
             self._fetch_pages(
                 unit,
@@ -428,6 +432,7 @@ class Fetcher:
                 max_pages_override,
                 stop_after_first_page,
                 stop=_stop if _stop is not None else threading.Event(),
+                on_records=(lambda rows: _on_records(self._decorate(rows))) if _on_records is not None else None,
             )
         )
 
@@ -439,6 +444,7 @@ class Fetcher:
         max_pages_override: int | None = None,
         stop_after_first_page: bool = False,
         stop: threading.Event | None = None,
+        on_records: Callable[[list], None] | None = None,
     ) -> list[dict]:
         """页码 / 游标分页循环。
 
@@ -536,6 +542,7 @@ class Fetcher:
         if effective_page_size <= 0:
             raise ConfigError(f"pagination.page_size 必须是正整数，实际 {effective_page_size}")
         records: list[dict] = []
+        record_count = 0
         current = 1
         cursor = cursor_start
         seen_cursors = {str(cursor)}
@@ -567,6 +574,17 @@ class Fetcher:
                 # records_missing=empty 只认第一页（零数据日常见写法：直接返回空对象）；
                 # 翻到一半记录路径取不到，是接口结构变了/返回不完整，宁可整窗失败也别静默截断
                 if first_page and self.records_missing == "empty":
+                    raw_items = get_path(payload, total_items_path) if total_items_path else None
+                    raw_pages = get_path(payload, total_pages_path) if total_pages_path else None
+                    next_cursor = get_path(payload, cursor_path) if page_type == "cursor" else None
+                    if (
+                        _positive_int(raw_items) is not None
+                        or (_positive_int(raw_pages) or 0) > current
+                        or (next_cursor is not None and next_cursor != "")
+                    ):
+                        raise RuntimeError(
+                            f"{unit.label} records_path 未命中，但接口总数或下一页游标仍报告有数据，不能按空结果处理"
+                        )
                     log(f"  {unit.label}：records_path 未命中，按空结果处理（records_missing=empty）")
                     return []
                 extract_json_records(payload, self.request_cfg, unit.label)  # 抛带诊断信息的错误
@@ -587,12 +605,16 @@ class Fetcher:
                         "可设 pagination.allow_repeated_pages=true 显式放行"
                     )
                 seen_pages.add(digest)
-            records.extend(page_records)
-            if len(records) > MAX_UNIT_RECORDS:
+            record_count += len(page_records)
+            if on_records is None:
+                records.extend(page_records)
+            else:
+                on_records(page_records)
+            if record_count > MAX_UNIT_RECORDS:
                 # 普通失败会被整窗重试、继续堆内存；这里直接按配置错终止
                 raise ConfigError(
-                    f"{unit.label} 单个请求单元已累积 {len(records):,} 条记录"
-                    f"（内存保护上限 {MAX_UNIT_RECORDS:,}）：请缩小窗口（--start-date/--end-date）"
+                    f"{unit.label} 单个请求单元已累积 {record_count:,} 条记录"
+                    f"（记录数上限 {MAX_UNIT_RECORDS:,}）：请缩小窗口（--start-date/--end-date）"
                     f"或改用 window.mode=per_day 按天拉取"
                 )
 
@@ -613,7 +635,7 @@ class Fetcher:
                 # 空页却报 0 条，与前几页的记录自相矛盾，那种情况照旧按未翻完处理
                 if (
                     not page_records
-                    and not records
+                    and record_count == 0
                     and (_is_zero_count(raw_pages) or _is_zero_count(raw_items))
                     and _positive_int(raw_pages) is None
                     and _positive_int(raw_items) is None
@@ -637,7 +659,7 @@ class Fetcher:
                 total_items = last_total_items
                 # 用「已累计条数」而不是 页码×page_size 估算：接口把 PageSize 压小
                 # （返回条数少于请求的 page_size）时，估算会提前判定拉完，静默丢数
-                reached_end = total_items is not None and len(records) >= total_items
+                reached_end = total_items is not None and record_count >= total_items
                 if total_pages is not None and current >= total_pages:
                     # 两个终点都配时，接口的 totalPages 可能按「请求的 page_size」算
                     # （实际每页给得更少），或者中途变小——这时页数说翻完了、条数说还差，
@@ -653,7 +675,7 @@ class Fetcher:
                     # 空页：只在"确实翻完了"时才收尾。只给了 total_pages 的作业同样要判
                     # （第 N 页空但 N < totalPages = 接口抖动，静默收尾会整天少数据），
                     # 并把条件写进报错信息，否则 strict=false 的收尾日志会变成一句空话
-                    unfinished = _unfinished_reason(current, total_pages, len(records), total_items)
+                    unfinished = _unfinished_reason(current, total_pages, record_count, total_items)
                     if unfinished is None:
                         break
                     message = f"{unit.label} 第 {current} 页返回为空，但{unfinished}，可能是接口抖动"
@@ -663,7 +685,7 @@ class Fetcher:
                         raise UnconfirmedEndError(message)
                     # 非严格模式：接口给的终点不准时不该让整个调度永久失败，
                     # 但必须留痕——静默收尾正是"少拉数据却显示成功"的成因
-                    log(f"  警告：{message}；pagination.strict=false，按已拉到的 {len(records)} 条收尾")
+                    log(f"  警告：{message}；pagination.strict=false，按已拉到的 {record_count} 条收尾")
                     break
             else:  # cursor
                 # 游标模式下也用 total_items_path 兜底：cursor_path 写错、或接口中途不返回游标时，
@@ -678,14 +700,14 @@ class Fetcher:
                 # 当成结束会提前收尾、静默少数据
                 if next_cursor is None or next_cursor == "":
                     total_items = last_total_items
-                    if total_items is not None and len(records) < total_items:
+                    if total_items is not None and record_count < total_items:
                         message = (
                             f"{unit.label} 游标已结束，但仍有数据未拉完"
-                            f"（TotalCount={total_items}，已拉 {len(records)} 条）——cursor_path 是否写错？"
+                            f"（TotalCount={total_items}，已拉 {record_count} 条）——cursor_path 是否写错？"
                         )
                         if strict:
                             raise UnconfirmedEndError(message)
-                        log(f"  警告：{message}；pagination.strict=false，按已拉到的 {len(records)} 条收尾")
+                        log(f"  警告：{message}；pagination.strict=false，按已拉到的 {record_count} 条收尾")
                     break
                 if str(next_cursor) in seen_cursors:
                     # 按字符串判等：param_as_string 场景下发出去的是 "1000"、接口回显可能
@@ -729,7 +751,7 @@ class Fetcher:
     ) -> tuple[list[tuple[str, int]], list[tuple[str, str]]]:
         """按计划拉取全部单元。
 
-        - on_records：每拉完一个单元立刻回调（调用方用来写 Spool，避免全量数据占内存）；
+        - on_records：单元按页暂存成功后分批回调；重试不会交付失败尝试的半成品；
         - 返回 (每单元条数统计 [(label, 条数)], 失败明细 [(label, 错误)])；
         - 只要 failures 非空，调用方必须放弃写库（见 cli.run_sync）。
         """
@@ -753,7 +775,7 @@ class Fetcher:
         stats: list[tuple[str, int]] = []
         failures: list[tuple[str, str]] = []
 
-        def run_unit(unit: FetchUnit) -> tuple[str, list[dict]]:
+        def run_unit(unit: FetchUnit) -> tuple[str, SpoolWriter]:
             """单个单元 + 整窗重试（接口偶发抖动时不用重跑整个任务）。
 
             重试只对"可能自己好起来"的错误有意义。密钥错（401）、配置写错这类问题重试
@@ -767,7 +789,17 @@ class Fetcher:
                     # worker 还没起跑（或刚醒来）时其它单元已失败：直接收手，不发任何请求
                     raise FatalApiError(f"{unit.label}：其它单元已失败，不再尝试")
                 try:
-                    return unit.label, self.fetch_unit(unit, _stop=stop)
+                    data = SpoolWriter()
+                    try:
+                        records = self.fetch_unit(unit, _stop=stop, _on_records=data.write_records)
+                        if records:
+                            data.write_records(records)
+                        if stop.is_set():
+                            raise FatalApiError(f"{unit.label}：其它单元已失败，停止交付")
+                        return unit.label, data
+                    except BaseException:
+                        data.close()
+                        raise
                 except (FatalApiError, ConfigError):
                     raise
                 except Exception as exc:  # noqa: BLE001
@@ -783,24 +815,34 @@ class Fetcher:
             # 统一按普通失败上报；消息要脱敏，重试日志里也不该出现密钥
             raise RuntimeError(self.redact(last_err)) from last_err
 
-        def handle(label: str, records: list[dict]) -> None:
-            """单元拉完后的统一收尾：先落盘、再统计条数、最后打日志。"""
-            # 先落盘再统计：落盘抛错时这条不该算进"成功条数"（磁盘满就是这样，
-            # 原来日志会显示拉取成功、实际一条没落盘）
-            if on_records is not None:
-                # 交付副本：下面的并发分支在回调后会清空原列表以释放 future 持有的内存，
-                # 调用方即使保留了引用也不会被这次清理影响（传原列表会让"保留引用"静默丢数据）
-                on_records(list(records))
-            stats.append((label, len(records)))
-            log(f"  {label}：拉取 {len(records):,} 条")
+        def handle(label: str, data: SpoolWriter) -> None:
+            """单元全部成功后才分批交付；回调失败时不统计成功，并清理该单元暂存。"""
+            try:
+                if on_records is not None:
+                    for rows in data.iter_batches():
+                        on_records([loads_json(row) for row in rows])
+                    if data.count == 0:
+                        on_records([])
+                stats.append((label, data.count))
+                log(f"  {label}：拉取 {data.count:,} 条")
+            finally:
+                data.close()
+
+        def discard(future) -> None:
+            """退出时回收未交付的结果；在飞 worker 完成后也不能遗留临时文件。"""
+            try:
+                _, data = future.result()
+            except BaseException:
+                return
+            data.close()
 
         if workers <= 1 or len(units) <= 1:
             # 串行：顺序稳定，日志简单
             try:
                 for unit in units:
                     try:
-                        label, records = run_unit(unit)
-                        handle(label, records)
+                        label, data = run_unit(unit)
+                        handle(label, data)
                     except (FatalApiError, ConfigError):
                         # 同上：不接住就会被下面的 except Exception 吃掉，同一份配置下后面的单元
                         # 必然同样失败，继续跑只是把错误重复几十遍（ConfigError 与 run_unit 里的
@@ -829,11 +871,8 @@ class Fetcher:
                     for future in completed:
                         unit = futures.pop(future)
                         try:
-                            label, records = future.result()
-                            handle(label, records)
-                            # 回调收到副本；清掉 Future 持有的原列表后才补交新单元。
-                            if isinstance(records, list):
-                                records.clear()
+                            label, data = future.result()
+                            handle(label, data)
                         except (FatalApiError, ConfigError):
                             raise
                         except Exception as exc:  # noqa: BLE001
@@ -853,6 +892,8 @@ class Fetcher:
                 # 不用 with：它的 __exit__ 是 shutdown(wait=True)，Ctrl+C 之后还要等
                 # 所有在飞的请求（可能正卡在 180s 超时或整窗重试的 sleep 里）跑完才退出。
                 # cancel_futures 取消没开始的，在飞的请求收到停止信号后尽快结束，进程不再被拖住
+                for future in futures:
+                    future.add_done_callback(discard)
                 pool.shutdown(wait=False, cancel_futures=True)
 
         return stats, failures

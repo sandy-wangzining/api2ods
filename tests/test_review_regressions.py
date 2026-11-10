@@ -1594,34 +1594,31 @@ class TestNinthPassReview(OfflineTestCase):
 
     # ---------------------------------------------------------------- 覆盖写入失败
     def test_write_partition_failure_warns_partition_may_be_gone(self):
-        """先删后填中途失败：错误信息必须点明"分区可能缺数、要重跑"（旧数据不会自己回来）。"""
         table = FakeTable()
-        table.fail_next_write = True  # 删/建成功，Tunnel 写入失败
-        rows = [json.dumps({"i": 0})]
-        with self.assertRaises(RuntimeError) as ctx:
-            mc_mod.write_partition(
-                DdlOdps(table), table, "demo_project", "ods_x", "20260918", lambda: iter([rows]), total=1, retries=1
-            )
-        message = str(ctx.exception)
-        self.assertIn("可能已被清空", message)
-        self.assertIn("重跑", message)
-        self.assertEqual(table.deleted, [("pt=20260918", True)])  # 确实先删过
+        table.written["pt=20260918"] = [["old"]]
+        odps = DdlOdps(table)
+        with mock.patch.object(mc_mod, "add_partition", side_effect=RuntimeError("stage creation failed")):
+            with self.assertRaises(RuntimeError) as ctx:
+                mc_mod.write_partition(
+                    odps, table, "demo_project", "ods_x", "20260918", lambda: iter([["new"]]), total=1, retries=1
+                )
+        self.assertIn("未提前删除", str(ctx.exception))
+        self.assertIn("暂存表", str(ctx.exception))
+        self.assertEqual(table.deleted, [])
+        self.assertEqual(table.written["pt=20260918"], [["old"]])
 
     def test_delete_partition_error_still_warns_partition_may_be_gone(self):
-        """删分区自己抛异常时，服务端可能已经删了：不能吞掉缺数提示。"""
         table = FakeTable()
-        rows = [json.dumps({"i": 0})]
         with (
             mock.patch.object(mc_mod, "drop_partition", side_effect=RuntimeError("delete timeout")),
-            mock.patch.object(utils.time, "sleep"),
             self.assertRaises(RuntimeError) as ctx,
         ):
             mc_mod.write_partition(
-                DdlOdps(table), table, "demo_project", "ods_x", "20260918", lambda: iter([rows]), total=1, retries=1
+                DdlOdps(table), table, "demo_project", "ods_x", "20260918", lambda: iter([["new"]]), total=1, retries=1
             )
-        message = str(ctx.exception)
-        self.assertIn("可能已被清空", message)
-        self.assertIn("delete timeout", message)
+        self.assertIn("未提前删除", str(ctx.exception))
+        self.assertIn("delete timeout", str(ctx.exception))
+        self.assertEqual(table.deleted, [])
 
     # ---------------------------------------------------------------- 日期格式
     def test_locale_dependent_directives_are_c_locale_english(self):
@@ -2025,7 +2022,7 @@ class TestEleventhPassReview(OfflineTestCase):
         )
         self.assertEqual(written, 1)
         self.assertEqual(calls["n"], 2)  # 1 次写前校验 + 1 次写入（不再每轮重试各通读一遍）
-        self.assertEqual(table.deleted, [("pt=20260918", True)])
+        self.assertEqual(table.deleted, [])
 
     def test_as_count_rejects_bool_and_float(self):
         """window_retries: true 会被 int(True) 静默当成 1；2.5/nan 会被静默截断。"""

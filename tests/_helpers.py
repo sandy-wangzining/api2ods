@@ -16,6 +16,7 @@ import tempfile
 import time
 import unittest
 import urllib.parse
+from contextlib import nullcontext
 from datetime import date
 from pathlib import Path
 from unittest import mock
@@ -60,6 +61,7 @@ class OfflineTestCase(unittest.TestCase):
         env_patcher = mock.patch.dict(os.environ, clear=False)
         env_patcher.start()
         self.addCleanup(env_patcher.stop)
+        os.environ["ODS_TARGET_LOCK_DIR"] = str(Path(lock_root) / "targets")
         for name in ("bizdate", "SKYNET_BIZDATE", "ODS_BIZDATE_TZ"):
             os.environ.pop(name, None)
 
@@ -192,6 +194,7 @@ class FakeTable:
         self.fail_next_write = False
         self._writer = FakeWriter()
         self.existing_partitions = set()
+        self.written = {}
 
     def exist_partition(self, spec):
         return spec in self.existing_partitions
@@ -208,11 +211,14 @@ class FakeTable:
         if self.fail_next_write:
             self.fail_next_write = False
             raise RuntimeError("tunnel boom")
+        self._writer = FakeWriter(self, partition)
         return self._writer
 
 
 class FakeWriter:
-    def __init__(self):
+    def __init__(self, table=None, partition=None):
+        self.table = table
+        self.partition = partition
         self.records = []
         self.closed = False
         self.max_row_counts = []
@@ -226,38 +232,84 @@ class FakeWriter:
 
     def __exit__(self, *exc_info):
         self.closed = True
+        if exc_info[0] is None and self.table is not None:
+            self.table.written[self.partition] = list(self.records)
+            self.table.existing_partitions.add(self.partition)
 
 
 class DdlOdps:
-    """假 ODPS 客户端：分区增删的 DDL 直接落到 FakeTable 上（生产已改走带超时的 DDL）。
-
-    - run_sql 收到 `alter table ... drop/add ... partition (pt='X')` 时，按 pyodps 表 API 的
-      语义更新 table.deleted / table.created（既有断言"确实先删过"继续有意义）；
-    - 其余 SQL 返回"立即成功"的假实例（这些用例不校验 count/verify）。
-    """
+    """假数仓：暂存与正式表隔离，发布成功时原子替换。"""
 
     def __init__(self, table=None):
         self.table = table
         self.sqls: list[str] = []
+        self.stages = {}
+        self.stage = None
+
+    def get_table(self, name):
+        short = str(name).rsplit(".", 1)[-1]
+        if short in self.stages:
+            return self.stages[short]
+        return self.table
 
     def run_sql(self, sql):
         self.sqls.append(sql)
-        match = re.search(
-            r"(drop\s+if\s+exists|add\s+if\s+not\s+exists)\s+partition\s*\(\s*pt\s*=\s*'([^']*)'\s*\)",
+        create = re.match(r"create table if not exists ([\w.]+)", sql, re.I)
+        if create and create.group(1).rsplit(".", 1)[-1].startswith("tmp_api2ods_"):
+            name = create.group(1).rsplit(".", 1)[-1]
+            self.stage = FakeTable(
+                columns=list(self.table.table_schema.columns), partitions=list(self.table.table_schema.partitions)
+            )
+            self.stages[name] = self.stage
+            return OkInstance()
+        drop = re.match(r"drop table if exists ([\w.]+)", sql, re.I)
+        if drop:
+            self.stages.pop(drop.group(1).rsplit(".", 1)[-1], None)
+            return OkInstance()
+        publication = re.match(
+            r"insert overwrite table ([\w.]+) partition \(pt='([^']+)'\) select (.+?) from ([\w.]+) where",
             sql,
             re.I,
         )
-        if match is not None and self.table is not None:
-            spec = f"pt={match.group(2)}"
-            if match.group(1).lower().startswith("drop"):
-                self.table.deleted.append((spec, True))
+        if publication:
+            target = self.get_table(publication.group(1))
+            stage = self.get_table(publication.group(4))
+            spec = f"pt={publication.group(2)}"
+            target.written[spec] = [list(row) for row in stage.written.get(spec, [])]
+            target.existing_partitions.add(spec)
+            return OkInstance()
+        if "count(" in sql.lower().replace(" ", ""):
+            partition = re.search(r"pt\s*=\s*'([^']*)'", sql, re.I)
+            source = re.search(r"\bfrom\s+([\w.]+)", sql, re.I)
+            if partition is None or source is None:
+                raise AssertionError(f"fake 无法解析 count：{sql!r}")
+            table = self.get_table(source.group(1))
+            return OkInstance([{"cnt": len(table.written.get(f"pt={partition.group(1)}", []))}])
+        partition = re.search(
+            r"alter table ([\w.]+) (drop\s+if\s+exists|add\s+if\s+not\s+exists)\s+partition\s*\(\s*pt\s*=\s*'([^']*)'\s*\)",
+            sql,
+            re.I,
+        )
+        if partition and self.table is not None:
+            table = self.get_table(partition.group(1))
+            spec = f"pt={partition.group(3)}"
+            if partition.group(2).lower().startswith("drop"):
+                table.deleted.append((spec, True))
+                table.written.pop(spec, None)
+                table.existing_partitions.discard(spec)
             else:
-                self.table.created.append((spec, True))
+                table.created.append((spec, True))
         return OkInstance()
 
 
 class OkInstance:
     """立即成功、未终止的假 SQL 实例（run_sql_with_timeout 直接取用）。"""
+
+    def __init__(self, rows=None):
+        self.rows = rows or []
+
+    def open_reader(self):
+        return nullcontext(self.rows)
 
     def is_successful(self):
         return True
